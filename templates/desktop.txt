@@ -1,0 +1,167 @@
+const screen_w: u32 = {{width}};
+const screen_h: u32 = {{height}};
+const screen_title = "{{title}}";
+const target_fps: u32 = {{fps}};
+
+const BackendGfxType = @import("backend_gfx");
+
+{{module_vars}}pub fn main() !void {
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `labelle run --headless` (and `--uncapped`/`--ticks`, which imply it)
+    // run the window unmapped so no window pops up in CI. bgfx still needs a
+    // real native surface (it can't render or read the backbuffer back for
+    // `--screenshot` otherwise), so this is an invisible window, not a truly
+    // windowless run. `setConfigFlags` must precede `initWindow` — the GLFW
+    // visibility hint is applied at window creation. Gated on the backend
+    // exposing the helper so older bgfx backends still build.
+    if (comptime @hasDecl(window, "isHeadless") and @hasDecl(window, "setConfigFlags")) {
+        if (window.isHeadless()) window.setConfigFlags(.{ .window_hidden = true });
+    }
+{{hidden_setup}}    window.initWindow(screen_w, screen_h, screen_title);
+    defer window.closeWindow();
+    window.setTargetFPS(target_fps);
+
+    // `--uncapped`: bgfx's only frame pacing is vsync, so drop it to let the
+    // loop run flat-out (matches the sokol backend skipping its nanosleep).
+    // `--ticks=N`: exit the loop after N iterations (0 = run until closed).
+    // Both fold away to a no-op / 0 on a normal run. Gated so the template
+    // stays compatible with bgfx backends predating these helpers.
+    const headless_max_ticks: u64 = if (comptime @hasDecl(window, "headlessTicks")) window.headlessTicks() else 0;
+    if (comptime @hasDecl(window, "isUncapped") and @hasDecl(window, "setVsync")) {
+        if (window.isUncapped()) window.setVsync(false);
+    }
+    var headless_tick_count: u64 = 0;
+    // bgfx's `requestScreenShot` is async: the capture is fulfilled (and the
+    // `.tga` flushed to disk) a few `bgfx.frame()` calls later by the
+    // multi-threaded render path. So if `--ticks` would `break` right after
+    // (or on) the screenshot frame, the file never lands. Once the shot has
+    // fired we pump this many extra frames before honouring the tick-exit so
+    // the async capture flushes — matching the margin the `--timeout` path
+    // got for free. Unused (and folded away) when no screenshot is requested.
+    const screenshot_flush_frames: u32 = 8;
+    var screenshot_flush_left: u32 = 0;
+
+{{hooks_init_block}}
+    var g = AssembledGame.init(allocator);
+    defer g.deinit();
+
+    g.setHooks(&hooks);
+
+    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+
+{{preview_setup}}{{setup_code}}
+    // Screenshot capture request (labelle-cli#227). Reads
+    // `LABELLE_SCREENSHOT_PATH` once on startup; null when the env var is
+    // absent, so the per-frame check below collapses to a `null` test on
+    // regular runs. `loop_start_ns` captures wall-clock at the first frame
+    // so `after_sec` is "seconds since the game entered its main loop".
+    var screenshot_req: ?engine.ScreenshotRequest = engine.requestedScreenshot();
+    const loop_start_ns: i128 = engine.nowNs();
+
+    while (!window.shouldQuit()) {
+        // Honor `game.quit()` (e.g. the menu Exit button). The engine keeps
+        // quit backend-agnostic — it only flips its `running` flag — so the
+        // backend loop must forward that to the platform close. Without this
+        // the bgfx loop only exited on the window's own close button and Exit
+        // did nothing. Mirrors the sokol template. Gated so backends that
+        // predate `requestQuit` still build.
+        if (comptime @hasDecl(window, "requestQuit")) {
+            if (!g.isRunning()) {
+                window.requestQuit();
+                // Break immediately — don't run another tick/render/draw on a
+                // game that's already shutting down (avoids touching state the
+                // quit may have torn down). Matches the sokol template, which
+                // returns from its frame callback right after requestQuit.
+                break;
+            }
+        }
+        // Frame-rate-independent sim: derive dt from the real frame period
+        // (bgfx has no built-in timer, so `window.frameDuration` measures it
+        // with a monotonic clock) instead of a fixed 0.016. The fixed value
+        // tied game speed to the frame rate — vsync-off at e.g. 300 FPS ran
+        // the sim ~3x too fast. Clamp to 4 frames at target_fps so a stall /
+        // backgrounding can't explode physics. Mirrors the sokol template.
+        // @max(target_fps, 1) guards a target_fps=0 (unlimited) config.
+        const dt: f32 = @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
+        // Apply a pending fullscreen/windowed switch requested via
+        // `game.setFullscreen`/`toggleFullscreen`. The engine owns the
+        // desired flag; the backend owns the platform call. Gated on BOTH
+        // the backend exposing `setFullscreen` and the engine exposing the
+        // drain, so the template stays compatible with backends/engines
+        // that predate the API (older example projects still build).
+        if (comptime @hasDecl(window, "setFullscreen") and @hasDecl(@TypeOf(g), "takeFullscreenRequest")) {
+            if (g.takeFullscreenRequest()) |on| window.setFullscreen(on);
+        }
+        // Vsync: same engine-owned-flag / backend-applies split as fullscreen.
+        // Folds away on backends without `setVsync` or engines predating the API.
+        if (comptime @hasDecl(window, "setVsync") and @hasDecl(@TypeOf(g), "takeVsyncRequest")) {
+            if (g.takeVsyncRequest()) |on| window.setVsync(on);
+        }
+        // Aspect-fit the design canvas (config) into the real window size,
+        // so content renders correctly even if the window differs from the
+        // configured default. Per-frame is cheap and survives resizes.
+        BackendGfxType.setScreenSize(window.width(), window.height());
+        BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
+{{preview_heartbeat}}{{tick_code}}        g.tick(dt);
+
+        window.beginFrame();
+        window.clearBackground(245, 245, 245, 255);
+        g.render();
+        g.renderGizmos();
+{{gui_draw_code}}        window.drawText(screen_title, 10, 10, 20, 80, 80, 80, 255);
+
+        // Queue the screenshot exactly once, after the configured delay,
+        // BEFORE `endFrame` so the capture lands on THIS frame's content
+        // (scene + GUI overlay just submitted). bgfx's `takeScreenshot`
+        // only stashes the path; `endFrame` issues the bgfx capture
+        // request right before the frame swap and pumps the extra frames
+        // the multi-threaded render path needs to flush the async capture
+        // to disk. Gated on the backend exposing the API so the template
+        // stays compatible with older bgfx backends.
+        //
+        // We intentionally do NOT break out of the loop after the capture:
+        // unlike raylib's synchronous `TakeScreenshot`, bgfx's clean exit
+        // would run `gpa.deinit()`, and any pre-existing teardown leak in
+        // the engine/plugins surfaces as a panic under the game's debug
+        // allocator. Letting `--timeout` SIGTERM the process avoids that
+        // path; the `.tga` is already on disk by the time the timeout
+        // fires. (One-shot is preserved via `screenshot_req = null`.)
+        if (comptime @hasDecl(window, "takeScreenshot")) {
+            if (screenshot_req) |req| {
+                const now_ns: i128 = engine.nowNs();
+                const elapsed_sec: f32 = @as(f32, @floatFromInt(now_ns - loop_start_ns)) / 1_000_000_000.0;
+                if (elapsed_sec >= req.after_sec) {
+                    window.takeScreenshot(req.path);
+                    screenshot_req = null;
+                    // Give the async bgfx capture its flush frames before a
+                    // pending `--ticks` exit can `break` (see decl above).
+                    screenshot_flush_left = screenshot_flush_frames;
+                }
+            }
+        }
+
+        window.endFrame();
+
+        // `--ticks=N`: exit cleanly after N rendered frames so CI / agent
+        // flows that just want "run for a bit then quit" don't have to rely
+        // on `--timeout` SIGTERM'ing the process. `endFrame` has already
+        // presented (and, for `--screenshot`, queued the capture for) this
+        // frame, so the count covers the frame just drawn. 0 = run forever.
+        // The counter advances EVERY frame (so the run length tracks `--ticks`,
+        // not `N + screenshot delay`); only the EXIT is held open while a
+        // screenshot is still pending (`screenshot_req != null`, so `--ticks`
+        // can't cut off a capture whose `--after` delay hasn't elapsed) or
+        // mid-flush (so the async bgfx readback can flush to disk first).
+        // Without that gate, `--ticks` + `--screenshot` together would exit
+        // before the file lands.
+        if (headless_max_ticks != 0) headless_tick_count += 1;
+        if (screenshot_flush_left > 0) screenshot_flush_left -= 1;
+        const screenshot_blocks_exit = screenshot_req != null or screenshot_flush_left > 0;
+        if (headless_max_ticks != 0 and headless_tick_count >= headless_max_ticks and !screenshot_blocks_exit) {
+            break;
+        }
+    }
+}

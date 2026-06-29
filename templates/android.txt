@@ -1,0 +1,164 @@
+// bgfx Android lifecycle (NativeActivity).
+//
+// Unlike the bgfx DESKTOP template — which owns a linear
+// `pub fn main() { init; while (!shouldClose) { tick; render } }` body —
+// the Android shell (`backends/bgfx/src/android_app.zig`) owns the event +
+// frame loop. The NativeActivity glue calls our exported `android_main`
+// on a dedicated app thread; from there `android_app.run(app)` pumps the
+// ALooper, brings bgfx up on `INIT_WINDOW`, and calls back into the game
+// once per frame (`tick_fn`) plus once at surface-ready (`init_fn`).
+//
+// So this template inverts the desktop body into three callbacks:
+//   * `gameInit`  — engine + scene init, fired ONCE after bgfx is live
+//                   (registered via `android_app.setInitCallback`).
+//   * `gameFrame` — one engine frame: tick + render (registered via
+//                   `android_app.setTickCallback`).
+//   * `android_main` — the C entry the glue calls. Registers the two
+//                   callbacks, then hands the loop to `android_app.run`.
+//
+// `labelle_provides_android_main` tells the backend's `android_app.zig` to
+// suppress ITS own `android_main` export (otherwise a duplicate symbol);
+// the game owns the entry so it can register callbacks before the loop.
+const android_app = @import("backend_app");
+const BackendGfxType = @import("backend_gfx");
+
+pub const labelle_provides_android_main = true;
+
+// Route zig `std.log` to Android logcat (tag "labelle"). Without a `logFn`,
+// std.log writes to stderr — invisible in `adb logcat` — so engine/backend
+// diagnostics never reach the device log (e.g. the surface_lost/surface_restored
+// markers and "first surface (cold init)" from the bgfx-android lifecycle).
+// bgfx's own C logging routes separately, which is why only bgfx lines showed
+// before. This is set on the generated `main.zig` (the root module), so it
+// covers ALL std.log across engine + backend + game. (#386 Phase 4 observability.)
+pub const std_options: std.Options = .{
+    .logFn = androidLogFn,
+};
+
+extern "c" fn __android_log_write(prio: c_int, tag: [*:0]const u8, text: [*:0]const u8) c_int;
+
+fn androidLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    _ = scope;
+    var buf: [1024]u8 = undefined;
+    const text = std.fmt.bufPrintZ(&buf, format, args) catch {
+        _ = __android_log_write(5, "labelle", "(log line truncated)");
+        return;
+    };
+    // ANDROID_LOG_*: DEBUG=3, INFO=4, WARN=5, ERROR=6.
+    const prio: c_int = switch (level) {
+        .debug => 3,
+        .info => 4,
+        .warn => 5,
+        .err => 6,
+    };
+    _ = __android_log_write(prio, "labelle", text);
+}
+
+// Android backend seam (#310 Stage 4). The engine's `src/android.zig` and
+// core's `gamepad_source/android.zig` no longer link any backend symbol
+// directly — they route their Android JNI calls (immersive mode + the
+// InputManager gamepad enumeration) through an `AndroidBackendContext` vtable
+// the active backend registers at startup (`registerAndroidBackend`). The bgfx
+// backend's adapter (`backends/bgfx/src/android.zig`, surfaced as
+// `backend_input.android`) builds that context from the bgfx NativeActivity
+// shell's stored `ANativeActivity*` (`labelle_bgfx_get_native_activity`) plus
+// the shared InputManager JNI glue. `gameInit` registers it once at startup,
+// before the first frame's gamepad poll.
+//
+// This replaces the previous sokol-compat shims (`sapp_android_get_native_-
+// activity`, inert `labelle_android_gamepad_init/_shutdown`): the `.so` now
+// exports a REAL JNI bridge and no fake `sapp_*` symbols.
+
+{{module_vars}}var g: AssembledGame = undefined;
+{{hooks_init_block}}
+var gpa = std.heap.DebugAllocator(.{}).init;
+
+const screen_w: u32 = {{width}};
+const screen_h: u32 = {{height}};
+const screen_title = "{{title}}";
+const target_fps: u32 = {{fps}};
+
+// {{platform_comment}}
+// One-shot surface-ready init: bgfx is already up against the
+// ANativeWindow surface (the shell called `window.initWindow` on
+// INIT_WINDOW just before firing this). Build the game, wire hooks, and
+// run the project's setup/scene-load code. Runs on the app thread, once.
+fn gameInit() callconv(.c) void {
+    const allocator = gpa.allocator();
+    g = AssembledGame.init(allocator);
+
+    g.setHooks(&hooks);
+    // The engine works in the DESIGN canvas (config height) — the gfx
+    // backend aspect-fits design→surface (setScreenSize/setDesignSize in
+    // gameFrame), so the engine must NOT be told the raw surface height or
+    // its coordinate math conflicts with the backend's fit. Matches the
+    // sokol Android template (which uses the config `screen_h`, not the
+    // ANativeWindow size). (An earlier revision fed the real surface height
+    // here — correct only before the backend had a design-size system.)
+    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+{{preview_setup}}{{init_code}}}
+
+// Per-frame tick: advance the engine, then render through bgfx. Mirrors
+// the desktop template's loop body (tick → beginFrame → render →
+// endFrame). The shell only calls this while the surface is live and
+// the activity is resumed, so no `isRunning()`/close handling is needed
+// here — the activity lifecycle drives shutdown.
+fn gameFrame() callconv(.c) void {
+    // Frame-rate-independent sim: derive dt from the real frame period
+    // (`window.frameDuration` measures it with a monotonic clock) instead of
+    // a fixed 0.016, so game speed doesn't drift if the device renders below
+    // its target rate. Clamp to 4 frames at target_fps so a stall (app
+    // backgrounded, GC pause) can't explode physics. Mirrors desktop.txt.
+    const dt: f32 = @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
+    // Engine works in the DESIGN canvas (config height); the gfx backend
+    // owns the design→surface aspect-fit below. Keep these consistent with
+    // gameInit and the sokol Android template.
+    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+    // Feed the gfx backend the REAL surface size (physical) + the design
+    // canvas (config), so it aspect-fits the 800x600-style design space
+    // into the device's actual resolution. Per-frame because the surface
+    // can change (rotation, pause/resume). Mirrors the sokol Android template.
+    BackendGfxType.setScreenSize(window.width(), window.height());
+    BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
+{{preview_heartbeat}}{{tick_code}}    g.tick(dt);
+
+    window.beginFrame();
+    window.clearBackground(245, 245, 245, 255);
+    g.render();
+    g.renderGizmos();
+{{gui_draw_code}}    window.endFrame();
+}
+
+// GPU-context-loss trampolines (epic #386 Phase 4). On Android,
+// APP_CMD_TERM_WINDOW destroys the GPU surface + every bgfx texture/shader,
+// and APP_CMD_INIT_WINDOW later recreates it. The bgfx shell fires these via
+// `setSurfaceLostCallback` / `setSurfaceRestoredCallback`; we forward to the
+// engine's `Game.surfaceLost()` / `surfaceRestored()`. `@hasDecl`-gated so an
+// OLDER engine without those methods still compiles (the call folds away).
+fn gameSurfaceLost() callconv(.c) void {
+    if (@hasDecl(@TypeOf(g), "surfaceLost")) g.surfaceLost();
+}
+fn gameSurfaceRestored() callconv(.c) void {
+    if (@hasDecl(@TypeOf(g), "surfaceRestored")) g.surfaceRestored();
+}
+
+// {{entry_comment}}
+// The NativeActivity glue (`android_native_app_glue.c`, compiled into the
+// `android_app` module) declares `extern void android_main(struct
+// android_app*)` and calls it on the app thread. We register the game's
+// init + frame callbacks, then hand the event/frame loop to the shell.
+export fn android_main(app: *android_app.android_app) callconv(.c) void {
+    android_app.setInitCallback(&gameInit);
+    android_app.setTickCallback(&gameFrame);
+    // GPU-context-loss callbacks (#386 Phase 4): the shell fires these around
+    // the TERM_WINDOW teardown / INIT_WINDOW restore so the engine can drop
+    // and rebuild its GPU catalog (sprites) across a surface cycle.
+    android_app.setSurfaceLostCallback(&gameSurfaceLost);
+    android_app.setSurfaceRestoredCallback(&gameSurfaceRestored);
+{{android_backend_register}}{{immersive_register}}    android_app.run(app);
+}

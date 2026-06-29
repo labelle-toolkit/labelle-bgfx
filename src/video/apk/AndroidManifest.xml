@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Minimal NativeActivity APK to verify the AMediaCodec decoder inside a real
+     app process (FP#549 Half 2). hasCode=false → pure native, no Java/dex.
+     The framework loads libdecodetest.so and calls ANativeActivity_onCreate. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.labelle.decodetest">
+
+    <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="34" />
+
+    <application android:hasCode="false" android:label="DecodeTest"
+        android:extractNativeLibs="true">
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true">
+            <meta-data android:name="android.app.lib_name" android:value="decodetest" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

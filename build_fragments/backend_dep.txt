@@ -1,0 +1,22 @@
+    const backend_dep = b.dependency("labelle_bgfx", .{ .target = target, .optimize = optimize, .gamepad_enabled = {{gamepad_enabled}}, .gamepad_hidapi = {{gamepad_hidapi}}, .gui_enabled = {{gui_enabled}} });
+    const backend_gfx = backend_dep.module("gfx");
+    const backend_input = backend_dep.module("input");
+    const backend_audio = backend_dep.module("audio");
+    const backend_window = backend_dep.module("window");
+    const bgfx_artifact = backend_dep.artifact("bgfx");
+    const glfw_artifact = backend_dep.artifact("glfw");
+
+    // Unify the app core onto the transitive `sdl_gamepad` desktop gamepad
+    // source — same diamond as `.backend_raylib`/`.backend_sokol` (see the note
+    // there). bgfx desktop reads gamepads through GLFW by default (#315), but
+    // when sdl_gamepad is wired in (`.gamepad = .auto`) the `input` module
+    // routes the desktop gamepad getters through the SDL HIDAPI source (so
+    // Switch-mode pads read). The bgfx `input` module reaches `GamepadEvent`
+    // through `sdl_gamepad` (imported under the `labelle_core` underscore key)
+    // rather than a direct core import, so the override target is the
+    // sdl_gamepad module, not `input`. `if` guard: only desktop bgfx wires
+    // sdl_gamepad in (Android uses android_gamepad). See labelle-assembler#271.
+    if (backend_input.import_table.get("sdl_gamepad")) |sdl_gp_mod| {
+        overrideImport(sdl_gp_mod, "labelle_core", core_mod);
+    }
+

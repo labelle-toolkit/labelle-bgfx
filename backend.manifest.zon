@@ -1,0 +1,78 @@
+.{
+    // ─────────────────────────────────────────────────────────────────────
+    // bgfx backend manifest — pluggable-backends RFC (assembler#378, epic#386
+    // Phase 3 / Phase 5 seam: codegen-splice).
+    //
+    // Declares — as DATA in the backend package — everything the assembler
+    // otherwise hardcodes in `switch (cfg.backend) => .bgfx` for the
+    // bgfx-DESKTOP target. The manifest-driven generation path
+    // (`src/codegen/manifest_splice.zig`) reads this instead of branching on
+    // the backend enum, and produces byte-identical `main.zig` + `build.zig`
+    // to the enum path. The path is taken whenever this file is PRESENT and
+    // the target is desktop (manifest-presence gate — no env var).
+    //
+    // SCOPE: desktop ONLY. bgfx's wasm/ios/android paths stay on the enum
+    // path — bgfx-android in particular carries NDK link ordering that is not
+    // declarative (the POC flagged this). This manifest declares desktop
+    // fields only; the splice falls back to enum for every non-desktop bgfx
+    // build. So this file does NOT make bgfx-android manifest-driven.
+    // ─────────────────────────────────────────────────────────────────────
+
+    // Package directory name under `backends/`. The enum path derives this from
+    // `@tagName(cfg.backend)`. As a manifest field it is plain data — the dir
+    // name no longer implies an enum tag.
+    .dir_name = "bgfx",
+
+    // Dependency package name used in the generated build.zig
+    // `b.dependency("labelle_bgfx", ...)` call. Enum path: `"labelle_" ++ @tagName`.
+    .dep_name = "labelle_bgfx",
+
+    // ── Run-loop style (the lifecycle splice, RFC §Q1) ──────────────────────
+    // bgfx-desktop is a LOOP backend: the generated `main()` drives a
+    // `while (!window.shouldQuit())` desktop loop (lifecycle/loop.zig +
+    // templates/desktop.txt), NOT the sokol-style init/frame/cleanup callbacks.
+    // Enum path: `use_callback_lifecycle = cfg.backend == .sokol or ...` is
+    // FALSE for bgfx-desktop. The manifest declares `.loop`, which the splice
+    // turns into `use_callback_lifecycle = (.loop == .callback) = false` —
+    // identical selection, now data-driven.
+    .loop_style = .loop,
+
+    // ── Main-loop template ──────────────────────────────────────────────────
+    // Path (relative to the backend package root) of the lifecycle template
+    // whose `{{placeholder}}`s the assembler fills with backend-AGNOSTIC game
+    // logic. Enum path: `loadBackendTemplate` maps bgfx-desktop →
+    // `@tagName(.desktop)` + ".txt" = `templates/desktop.txt`. Here it is a
+    // declared path landing on the SAME file.
+    .main_loop_template = "templates/desktop.txt",
+
+    // ── build.zig fragments (the embedded-section externalization) ───────────
+    // The enum path embeds the `backend_bgfx` + `link_bgfx` build.zig sections
+    // inside the assembler's OWN `src/templates/build_zig.txt`. This manifest
+    // moves them into the backend package as standalone fragment files, so the
+    // splice renders them WITHOUT a `=> .bgfx` enum branch. Paths are relative
+    // to the backend package root. The fragment bytes are extracted VERBATIM
+    // from the corresponding template sections, so output stays byte-identical.
+    .build_fragments = .{
+        // Emitted where the enum path calls
+        //   renderSection(build_zig_tmpl, "backend_bgfx", ...).
+        // Declares backend gfx/input/audio/window modules + bgfx/glfw
+        // artifacts and the sdl_gamepad core-unify override.
+        .backend_dep = "build_fragments/backend_dep.txt",
+        // Emitted where the enum path calls
+        //   writeSection(build_zig_tmpl, "link_bgfx").
+        // exe.root_module.linkLibrary(bgfx_artifact) + linkLibrary(glfw_artifact).
+        .link = "build_fragments/link.txt",
+    },
+
+    // ── Section parameters ({{placeholder}}s the fragments need) ─────────────
+    // The enum path passes a hardcoded struct to `renderSection`:
+    // `gamepad_enabled`, `gamepad_hidapi`, `gui_enabled`. (Note `gui_enabled`
+    // is bgfx's spelling of the imgui-only predicate — sokol spells the same
+    // thing `with_imgui`.) The splice computes their values from cfg using the
+    // same predicates as the enum path and feeds only the declared set.
+    // `link_bgfx` takes no params (emitted verbatim).
+    .params = .{
+        .backend_dep = .{ "gamepad_enabled", "gamepad_hidapi", "gui_enabled" },
+        .link = .{},
+    },
+}
