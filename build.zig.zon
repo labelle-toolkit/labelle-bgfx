@@ -22,7 +22,8 @@
         // #248) reached via `dep.path(...)` and compiled into `input` on
         // Android. Off Android nothing here is referenced.
         .labelle_android_gamepad = .{
-            .path = "android_gamepad",
+            .url = "https://github.com/labelle-toolkit/labelle-android-gamepad/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "labelle_android_gamepad-0.1.0-aniuyr7OAADukHTeqRqavrEvsUDAutllmC2KJDek0Ox9",
         },
         // Shared windowless-SDL desktop gamepad source (core#28). In-tree
         // sub-package shared with the raylib and sokol desktop backends via a
@@ -32,7 +33,8 @@
         // when `.gamepad = .auto`; off Android/desktop-disabled nothing here is
         // referenced.
         .labelle_sdl_gamepad = .{
-            .path = "sdl_gamepad",
+            .url = "https://github.com/labelle-toolkit/labelle-sdl-gamepad/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "labelle_sdl_gamepad-0.1.0-zOpuDcSwAABZaICKS4AEVvghHnZSNDyls-wzdnYc6cLQ",
         },
         // labelle-core (#310 Stage 4 + #386 Phase 3). The bgfx Android backend
         // adapter (`src/android.zig`) imports core for the `AndroidBackendContext`
@@ -74,11 +76,5 @@
         // Build inputs:
         "src",
         "libs",
-        // Vendored shared gamepad sub-packages (formerly the in-tree
-        // backends/sdl_gamepad + backends/android_gamepad referenced via `../`).
-        // Vendored so this out-of-tree package is self-contained; de-duplicating
-        // them into standalone repos shared with raylib/sokol is a follow-up.
-        "sdl_gamepad",
-        "android_gamepad",
     },
 }

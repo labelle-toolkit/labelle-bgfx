@@ -29,13 +29,11 @@ Opt in explicitly via `backend_package`:
 will resolve here transparently — that flip is deferred until this package is
 validated against real games.)
 
-## Self-contained
+## Shared gamepad packages
 
-This package vendors the shared desktop/Android gamepad sub-packages
-(`sdl_gamepad/`, `android_gamepad/`) that used to live in `backends/` and were
-referenced via `../`. They're vendored so the out-of-tree package is
-self-contained; de-duplicating them into standalone repos shared with the other
-backends (raylib/sokol) is a planned follow-up.
+The desktop/Android gamepad sources are versioned packages this backend depends
+on (not vendored): [`labelle-sdl-gamepad`](https://github.com/labelle-toolkit/labelle-sdl-gamepad)
+and [`labelle-android-gamepad`](https://github.com/labelle-toolkit/labelle-android-gamepad).
 
 | Path | Role |
 |------|------|
@@ -43,4 +41,3 @@ backends (raylib/sokol) is a planned follow-up.
 | `build_fragments/`, `templates/` | build.zig fragments + main-loop templates spliced at codegen time. |
 | `src/` | gfx / window / input / audio modules + the bgfx/glfw/Android glue. |
 | `libs/miniaudio/` | desktop audio device backend. |
-| `sdl_gamepad/`, `android_gamepad/` | vendored shared gamepad sources. |
