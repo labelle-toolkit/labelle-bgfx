@@ -17,7 +17,7 @@
 const std = @import("std");
 const texture = @import("../gfx/texture.zig");
 const types = @import("../gfx/types.zig");
-const planes = @import("video_hot").planes;
+const planes = @import("planes.zig");
 
 /// Comptime kill-switch for the GPU-side YUV→RGBA path (perf/gpu-yuv-video).
 /// When true (default) the player uploads raw Y/U/V planes to three R8 textures

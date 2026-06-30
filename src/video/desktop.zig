@@ -15,8 +15,8 @@
 //! and the `fs_yuv` shader use, so all three paths match.
 
 const std = @import("std");
-const yuv = @import("video_hot").yuv;
-const planes = @import("video_hot").planes;
+const yuv = @import("yuv.zig");
+const planes = @import("planes.zig");
 
 extern "c" fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
 extern "c" fn pclose(stream: *anyopaque) c_int;

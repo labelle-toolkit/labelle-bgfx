@@ -35,8 +35,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const yuv = @import("video_hot").yuv;
-const planes = @import("video_hot").planes;
+const yuv = @import("yuv.zig");
+const planes = @import("planes.zig");
 
 extern fn close(c_int) c_int;
 
