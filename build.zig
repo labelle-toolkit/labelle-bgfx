@@ -125,6 +125,19 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     gfx_mod.addImport("zbgfx", zbgfx_mod);
+
+    // Hot-path video CPU code (plane de-interleave + CPU YUV convert) pinned to
+    // ReleaseFast even when the game builds Debug — otherwise the per-frame NV12
+    // chroma gather floors the CPU and the intro video stutters on a debug APK
+    // (the rest of the game is fine). Pure-Zig leaf, so a per-module optimize
+    // override is safe + invisible to the rest of the build. See src/video/hot.zig.
+    const video_hot_mod = b.createModule(.{
+        .root_source_file = b.path("src/video/hot.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    gfx_mod.addImport("video_hot", video_hot_mod);
+
     // `@cInclude("stb_shim.h")` in gfx/texture.zig needs src/ on the
     // include path to find stb_shim.h → stb_image.h.
     gfx_mod.addIncludePath(b.path("src"));
