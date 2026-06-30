@@ -1,0 +1,58 @@
+{
+    // bgfx-on-Android render demo. All content is on the screen-space
+    // `hud` layer so the 800x600 design coords map straight onto the
+    // surface via the backend's design->surface aspect-fit (world-space
+    // layers route through the camera and land off-screen on a fresh
+    // scene).
+    //
+    // No `"assets": [...]` manifest is declared on purpose: this example
+    // has no loading scene, so it relies on the engine's eager-fallback
+    // (Debug builds load every registered project resource and let the
+    // atlas pop in when its decode lands) rather than the manifest gate,
+    // which would defer the scene until a loading controller advances it.
+    // The "icons" atlas comes from project.labelle's `.resources`.
+    "name": "main",
+    "entities": [
+        {
+            "name": "rect",
+            "components": {
+                "Position": { "x": 90, "y": 360 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 160, "height": 160 } },
+                    "color": { "r": 230, "g": 30, "b": 200, "a": 255 },
+                    "layer": "hud",
+                    "z_index": 1
+                }
+            }
+        },
+        {
+            "name": "circle",
+            "components": {
+                "Position": { "x": 620, "y": 150 },
+                "Shape": {
+                    "shape": { "circle": { "radius": 80 } },
+                    "color": { "r": 20, "g": 170, "b": 160, "a": 255 },
+                    "layer": "hud",
+                    "z_index": 1
+                }
+            }
+        },
+        {
+            // Textured sprite — the "icon" frame of the "icons" atlas,
+            // drawn through the bgfx textured-quad path. Its internal
+            // diamond pattern proves it is sampled from a GPU texture,
+            // not a flat-colored quad.
+            "name": "sprite",
+            "components": {
+                "Position": { "x": 400, "y": 300 },
+                "Sprite": {
+                    "sprite_name": "icon",
+                    "pivot": "center",
+                    "layer": "hud",
+                    "scale_x": 2.0,
+                    "scale_y": 2.0
+                }
+            }
+        }
+    ]
+}
