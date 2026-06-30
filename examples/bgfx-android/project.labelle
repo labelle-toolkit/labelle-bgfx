@@ -1,0 +1,49 @@
+// bgfx backend, Android platform — phase 4 of the bgfx-on-Android
+// bring-up (#303). On-device sibling of `examples/bgfx` (desktop). The
+// generated build compiles the game as a `lib<name>.so` for
+// `aarch64-linux-android`, importing the bgfx backend's Android-capable
+// gfx/input/audio/window modules plus the `android_app` NativeActivity
+// glue, and links the NDK libs (android, log, EGL, GLESv3, m, dl). The C++
+// runtime comes from Zig's toolchain, not the NDK's libc++_shared.so.
+//
+// The generated `main.zig` owns the NativeActivity `android_main` entry:
+// it registers a one-shot engine-init callback (fired once bgfx is up on
+// INIT_WINDOW) and a per-frame tick callback, then hands the event/frame
+// loop to `android_app.run`.
+//
+// Build: `labelle-assembler generate --project-root .` then
+// `cd .labelle/bgfx_android && zig build` (produces the .so) +
+// `zig build package` (wraps it as a NativeActivity APK).
+.{
+    .name = "example_bgfx_android",
+    .title = "LaBelle — bgfx (Android)",
+    .width = 800,
+    .height = 600,
+    .target_fps = 60,
+    .backend = .bgfx,
+    .y_axis = .up,
+    .ecs = .mock,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    .resources = .{
+        .{ .name = "icons", .json = "assets/icon.json", .texture = "assets/icon.tga" },
+    },
+    .layers = .{
+        .{ .name = "far_background", .order = 0, .space = .screen },
+        .{ .name = "terrain", .order = 1, .space = .world },
+        .{ .name = "characters", .order = 2, .space = .world },
+        .{ .name = "effects", .order = 3, .space = .world },
+        .{ .name = "hud", .order = 4, .space = .screen },
+    },
+    .android = .{
+        .app_name = "LaBelle bgfx",
+        .package_name = "com.labelle.bgfx_demo",
+        .min_sdk_version = 28,
+        .target_sdk_version = 34,
+    },
+    .core_version = "1.21.0",
+    .engine_version = "1.65.0",
+    .gfx_version = "1.19.0",
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../../labelle-assembler",
+}
