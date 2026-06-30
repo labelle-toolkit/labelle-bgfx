@@ -125,23 +125,6 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     gfx_mod.addImport("zbgfx", zbgfx_mod);
-
-    // Hot-path video CPU code (plane de-interleave + CPU YUV convert) pinned to
-    // ReleaseSafe even when the game builds Debug — otherwise the per-frame NV12
-    // chroma gather floors the CPU and the intro video stutters on a debug APK
-    // (the rest of the game is fine). ReleaseSafe (not ReleaseFast) so the
-    // optimizer still vectorizes the gather — easily fast enough for smooth video
-    // — WHILE keeping bounds checks + the module's `std.debug.assert` input guards
-    // live: planes/yuv index off decoder-provided dims/strides, so dropping safety
-    // (ReleaseFast) would risk OOB/UB on a malformed frame. Pure-Zig leaf, so the
-    // per-module optimize override is invisible to the rest of the build.
-    const video_hot_mod = b.createModule(.{
-        .root_source_file = b.path("src/video/hot.zig"),
-        .target = target,
-        .optimize = .ReleaseSafe,
-    });
-    gfx_mod.addImport("video_hot", video_hot_mod);
-
     // `@cInclude("stb_shim.h")` in gfx/texture.zig needs src/ on the
     // include path to find stb_shim.h → stb_image.h.
     gfx_mod.addIncludePath(b.path("src"));
