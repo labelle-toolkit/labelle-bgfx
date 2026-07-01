@@ -109,5 +109,10 @@ pub fn main() !void {
 
     g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
 
-{{preview_setup}}{{setup_code}}    emscripten_set_main_loop(&gameFrame, @intCast(target_fps), 1);
+    // Pass fps=0 so emscripten drives the loop via `requestAnimationFrame`
+    // (vsync-aligned, browser-friendly) instead of `setTimeout` — a non-zero
+    // fps triggers the browser's "use 0 for the frame rate" warning
+    // (labelle-bgfx#14). `target_fps` is still used above for the frame-rate-
+    // independent sim's dt clamp, so game timing is unchanged.
+{{preview_setup}}{{setup_code}}    emscripten_set_main_loop(&gameFrame, 0, 1);
 }
