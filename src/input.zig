@@ -318,6 +318,11 @@ pub fn setWindow(win: if (no_glfw) *anyopaque else *glfw.Window) void {
 // Only analyzed on wasm: referenced solely from `registerWasmMouse`, itself
 // reached only under `if (comptime is_wasm)`. `em`/`mouse_*` are the wasm defs.
 const wasm_canvas: [:0]const u8 = "#canvas";
+// Keyboard events don't target the canvas (it isn't keyboard-focusable) — they
+// go to the window. `EMSCRIPTEN_EVENT_TARGET_WINDOW` is the sentinel
+// `(const char*)2` (html5.h), which emscripten's findEventTarget special-cases
+// before treating the pointer as a selector string.
+const wasm_window_target: [*:0]const u8 = @ptrFromInt(2);
 
 /// DOM `MouseEvent.button` (0=left,1=middle,2=right) → the engine/GLFW canonical
 /// numbering (0=left,1=right,2=middle) that `mouse_down[]`, the engine getters,
@@ -647,9 +652,12 @@ fn registerWasmInput() void {
     _ = em.emscripten_set_touchend_callback_on_thread(wasm_canvas.ptr, null, true, wasmTouchEnd, em.CALLING_THREAD);
     _ = em.emscripten_set_touchcancel_callback_on_thread(wasm_canvas.ptr, null, true, wasmTouchEnd, em.CALLING_THREAD);
     // Keyboard / text (desktop web) — key state + imgui key/char feed (#16).
-    _ = em.emscripten_set_keydown_callback_on_thread(wasm_canvas.ptr, null, true, wasmKeyDown, em.CALLING_THREAD);
-    _ = em.emscripten_set_keyup_callback_on_thread(wasm_canvas.ptr, null, true, wasmKeyUp, em.CALLING_THREAD);
-    _ = em.emscripten_set_keypress_callback_on_thread(wasm_canvas.ptr, null, true, wasmKeyPress, em.CALLING_THREAD);
+    // Registered on the WINDOW (not the canvas): keyboard events target the
+    // focused element / window, and the canvas isn't keyboard-focusable, so
+    // canvas-targeted key callbacks never fire.
+    _ = em.emscripten_set_keydown_callback_on_thread(wasm_window_target, null, true, wasmKeyDown, em.CALLING_THREAD);
+    _ = em.emscripten_set_keyup_callback_on_thread(wasm_window_target, null, true, wasmKeyUp, em.CALLING_THREAD);
+    _ = em.emscripten_set_keypress_callback_on_thread(wasm_window_target, null, true, wasmKeyPress, em.CALLING_THREAD);
 }
 
 fn scrollCallback(_: *glfw.Window, _: f64, yoffset: f64) callconv(.c) void {
