@@ -154,7 +154,7 @@
             // (design §3 merge contract) — matching the enum `backend_bgfx_android`,
             // which forwards only `gui_enabled` (no gamepad flags on android).
             .dep_options = .{},
-            .package = .{ .apk = .{ .manifest = "AndroidManifest.xml.tmpl" } },
+            .package = .{ .apk = .{ .manifest = "src/video/apk/AndroidManifest.xml" } },
         },
         // No ios/wasm — bgfx ships no iOS/wasm templates (mobile is Android-only).
     },
