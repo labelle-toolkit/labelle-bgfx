@@ -235,6 +235,12 @@ fn initWindowWasm(w: i32, h: i32) void {
 
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
     bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));
+
+    // Register the HTML5 canvas mouse callbacks so Dear ImGui (and the engine)
+    // receive pointer input on the web (#24). No GLFW window on wasm, so this
+    // replaces the desktop `input.setWindow` call.
+    const input = @import("input");
+    input.initWasmInput();
 }
 
 /// Android init path: no GLFW. The `ANativeWindow*` surface must have
