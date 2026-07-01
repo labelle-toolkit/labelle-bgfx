@@ -32,6 +32,11 @@ const labelle_audio = @import("labelle-audio");
 const is_android = builtin.target.os.tag == .linux and
     (builtin.target.abi == .android or builtin.target.abi == .androideabi);
 
+// wasm/Emscripten has no OS playback device wired yet — use the shared
+// device-less NullSink so the mixer compiles + links under emcc (no miniaudio
+// C TU, no AAudio externs). Same observable behavior as headless.
+const is_wasm = builtin.target.cpu.arch.isWasm();
+
 // Output device, selected per target — the shared `DeviceSink` the mixer
 // drives. On Android it's the AAudio device (#306); on desktop it's the
 // miniaudio device. Both expose `ensureStarted`/`stop`/`framesMixed`, so they
@@ -40,6 +45,8 @@ const is_android = builtin.target.os.tag == .linux and
 // on Android, and the AAudio externs are never seen on desktop.
 const device_backend = if (is_android)
     @import("audio_device_android.zig")
+else if (is_wasm)
+    labelle_audio.NullSink
 else
     @import("audio_device.zig");
 

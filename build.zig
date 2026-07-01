@@ -678,10 +678,19 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // every zglfw reference behind `no_glfw` (Android OR wasm) and stubs the
     // getters, so the wasm example needs no input wiring. `android_gamepad` is
     // imported on every target (its Android symbols are internally gated).
+    // The manifest forwards `gui_enabled` on EVERY platform (base dep_option), so
+    // the assembler-generated build.zig passes `-Dgui_enabled` even on wasm.
+    // Declare it (defaults false) so the option resolves; forward it into the
+    // input module's imgui-bridge gate exactly as desktop/android do. gamepad_*
+    // stays desktop-only (no browser gamepad wiring yet). Note: imgui-on-wasm is
+    // not wired yet — this accepts + threads the option so the graph builds with
+    // gui_enabled=false; gui_enabled=true needs a follow-up imgui-on-emcc bridge.
+    const gui_enabled = b.option(bool, "gui_enabled", "Forward mouse/touch input to the imgui bridge (default false)") orelse false;
+
     const input_opts = b.addOptions();
     input_opts.addOption(bool, "gamepad_enabled", false);
     input_opts.addOption(bool, "gamepad_hidapi", false);
-    input_opts.addOption(bool, "gui_enabled", false);
+    input_opts.addOption(bool, "gui_enabled", gui_enabled);
     const input_mod = b.addModule("input", .{
         .root_source_file = b.path("src/input.zig"),
         .target = target,
@@ -691,6 +700,21 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     input_mod.addImport("labelle-core", core_mod);
     const android_gp_dep = b.dependency("labelle_android_gamepad", .{ .target = target, .optimize = optimize });
     input_mod.addImport("android_gamepad", android_gp_dep.module("android_gamepad"));
+
+    // ── Audio backend module (device-less on wasm) ──────────────────────
+    // The manifest lists `audio` as a base module on EVERY platform, so the
+    // assembler-generated build.zig does `backend_dep.module("audio")`. Create
+    // it here (mirroring desktop/android) — `src/audio.zig` comptime-selects the
+    // shared NullSink on wasm (no miniaudio C TU, no AAudio externs), so it
+    // compiles + links under emcc without an OS playback device.
+    const labelle_audio_dep = b.dependency("labelle_audio", .{ .target = target, .optimize = optimize });
+    const audio_mod = b.addModule("audio", .{
+        .root_source_file = b.path("src/audio.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    audio_mod.addImport("labelle-audio", labelle_audio_dep.module("labelle-audio"));
 
     // ── Window backend module ───────────────────────────────────────
     // No zglfw; src/window.zig comptime-selects `initWindowWasm`, which hands
