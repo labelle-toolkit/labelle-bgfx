@@ -40,6 +40,61 @@ const no_glfw = is_android or is_wasm;
 
 const glfw = if (no_glfw) struct {} else @import("zglfw");
 
+// ── wasm/emscripten HTML5 mouse input (#24) ─────────────────────────────
+// bgfx has no windowing framework on wasm (no GLFW), so — like the Android
+// NativeActivity glue feeds touch — we register emscripten HTML5 mouse
+// callbacks on the `#canvas` element and feed the module's mouse state. The
+// callbacks fire asynchronously between frames (browser event loop); `newFrame`
+// derives this-frame press/release edges and forwards to Dear ImGui, mirroring
+// the Android path. Hand-rolled externs (no `@cImport(<html5.h>)`, matching
+// window.zig): the `EmscriptenMouseEvent` layout is byte-faithful to emscripten
+// 4.x `html5.h`.
+const em = if (is_wasm) struct {
+    const MouseEvent = extern struct {
+        timestamp: f64,
+        screenX: i32,
+        screenY: i32,
+        clientX: i32,
+        clientY: i32,
+        ctrlKey: bool,
+        shiftKey: bool,
+        altKey: bool,
+        metaKey: bool,
+        button: u16,
+        buttons: u16,
+        movementX: i32,
+        movementY: i32,
+        targetX: i32,
+        targetY: i32,
+        canvasX: i32,
+        canvasY: i32,
+        padding: i32,
+    };
+    const WheelEvent = extern struct {
+        mouse: MouseEvent,
+        deltaX: f64,
+        deltaY: f64,
+        deltaZ: f64,
+        deltaMode: u32,
+    };
+    const MouseCb = *const fn (event_type: i32, e: *const MouseEvent, user: ?*anyopaque) callconv(.c) bool;
+    const WheelCb = *const fn (event_type: i32, e: *const WheelEvent, user: ?*anyopaque) callconv(.c) bool;
+    // `EM_CALLBACK_THREAD_CONTEXT_CALLING_THREAD` == (pthread_t)0x2 (html5.h).
+    const CALLING_THREAD: ?*anyopaque = @ptrFromInt(2);
+    extern "c" fn emscripten_set_mousemove_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: MouseCb, thread: ?*anyopaque) c_int;
+    extern "c" fn emscripten_set_mousedown_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: MouseCb, thread: ?*anyopaque) c_int;
+    extern "c" fn emscripten_set_mouseup_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: MouseCb, thread: ?*anyopaque) c_int;
+    extern "c" fn emscripten_set_wheel_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: WheelCb, thread: ?*anyopaque) c_int;
+    extern "c" fn emscripten_get_canvas_element_size(target: [*:0]const u8, w: *c_int, h: *c_int) c_int;
+    extern "c" fn emscripten_get_element_css_size(target: [*:0]const u8, w: *f64, h: *f64) c_int;
+} else struct {};
+
+// wasm mouse state, written by the HTML5 callbacks (async), read/latched in
+// `newFrame`. Kept separate from `mouse_down[]` (the frame-latched state) so a
+// press+release landing in the same frame is still observed as a click edge.
+var wasm_mouse_down: [MAX_MOUSE_BUTTONS]bool = [_]bool{false} ** MAX_MOUSE_BUTTONS;
+var wasm_wheel_accum: f32 = 0;
+
 // ── Android analog gamepad state (#310 Stage 4 / #250) ──────────────
 //
 // The shared `android_gamepad` module (`../android_gamepad`, also used by the
@@ -157,6 +212,7 @@ var glfw_window: if (no_glfw) ?*anyopaque else ?*glfw.Window = null;
 pub fn setWindow(win: if (no_glfw) *anyopaque else *glfw.Window) void {
     if (no_glfw) {
         glfw_window = win;
+        if (comptime is_wasm) registerWasmMouse();
         return;
     }
     glfw_window = win;
@@ -177,6 +233,99 @@ pub fn setWindow(win: if (no_glfw) *anyopaque else *glfw.Window) void {
         // the (then-defined) `imgui_bridge_char` export.
         if (comptime gui_enabled) _ = win.setCharCallback(charCallback);
     }
+}
+
+// ── wasm/emscripten HTML5 mouse callbacks (#24) ─────────────────────────
+// Only analyzed on wasm: referenced solely from `registerWasmMouse`, itself
+// reached only under `if (comptime is_wasm)`. `em`/`mouse_*` are the wasm defs.
+const wasm_canvas: [:0]const u8 = "#canvas";
+
+/// DOM `MouseEvent.button` (0=left,1=middle,2=right) → the engine/GLFW canonical
+/// numbering (0=left,1=right,2=middle) that `mouse_down[]`, the engine getters,
+/// and the imgui bridge's forwarded buttons all use. Returns null for others.
+fn domToCanonButton(dom: u16) ?u32 {
+    return switch (dom) {
+        0 => 0, // left
+        1 => 2, // DOM middle → canonical middle
+        2 => 1, // DOM right  → canonical right
+        else => null,
+    };
+}
+
+/// CSS-pixel → framebuffer-pixel scale. The HTML5 event's `targetX/Y` are CSS
+/// pixels relative to the canvas; the bridge renders (and the engine hit-tests)
+/// in the canvas drawing-buffer pixels reported by `get_canvas_element_size`.
+/// On a devicePixelRatio-1 display these are equal.
+fn wasmScale() struct { x: f32, y: f32 } {
+    var cw: c_int = 0;
+    var ch: c_int = 0;
+    var css_w: f64 = 0;
+    var css_h: f64 = 0;
+    _ = em.emscripten_get_canvas_element_size(wasm_canvas.ptr, &cw, &ch);
+    _ = em.emscripten_get_element_css_size(wasm_canvas.ptr, &css_w, &css_h);
+    const sx: f32 = if (css_w > 0) @as(f32, @floatFromInt(cw)) / @as(f32, @floatCast(css_w)) else 1;
+    const sy: f32 = if (css_h > 0) @as(f32, @floatFromInt(ch)) / @as(f32, @floatCast(css_h)) else 1;
+    return .{ .x = sx, .y = sy };
+}
+
+fn setWasmPos(e: *const em.MouseEvent) void {
+    const s = wasmScale();
+    mouse_x = @as(f32, @floatFromInt(e.targetX)) * s.x;
+    mouse_y = @as(f32, @floatFromInt(e.targetY)) * s.y;
+    // Feed imgui the position immediately (event-driven), so a click landing in
+    // the SAME frame as its move still hit-tests at the right spot. imgui buffers
+    // events and applies them at the next `NewFrame` (imgui_bridge_begin).
+    if (comptime gui_enabled) imgui.imgui_bridge_mouse_pos(mouse_x, mouse_y);
+}
+
+fn wasmMouseMove(_: i32, e: *const em.MouseEvent, _: ?*anyopaque) callconv(.c) bool {
+    setWasmPos(e);
+    return true;
+}
+
+fn wasmMouseDown(_: i32, e: *const em.MouseEvent, _: ?*anyopaque) callconv(.c) bool {
+    setWasmPos(e);
+    if (domToCanonButton(e.button)) |b| {
+        wasm_mouse_down[b] = true; // latched state for the engine's polling getters
+        // Event-driven for imgui: a mousedown+mouseup between two frames would
+        // collapse to "not pressed" if we only forwarded the per-frame latch, so
+        // the click would be lost. Forwarding each event lets imgui see the full
+        // down→up sequence and register the click.
+        if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(@intCast(b), true);
+    }
+    return true;
+}
+
+fn wasmMouseUp(_: i32, e: *const em.MouseEvent, _: ?*anyopaque) callconv(.c) bool {
+    setWasmPos(e);
+    if (domToCanonButton(e.button)) |b| {
+        wasm_mouse_down[b] = false;
+        if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(@intCast(b), false);
+    }
+    return true;
+}
+
+fn wasmWheel(_: i32, e: *const em.WheelEvent, _: ?*anyopaque) callconv(.c) bool {
+    // DOM wheel deltaY is +down; GLFW/desktop yoffset is +up. Negate to match,
+    // and normalize pixel-mode deltas (~100/notch) to imgui's ~1/notch scale.
+    const w = @as(f32, @floatCast(-e.deltaY / 100.0));
+    wasm_wheel_accum += w; // for the engine's per-frame getMouseWheelMove
+    if (comptime gui_enabled) imgui.imgui_bridge_mouse_wheel(0, w);
+    return true;
+}
+
+/// Register the HTML5 canvas mouse callbacks (wasm only). Called from
+/// `window.initWindowWasm` — the wasm analog of the desktop `setWindow` GLFW
+/// callback registration. No-op / comptime-eliminated off wasm.
+pub fn initWasmInput() void {
+    if (comptime is_wasm) registerWasmMouse();
+}
+
+fn registerWasmMouse() void {
+    _ = em.emscripten_set_mousemove_callback_on_thread(wasm_canvas.ptr, null, true, wasmMouseMove, em.CALLING_THREAD);
+    _ = em.emscripten_set_mousedown_callback_on_thread(wasm_canvas.ptr, null, true, wasmMouseDown, em.CALLING_THREAD);
+    _ = em.emscripten_set_mouseup_callback_on_thread(wasm_canvas.ptr, null, true, wasmMouseUp, em.CALLING_THREAD);
+    _ = em.emscripten_set_wheel_callback_on_thread(wasm_canvas.ptr, null, true, wasmWheel, em.CALLING_THREAD);
 }
 
 fn scrollCallback(_: *glfw.Window, _: f64, yoffset: f64) callconv(.c) void {
@@ -253,10 +402,26 @@ pub fn newFrame() void {
         return;
     }
 
-    // wasm: no GLFW poll and no html5 input feed yet — the per-frame edge arrays
-    // were already cleared above, so the getters report the empty state. Returning
-    // before the GLFW path keeps every zglfw reference comptime-eliminated.
-    if (comptime is_wasm) return;
+    // wasm: the HTML5 mouse callbacks (registerWasmMouse) updated `wasm_mouse_down`
+    // + `mouse_x/y` + `wasm_wheel_accum` asynchronously since the last frame. Latch
+    // them into the frame state: derive this-frame press/release EDGES (like the
+    // Android pointer path), copy the live down-state, drain the wheel, and forward
+    // to Dear ImGui. Returning here keeps every zglfw reference comptime-eliminated.
+    if (comptime is_wasm) {
+        // Latch the async-callback state into this frame's engine getters
+        // (isMouseButton{Down,Pressed,Released}, getMouseWheelMove). imgui is fed
+        // event-driven directly from the callbacks (see wasmMouse*), so no
+        // forwardGuiInput() here — that would double every imgui mouse event.
+        for (0..MAX_MOUSE_BUTTONS) |b| {
+            const cur = wasm_mouse_down[b];
+            if (cur and !mouse_down[b]) mouse_pressed[b] = true;
+            if (!cur and mouse_down[b]) mouse_released[b] = true;
+            mouse_down[b] = cur;
+        }
+        mouse_wheel = wasm_wheel_accum;
+        wasm_wheel_accum = 0;
+        return;
+    }
 
     glfw.pollEvents();
 
@@ -332,8 +497,9 @@ pub fn newFrame() void {
 const GUI_FORWARDED_BUTTONS = 3; // left(0), right(1), middle(2)
 
 fn guiButtonDown(button: u32) bool {
-    if (is_android) {
-        // Only the primary pointer → mouse button 0 is modelled on Android.
+    if (is_android or is_wasm) {
+        // Android: the primary pointer → mouse button 0. wasm: the HTML5 mouse
+        // callbacks maintain the full `mouse_down[]` (latched in `newFrame`).
         return button < MAX_MOUSE_BUTTONS and mouse_down[button];
     }
     // Desktop: read the live GLFW button state (same source as the engine's
@@ -395,7 +561,7 @@ pub fn isMouseButtonDown(button: u32) bool {
         // Touch maps onto mouse button 0 (see the Android touch state).
         return button < MAX_MOUSE_BUTTONS and mouse_down[button];
     }
-    if (comptime is_wasm) return false; // no html5 pointer feed yet
+    if (comptime is_wasm) return button < MAX_MOUSE_BUTTONS and mouse_down[button];
     if (glfw_window) |win| {
         return win.getMouseButton(@enumFromInt(button)) == .press;
     }
