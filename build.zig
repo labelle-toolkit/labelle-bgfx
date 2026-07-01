@@ -622,18 +622,50 @@ pub fn build(b: *std.Build) void {
 /// `is_wasm` is true, is the loud-fail equivalent that keeps desktop/android
 /// byte-unchanged.
 fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    // ── emscripten sysroot ───────────────────────────────────────────
+    // ── emscripten sysroot (sourced from the emsdk PACKAGE) ──────────
     // bgfx/bx/bimg (C++) and stb_image (C) need emscripten's libc/libc++/EGL/GLES
     // headers, which the Zig toolchain does NOT ship for wasm32-emscripten. The
     // proven spike recipe threads a `-Demsdk_sysroot` path into zbgfx (which
     // `addSystemIncludePath`s it onto bx/bimg/bgfx) and reuses it for our own
-    // stb C compile. Default to the Homebrew emscripten sysroot (matching the
-    // `emcc` on PATH used for the link below); override with `-Demsdk_sysroot`.
-    const emsdk_sysroot = b.option(
+    // stb C compile.
+    //
+    // Portability (labelle-bgfx#... ubuntu deploy fix): the sysroot MUST come
+    // from the `emsdk` package — NOT a hardcoded Homebrew path — so the wasm
+    // build works on any host (macOS / Linux CI / Windows) without a
+    // pre-installed local emscripten. Mirror the labelle-imgui bgfx bridge:
+    //   1. resolve the `emsdk` dependency,
+    //   2. default the sysroot to its packaged
+    //      `upstream/emscripten/cache/sysroot/include` (LazyPath),
+    //   3. run a one-time `emSdkSetupStep` (`emsdk install/activate latest`)
+    //      and make every C/C++ compile DEPEND on it, so the package sysroot is
+    //      populated before bx/bimg/bgfx + stb_image compile.
+    // `-Demsdk_sysroot` remains an explicit override for unusual setups.
+    const emsdk_dep = b.lazyDependency("emsdk", .{}) orelse
+        @panic("emsdk dependency unavailable for wasm build");
+
+    // One-time emsdk setup (install + activate). Populates/activates the
+    // package sysroot; a no-op (returns null) when the `.emscripten` marker is
+    // already present (shared package cache already activated). C/C++ compiles
+    // below depend on it so `-isystem .../sysroot/include` resolves to a
+    // populated path by the time bx/stb_image compile.
+    const emsdk_setup = emSdkSetupStep(b, emsdk_dep) catch @panic("emsdk setup failed");
+
+    const emsdk_sysroot_override = b.option(
         []const u8,
         "emsdk_sysroot",
-        "Path to the emscripten sysroot 'include' dir for the wasm C/C++ compiles",
-    ) orelse "/opt/homebrew/Cellar/emscripten/4.0.23/libexec/cache/sysroot/include";
+        "Path to the emscripten sysroot 'include' dir for the wasm C/C++ compiles (defaults to the emsdk package)",
+    );
+
+    // String form (zbgfx's `.emsdk_sysroot` option) + LazyPath form
+    // (`addSystemIncludePath`). Both resolve to the emsdk PACKAGE by default —
+    // portable, unlike the old Homebrew constant — unless `-Demsdk_sysroot`
+    // explicitly overrides them.
+    const packaged_sysroot = emsdk_dep.path("upstream/emscripten/cache/sysroot/include");
+    const emsdk_sysroot_str: []const u8 = emsdk_sysroot_override orelse packaged_sysroot.getPath(b);
+    const emsdk_sysroot_lp: std.Build.LazyPath = if (emsdk_sysroot_override) |p|
+        .{ .cwd_relative = p }
+    else
+        packaged_sysroot;
 
     // ── wasm/WebGL-capable zbgfx (apotema/zbgfx fork, #8) ────────────
     // Force `with_shaderc = false` (the host codegen tool can't build for wasm)
@@ -644,10 +676,22 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .target = target,
         .optimize = optimize,
         .with_shaderc = false,
-        .emsdk_sysroot = emsdk_sysroot,
+        .emsdk_sysroot = emsdk_sysroot_str,
     });
     const zbgfx_mod = zbgfx_dep.module("zbgfx");
     const bgfx_artifact = zbgfx_dep.artifact("bgfx");
+
+    // Ensure the emsdk sysroot is populated before bx/bimg/bgfx compile. Walk
+    // bgfx's transitive compile deps (bgfx + bx + bimg) so every C/C++ TU that
+    // consumes the `-isystem .../sysroot/include` waits on the setup step. On
+    // the old Homebrew path this ordering was implicit (brew pre-populated the
+    // sysroot); the package path needs explicit population.
+    if (emsdk_setup) |setup| {
+        bgfx_artifact.step.dependOn(&setup.step);
+        for (bgfx_artifact.getCompileDependencies(false)) |dep| {
+            if (dep.kind == .lib) dep.step.dependOn(&setup.step);
+        }
+    }
 
     // labelle-core — comptime contract conformance for gfx/window/input (same as
     // desktop/android). No core type crosses the engine seam through these
@@ -670,7 +714,8 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     gfx_mod.addImport("zbgfx", zbgfx_mod);
     gfx_mod.addImport("labelle-core", core_mod);
     gfx_mod.addIncludePath(b.path("src"));
-    gfx_mod.addSystemIncludePath(.{ .cwd_relative = emsdk_sysroot });
+    // Package (or overridden) emscripten sysroot for stb_image's `<stdlib.h>` etc.
+    gfx_mod.addSystemIncludePath(emsdk_sysroot_lp);
     gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_image_impl.c"), .flags = &.{} });
 
     // ── Input backend module ────────────────────────────────────────
@@ -750,6 +795,10 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .linkage = .static,
         .root_module = example_mod,
     });
+    // gfx_mod's stb_image C TU is compiled into this artifact and consumes the
+    // emsdk sysroot include path — wait on the setup step so the sysroot is
+    // populated first.
+    if (emsdk_setup) |setup| example_lib.step.dependOn(&setup.step);
 
     // Re-export the bgfx artifact (parity with the desktop/android installs).
     b.installArtifact(bgfx_artifact);
@@ -995,4 +1044,47 @@ fn ndkHostTag() []const u8 {
         .windows => "windows-x86_64",
         else => "linux-x86_64",
     };
+}
+
+// ── emsdk one-time setup (ported from sokol-zig) ───────────────────────
+//
+// Replicates sokol-zig's private `emSdkSetupStep` / `createEmsdkStep` /
+// `fileExistsEm` helpers verbatim so the wasm build can populate + activate the
+// emsdk sysroot from the `emsdk` PACKAGE without a pre-installed local
+// emscripten. Mirrors the labelle-imgui bgfx bridge (`bridges/bgfx/build.zig`).
+// Kept byte-compatible with the sokol implementation (same `.emscripten`
+// marker-file gate) so it shares the emsdk package cache without stepping on
+// other backends/bridges.
+
+fn createEmsdkStep(b: *std.Build, emsdk: *std.Build.Dependency) *std.Build.Step.Run {
+    if (builtin.os.tag == .windows) {
+        return b.addSystemCommand(&.{emsdk.path("emsdk.bat").getPath(b)});
+    } else {
+        const step = b.addSystemCommand(&.{"bash"});
+        step.addArg(emsdk.path("emsdk").getPath(b));
+        return step;
+    }
+}
+
+fn fileExistsEm(b: *std.Build, path: []const u8) !bool {
+    return !std.meta.isError(std.Io.Dir.cwd().access(b.graph.io, path, .{}));
+}
+
+/// One-time setup of the Emscripten SDK (runs `emsdk install + activate`).
+/// If the SDK had to be set up, a run step is returned that should be added
+/// as a dependency of anything needing the sysroot; if the emsdk was already
+/// set up (`.emscripten` marker present), null is returned.
+fn emSdkSetupStep(b: *std.Build, emsdk: *std.Build.Dependency) !?*std.Build.Step.Run {
+    const dot_emsc_path = emsdk.path(".emscripten").getPath(b);
+    const dot_emsc_exists = try fileExistsEm(b, dot_emsc_path);
+    if (!dot_emsc_exists) {
+        const emsdk_install = createEmsdkStep(b, emsdk);
+        emsdk_install.addArgs(&.{ "install", "latest" });
+        const emsdk_activate = createEmsdkStep(b, emsdk);
+        emsdk_activate.addArgs(&.{ "activate", "latest" });
+        emsdk_activate.step.dependOn(&emsdk_install.step);
+        return emsdk_activate;
+    } else {
+        return null;
+    }
 }
