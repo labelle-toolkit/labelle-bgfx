@@ -61,7 +61,7 @@ pub const HOOK_ABI_VERSION: u8 = 2;
 
 /// The platform tag the hook branches on. Mirrors `config.Platform` structurally so
 /// the hook needs no assembler import. bgfx supports desktop + android + wasm
-/// (labelle-bgfx#8 scaffolding); the ios variant exists for `HookContext`
+/// (labelle-bgfx#8, shipped in 0.4.x); the ios variant exists for `HookContext`
 /// shape-compatibility with `manifest_v2` and is never reached (bgfx declares no
 /// ios platform entry).
 pub const Platform = enum { desktop, ios, android, wasm };
@@ -270,10 +270,11 @@ fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
 
 // ── wasm emcc residual — the emLinkStep reconstruction (labelle-bgfx#8) ─────
 //
-// SCAFFOLDING, mirrors the proven raylib wasm hook. The hook is std-only and
-// cannot import the provider package, so — like raylib — the emcc link step is
-// reconstructed from ONLY `std.Build` + the emsdk dependency: it locates `emcc`
-// under the resolved emsdk (`emTool`) and shells out with the web settings.
+// Shipped (0.4.x, browser-verified); mirrors the proven raylib wasm hook. The
+// hook is std-only and cannot import the provider package, so — like raylib —
+// the emcc link step is reconstructed from ONLY `std.Build` + the emsdk
+// dependency: it locates `emcc` under the resolved emsdk (`emTool`) and shells
+// out with the web settings.
 //
 // The bgfx-specific emcc flag set: WebGL2 (bgfx creates its own context — no GLFW
 // emulation, no asyncify) + the GL proc-address helper bgfx needs, plus the

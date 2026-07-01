@@ -39,16 +39,16 @@ pub fn build(b: *std.Build) void {
     const is_android = target.result.os.tag == .linux and
         (target.result.abi == .android or target.result.abi == .androideabi);
 
-    // ── WASM (Emscripten) — SKELETON, spike-blocked (bgfx-wasm epic
-    // labelle-bgfx#8) ────────────────────────────────────────────────────────
+    // ── WASM (Emscripten / WebGL2) — SHIPPED, browser-verified (bgfx-wasm
+    // epic labelle-bgfx#8, released in 0.4.x) ────────────────────────────────
     // Self-contained early branch so the DESKTOP + ANDROID graph below is
     // byte-unchanged (they never reach `buildWasm`; `is_wasm` is false for
     // them). `buildWasm` mirrors the `is_android` carve-outs (no zglfw, no
-    // sdl_gamepad — both desktop-only — emsdk sysroot for the C compile) but
-    // hard-fails at the load-bearing seam: HOW zbgfx exposes an
-    // emscripten/WebGL-built bgfx artifact is exactly what the parallel
-    // zbgfx-wasm-build spike is determining, so it is stubbed rather than
-    // guessed. Desktop/android are unaffected.
+    // sdl_gamepad — both desktop-only — emsdk sysroot for the C compile) and
+    // wires the full chain: the wasm/WebGL-capable zbgfx fork → a static Zig
+    // lib → an `emcc` link that emits `zig-out/web/wasm_demo.{html,js,wasm}`.
+    // A full labelle game builds+runs on bgfx/WebGL2 via the assembler's
+    // v2-manifest path. Desktop/android are unaffected.
     const is_wasm = target.result.cpu.arch.isWasm();
     if (is_wasm) {
         buildWasm(b, target, optimize);
@@ -597,30 +597,30 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(audio_tests).step);
 }
 
-/// WASM (Emscripten) build — SKELETON, spike-blocked (bgfx-wasm epic
-/// labelle-bgfx#8).
+/// WASM (Emscripten / WebGL2) build — SHIPPED + browser-verified (bgfx-wasm
+/// epic labelle-bgfx#8, released in 0.4.x).
 ///
-/// Mirrors the PROVEN sokol/raylib wasm pattern for the pieces that DON'T depend
-/// on the parallel zbgfx-wasm-build spike:
+/// Mirrors the PROVEN sokol/raylib wasm pattern:
 ///   * emsdk sysroot plumbed into the C compile so `stb_image_impl.c` finds
 ///     `<stdlib.h>`/`<stdio.h>` — Zig ships no libc headers for
 ///     wasm32-emscripten; they live in emsdk's sysroot (mirrors labelle-sokol's
-///     build.zig). Fetched lazily so a desktop/android build never pulls emsdk.
+///     build.zig). Defaults to the Homebrew emscripten sysroot; override with
+///     `-Demsdk_sysroot`.
 ///   * no zglfw and no sdl_gamepad (both desktop-only), matching the is_android
 ///     carve-outs in `build()`.
 ///
 /// The load-bearing seam — resolving the zbgfx wasm/WebGL bgfx artifact + the
-/// bgfx WebGL context init — is what the spike determines, so it is a
-/// TODO(#8 spike) rather than a guess. Until then this hard-fails so a
-/// `zig build -Dtarget=wasm32-emscripten` errors LOUDLY + clearly instead of
-/// silently linking a desktop artifact.
+/// bgfx WebGL2 context init — is handled by the apotema/zbgfx fork: bgfx creates
+/// its own WebGL2 context on `#canvas`, runs single-threaded, and drives the
+/// frame from `emscripten_set_main_loop`. This branch builds the wasm/WebGL
+/// zbgfx, compiles the Zig side to a static lib, and links it with `emcc` (the
+/// system `emcc` on PATH — matching the sysroot above — or an activated emsdk)
+/// into `zig-out/web/wasm_demo.{html,js,wasm}` (`zig build wasm-example`). The
+/// assembler-generated app takes the same shape via templates/wasm.txt +
+/// backend.hook.zig's emcc arm.
 ///
-/// NOTE: a literal top-level `@compileError` cannot serve as the guard — the
-/// wasm target is a RUNTIME value from `-Dtarget`, so a `@compileError` would be
-/// analyzed (and fire) for the desktop/android builds too and break their
-/// `zig build`. This build-configuration `@panic`, reachable ONLY when
-/// `is_wasm` is true, is the loud-fail equivalent that keeps desktop/android
-/// byte-unchanged.
+/// Known caveats (not build blockers): video traps on wasm (labelle-bgfx#13)
+/// and the main-loop rAF integration (labelle-bgfx#14).
 fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // ── emscripten sysroot ───────────────────────────────────────────
     // bgfx/bx/bimg (C++) and stb_image (C) need emscripten's libc/libc++/EGL/GLES
