@@ -77,14 +77,44 @@ const em = if (is_wasm) struct {
         deltaZ: f64,
         deltaMode: u32,
     };
+    // EmscriptenTouchPoint / EmscriptenTouchEvent (html5.h), byte-faithful.
+    const TouchPoint = extern struct {
+        identifier: i32,
+        screenX: i32,
+        screenY: i32,
+        clientX: i32,
+        clientY: i32,
+        pageX: i32,
+        pageY: i32,
+        isChanged: bool,
+        onTarget: bool,
+        targetX: i32,
+        targetY: i32,
+        canvasX: i32,
+        canvasY: i32,
+    };
+    const TouchEvent = extern struct {
+        timestamp: f64,
+        numTouches: i32,
+        ctrlKey: bool,
+        shiftKey: bool,
+        altKey: bool,
+        metaKey: bool,
+        touches: [32]TouchPoint,
+    };
     const MouseCb = *const fn (event_type: i32, e: *const MouseEvent, user: ?*anyopaque) callconv(.c) bool;
     const WheelCb = *const fn (event_type: i32, e: *const WheelEvent, user: ?*anyopaque) callconv(.c) bool;
+    const TouchCb = *const fn (event_type: i32, e: *const TouchEvent, user: ?*anyopaque) callconv(.c) bool;
     // `EM_CALLBACK_THREAD_CONTEXT_CALLING_THREAD` == (pthread_t)0x2 (html5.h).
     const CALLING_THREAD: ?*anyopaque = @ptrFromInt(2);
     extern "c" fn emscripten_set_mousemove_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: MouseCb, thread: ?*anyopaque) c_int;
     extern "c" fn emscripten_set_mousedown_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: MouseCb, thread: ?*anyopaque) c_int;
     extern "c" fn emscripten_set_mouseup_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: MouseCb, thread: ?*anyopaque) c_int;
     extern "c" fn emscripten_set_wheel_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: WheelCb, thread: ?*anyopaque) c_int;
+    extern "c" fn emscripten_set_touchstart_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: TouchCb, thread: ?*anyopaque) c_int;
+    extern "c" fn emscripten_set_touchend_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: TouchCb, thread: ?*anyopaque) c_int;
+    extern "c" fn emscripten_set_touchmove_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: TouchCb, thread: ?*anyopaque) c_int;
+    extern "c" fn emscripten_set_touchcancel_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: TouchCb, thread: ?*anyopaque) c_int;
     extern "c" fn emscripten_get_canvas_element_size(target: [*:0]const u8, w: *c_int, h: *c_int) c_int;
     extern "c" fn emscripten_get_element_css_size(target: [*:0]const u8, w: *f64, h: *f64) c_int;
 } else struct {};
@@ -218,7 +248,8 @@ var glfw_window: if (no_glfw) ?*anyopaque else ?*glfw.Window = null;
 pub fn setWindow(win: if (no_glfw) *anyopaque else *glfw.Window) void {
     if (no_glfw) {
         glfw_window = win;
-        if (comptime is_wasm) registerWasmMouse();
+        // wasm registers its HTML5 mouse+touch callbacks via `initWasmInput`
+        // (called from `window.initWindowWasm`); Android has no setWindow input.
         return;
     }
     glfw_window = win;
@@ -331,18 +362,105 @@ fn wasmWheel(_: i32, e: *const em.WheelEvent, _: ?*anyopaque) callconv(.c) bool 
     return true;
 }
 
-/// Register the HTML5 canvas mouse callbacks (wasm only). Called from
+// ── wasm/emscripten HTML5 touch callbacks (mobile web) ──────────────────
+// Mirror the Android NativeActivity glue's single-primary-pointer model: map
+// the first touch point onto mouse button 0 + the cursor position, so imgui and
+// the engine's mouse-driven hit-testing see touch transparently. Also drive the
+// engine's touch getters (getTouchX/Y/Count/Id) for games that read touch
+// directly. Multi-touch (pinch) is a follow-up. Desktop fires mouse callbacks;
+// mobile fires these — a device just uses whichever it has.
+
+/// Position (scaled CSS→framebuffer) from the primary touch point.
+fn setWasmTouchPos(t: *const em.TouchPoint) void {
+    const s = wasmScale();
+    mouse_x = @as(f32, @floatFromInt(t.targetX)) * s.x;
+    mouse_y = @as(f32, @floatFromInt(t.targetY)) * s.y;
+    // Engine touch getters (Android-parity): expose as touch index 0.
+    touch_x = mouse_x;
+    touch_y = mouse_y;
+    if (comptime gui_enabled) imgui.imgui_bridge_mouse_pos(mouse_x, mouse_y);
+}
+
+/// Number of valid entries in the event's touch array (clamped to the fixed 32).
+fn wasmTouchCount(e: *const em.TouchEvent) usize {
+    if (e.numTouches <= 0) return 0;
+    return @min(@as(usize, @intCast(e.numTouches)), e.touches.len);
+}
+
+/// The touch point matching `id`, if present in this event.
+fn findWasmTouch(e: *const em.TouchEvent, id: u64) ?*const em.TouchPoint {
+    for (e.touches[0..wasmTouchCount(e)]) |*t| {
+        if (@as(u64, @intCast(t.identifier)) == id) return t;
+    }
+    return null;
+}
+
+// Single-primary-pointer model (Android-parity): the FIRST finger down becomes
+// the pointer, tracked by its `identifier`; other fingers are ignored until it
+// lifts. This prevents a second finger from emitting an extra button-0 press or
+// a stray finger's `touchend` from releasing an in-progress drag. (Multi-touch /
+// pinch is a follow-up.)
+fn wasmTouchStart(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bool {
+    if (e.numTouches <= 0) return true;
+    if (touch_active) return true; // already tracking a primary finger
+    const t = &e.touches[0];
+    touch_id = @intCast(t.identifier);
+    setWasmTouchPos(t);
+    touch_active = true;
+    pointer_down = true;
+    wasm_mouse_down[0] = true;
+    wasm_mouse_pressed_accum[0] = true;
+    if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(0, true);
+    return true;
+}
+
+fn wasmTouchMove(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bool {
+    if (!touch_active) return true;
+    if (findWasmTouch(e, touch_id)) |t| setWasmTouchPos(t);
+    return true;
+}
+
+fn wasmTouchEnd(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bool {
+    if (!touch_active) return true;
+    // The primary is still down iff it appears in this event as an ACTIVE
+    // (not-changed) touch — true whether emscripten includes the ended touch
+    // (as `isChanged`) or omits it. If so, a non-primary finger ended: keep the
+    // pointer down and just refresh position.
+    for (e.touches[0..wasmTouchCount(e)]) |*t| {
+        if (@as(u64, @intCast(t.identifier)) == touch_id and !t.isChanged) {
+            setWasmTouchPos(t);
+            return true;
+        }
+    }
+    // Primary finger lifted → release the pointer.
+    touch_active = false;
+    pointer_down = false;
+    if (wasm_mouse_down[0]) {
+        wasm_mouse_down[0] = false;
+        wasm_mouse_released_accum[0] = true;
+        if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(0, false);
+    }
+    return true;
+}
+
+/// Register the HTML5 canvas mouse + touch callbacks (wasm only). Called from
 /// `window.initWindowWasm` — the wasm analog of the desktop `setWindow` GLFW
 /// callback registration. No-op / comptime-eliminated off wasm.
 pub fn initWasmInput() void {
-    if (comptime is_wasm) registerWasmMouse();
+    if (comptime is_wasm) registerWasmInput();
 }
 
-fn registerWasmMouse() void {
+fn registerWasmInput() void {
+    // Mouse (desktop web)
     _ = em.emscripten_set_mousemove_callback_on_thread(wasm_canvas.ptr, null, true, wasmMouseMove, em.CALLING_THREAD);
     _ = em.emscripten_set_mousedown_callback_on_thread(wasm_canvas.ptr, null, true, wasmMouseDown, em.CALLING_THREAD);
     _ = em.emscripten_set_mouseup_callback_on_thread(wasm_canvas.ptr, null, true, wasmMouseUp, em.CALLING_THREAD);
     _ = em.emscripten_set_wheel_callback_on_thread(wasm_canvas.ptr, null, true, wasmWheel, em.CALLING_THREAD);
+    // Touch (mobile web) — primary pointer → mouse button 0 + touch getters.
+    _ = em.emscripten_set_touchstart_callback_on_thread(wasm_canvas.ptr, null, true, wasmTouchStart, em.CALLING_THREAD);
+    _ = em.emscripten_set_touchmove_callback_on_thread(wasm_canvas.ptr, null, true, wasmTouchMove, em.CALLING_THREAD);
+    _ = em.emscripten_set_touchend_callback_on_thread(wasm_canvas.ptr, null, true, wasmTouchEnd, em.CALLING_THREAD);
+    _ = em.emscripten_set_touchcancel_callback_on_thread(wasm_canvas.ptr, null, true, wasmTouchEnd, em.CALLING_THREAD);
 }
 
 fn scrollCallback(_: *glfw.Window, _: f64, yoffset: f64) callconv(.c) void {
@@ -609,22 +727,24 @@ pub fn getMouseWheelMove() f32 {
 // it as touch index 0 (multi-touch is a later phase).
 
 pub fn getTouchCount() u32 {
-    if (is_android) return if (touch_active) 1 else 0;
+    // Android NativeActivity glue OR wasm HTML5 touch callbacks feed the single
+    // primary pointer into `touch_active`/`touch_*`.
+    if (is_android or is_wasm) return if (touch_active) 1 else 0;
     return 0; // GLFW desktop: no touch support
 }
 
 pub fn getTouchX(index: u32) f32 {
-    if (is_android and index == 0 and touch_active) return touch_x;
+    if ((is_android or is_wasm) and index == 0 and touch_active) return touch_x;
     return 0;
 }
 
 pub fn getTouchY(index: u32) f32 {
-    if (is_android and index == 0 and touch_active) return touch_y;
+    if ((is_android or is_wasm) and index == 0 and touch_active) return touch_y;
     return 0;
 }
 
 pub fn getTouchId(index: u32) u64 {
-    if (is_android and index == 0 and touch_active) return touch_id;
+    if ((is_android or is_wasm) and index == 0 and touch_active) return touch_id;
     return 0;
 }
 
