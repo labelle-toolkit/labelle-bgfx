@@ -5,6 +5,7 @@
 /// namespace — every zglfw reference below is comptime-gated on
 /// `is_android` so the module compiles for `aarch64-linux-android`.
 const builtin = @import("builtin");
+const std = @import("std");
 
 /// labelle-core, for the comptime input-contract conformance gate below.
 const core = @import("labelle-core");
@@ -423,32 +424,54 @@ fn wasmWheel(_: i32, e: *const em.WheelEvent, _: ?*anyopaque) callconv(.c) bool 
 // engine key state (`keys_pressed`/`keys_released` edges + `wasm_key_down` for
 // `isKeyDown`) and imgui key events; keypress feeds typed characters to imgui.
 //
-// The engine's `KeyboardKey` codes equal the GLFW keycodes (see `keyCallback`),
-// but a browser `KeyboardEvent.keyCode` is the DOM legacy code, which differs
-// for the control keys. `domToGlfwKey` remaps those; letters (A–Z, DOM 65–90),
-// digits (0–9, DOM 48–57) and space (32) already coincide with GLFW. Unmapped
-// keys (F-keys, punctuation, numpad, …) are ignored for now.
+// The engine's `KeyboardKey` codes equal the GLFW keycodes (see `keyCallback`).
+// We map ENGINE key-state from the PHYSICAL `KeyboardEvent.code` token (e.g.
+// "KeyW"), NOT `keyCode`: `keyCode` reflects the PRODUCED CHARACTER, which is
+// layout-dependent — an AZERTY user pressing the physical W position reports
+// DOM `Z`, so keying off `keyCode` would break WASD vs desktop. `code` is
+// layout-INDEPENDENT (physical position), matching how desktop GLFW reports
+// keys. TEXT input stays on the keypress/char path (`imgui_bridge_char`), which
+// SHOULD be layout-dependent — only engine key-state uses physical `code`.
+// Unmapped keys (F-keys, punctuation, numpad, …) are ignored for now.
 
-/// DOM `KeyboardEvent.keyCode` → GLFW/engine keycode, or null when unmapped.
-fn domToGlfwKey(dom: u32) ?u32 {
-    return switch (dom) {
-        65...90 => dom, // A–Z (DOM == GLFW)
-        48...57 => dom, // 0–9 (DOM == GLFW)
-        32 => 32, // Space
-        13 => 257, // Enter
-        27 => 256, // Escape
-        8 => 259, // Backspace
-        9 => 258, // Tab
-        46 => 261, // Delete
-        37 => 263, // Arrow Left
-        38 => 265, // Arrow Up
-        39 => 262, // Arrow Right
-        40 => 264, // Arrow Down
-        16 => 340, // Shift  → GLFW LEFT_SHIFT
-        17 => 341, // Ctrl   → GLFW LEFT_CONTROL
-        18 => 342, // Alt    → GLFW LEFT_ALT
-        else => null,
-    };
+/// Physical `KeyboardEvent.code` token → GLFW/engine keycode, or null when
+/// unmapped. GLFW letter/digit codes coincide with ASCII: A=65..Z=90, 0=48..9=57.
+fn codeToGlfwKey(code: []const u8) ?u32 {
+    // Letter keys "KeyA".."KeyZ" → GLFW 65..90 (== the ASCII uppercase letter).
+    if (code.len == 4 and std.mem.eql(u8, code[0..3], "Key")) {
+        const c = code[3];
+        if (c >= 'A' and c <= 'Z') return c;
+    }
+    // Top-row digit keys "Digit0".."Digit9" → GLFW 48..57 (numpad is ignored).
+    if (code.len == 6 and std.mem.eql(u8, code[0..5], "Digit")) {
+        const d = code[5];
+        if (d >= '0' and d <= '9') return d;
+    }
+    const eql = std.mem.eql;
+    if (eql(u8, code, "Space")) return 32;
+    if (eql(u8, code, "Enter")) return 257;
+    if (eql(u8, code, "Escape")) return 256;
+    if (eql(u8, code, "Backspace")) return 259;
+    if (eql(u8, code, "Tab")) return 258;
+    if (eql(u8, code, "Delete")) return 261;
+    if (eql(u8, code, "ArrowLeft")) return 263;
+    if (eql(u8, code, "ArrowUp")) return 265;
+    if (eql(u8, code, "ArrowRight")) return 262;
+    if (eql(u8, code, "ArrowDown")) return 264;
+    if (eql(u8, code, "ShiftLeft")) return 340; // GLFW LEFT_SHIFT
+    if (eql(u8, code, "ShiftRight")) return 344; // GLFW RIGHT_SHIFT
+    if (eql(u8, code, "ControlLeft")) return 341; // GLFW LEFT_CONTROL
+    if (eql(u8, code, "ControlRight")) return 345; // GLFW RIGHT_CONTROL
+    if (eql(u8, code, "AltLeft")) return 342; // GLFW LEFT_ALT
+    if (eql(u8, code, "AltRight")) return 346; // GLFW RIGHT_ALT
+    if (eql(u8, code, "MetaLeft")) return 343; // GLFW LEFT_SUPER (macOS Cmd)
+    if (eql(u8, code, "MetaRight")) return 347; // GLFW RIGHT_SUPER (macOS Cmd)
+    return null;
+}
+
+/// The physical `code` token as a NUL-terminated slice of the fixed [32]u8.
+fn wasmKeyCode(e: *const em.KeyboardEvent) []const u8 {
+    return std.mem.sliceTo(&e.code, 0);
 }
 
 // All three key callbacks return FALSE so emscripten does NOT call
@@ -457,7 +480,7 @@ fn domToGlfwKey(dom: u32) ?u32 {
 // and swallow browser shortcuts. The FP web page is a fullscreen canvas, so we
 // don't need to consume keys to stop page-scroll; text-input correctness wins.
 fn wasmKeyDown(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) bool {
-    if (domToGlfwKey(e.keyCode)) |code| {
+    if (codeToGlfwKey(wasmKeyCode(e))) |code| {
         wasm_key_down[code] = true; // held-state for isKeyDown (no poll on wasm)
         // Auto-repeat isn't a fresh press: skip the edge accum + the imgui key
         // event (imgui auto-repeats from held state), matching desktop.
@@ -470,7 +493,7 @@ fn wasmKeyDown(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) 
 }
 
 fn wasmKeyUp(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) bool {
-    if (domToGlfwKey(e.keyCode)) |code| {
+    if (codeToGlfwKey(wasmKeyCode(e))) |code| {
         wasm_key_down[code] = false;
         wasm_key_released_accum[code] = true; // latched into keys_released in newFrame
         if (comptime gui_enabled) imgui.imgui_bridge_key(@intCast(code), false);
