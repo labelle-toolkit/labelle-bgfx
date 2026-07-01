@@ -93,6 +93,12 @@ const em = if (is_wasm) struct {
 // `newFrame`. Kept separate from `mouse_down[]` (the frame-latched state) so a
 // press+release landing in the same frame is still observed as a click edge.
 var wasm_mouse_down: [MAX_MOUSE_BUTTONS]bool = [_]bool{false} ** MAX_MOUSE_BUTTONS;
+// Edge accumulators: a mousedown+mouseup that both land BETWEEN two `newFrame`s
+// leaves `wasm_mouse_down` back at its old level, so a level-diff alone would
+// miss the click for the engine's polling getters (isMouseButtonPressed/Released).
+// The callbacks set these on each edge; `newFrame` ORs them in, then clears them.
+var wasm_mouse_pressed_accum: [MAX_MOUSE_BUTTONS]bool = [_]bool{false} ** MAX_MOUSE_BUTTONS;
+var wasm_mouse_released_accum: [MAX_MOUSE_BUTTONS]bool = [_]bool{false} ** MAX_MOUSE_BUTTONS;
 var wasm_wheel_accum: f32 = 0;
 
 // ── Android analog gamepad state (#310 Stage 4 / #250) ──────────────
@@ -287,6 +293,7 @@ fn wasmMouseDown(_: i32, e: *const em.MouseEvent, _: ?*anyopaque) callconv(.c) b
     setWasmPos(e);
     if (domToCanonButton(e.button)) |b| {
         wasm_mouse_down[b] = true; // latched state for the engine's polling getters
+        wasm_mouse_pressed_accum[b] = true; // press edge, even if released same frame
         // Event-driven for imgui: a mousedown+mouseup between two frames would
         // collapse to "not pressed" if we only forwarded the per-frame latch, so
         // the click would be lost. Forwarding each event lets imgui see the full
@@ -300,15 +307,25 @@ fn wasmMouseUp(_: i32, e: *const em.MouseEvent, _: ?*anyopaque) callconv(.c) boo
     setWasmPos(e);
     if (domToCanonButton(e.button)) |b| {
         wasm_mouse_down[b] = false;
+        wasm_mouse_released_accum[b] = true; // release edge, even if pressed same frame
         if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(@intCast(b), false);
     }
     return true;
 }
 
 fn wasmWheel(_: i32, e: *const em.WheelEvent, _: ?*anyopaque) callconv(.c) bool {
-    // DOM wheel deltaY is +down; GLFW/desktop yoffset is +up. Negate to match,
-    // and normalize pixel-mode deltas (~100/notch) to imgui's ~1/notch scale.
-    const w = @as(f32, @floatCast(-e.deltaY / 100.0));
+    // Position imgui at the wheel event location first (so it scrolls the widget
+    // under the cursor), then forward the delta.
+    setWasmPos(&e.mouse);
+    // DOM wheel deltaY is +down; GLFW/desktop yoffset is +up → negate. Normalize
+    // to imgui's ~1-unit-per-notch by `deltaMode`: 0=pixels (~100/notch), 1=lines
+    // (~1/line), 2=pages. Dividing everything by 100 would under-scale line/page.
+    const raw: f32 = @floatCast(-e.deltaY);
+    const w: f32 = switch (e.deltaMode) {
+        0 => raw / 100.0, // DOM_DELTA_PIXEL
+        1 => raw, // DOM_DELTA_LINE
+        else => raw * 3.0, // DOM_DELTA_PAGE → a few notches
+    };
     wasm_wheel_accum += w; // for the engine's per-frame getMouseWheelMove
     if (comptime gui_enabled) imgui.imgui_bridge_mouse_wheel(0, w);
     return true;
@@ -414,10 +431,14 @@ pub fn newFrame() void {
         // forwardGuiInput() here — that would double every imgui mouse event.
         for (0..MAX_MOUSE_BUTTONS) |b| {
             const cur = wasm_mouse_down[b];
-            if (cur and !mouse_down[b]) mouse_pressed[b] = true;
-            if (!cur and mouse_down[b]) mouse_released[b] = true;
+            // OR the callback-accumulated edges so a click that both pressed and
+            // released between frames still registers (level-diff alone misses it).
+            if (wasm_mouse_pressed_accum[b] or (cur and !mouse_down[b])) mouse_pressed[b] = true;
+            if (wasm_mouse_released_accum[b] or (!cur and mouse_down[b])) mouse_released[b] = true;
             mouse_down[b] = cur;
         }
+        wasm_mouse_pressed_accum = [_]bool{false} ** MAX_MOUSE_BUTTONS;
+        wasm_mouse_released_accum = [_]bool{false} ** MAX_MOUSE_BUTTONS;
         mouse_wheel = wasm_wheel_accum;
         wasm_wheel_accum = 0;
         return;
