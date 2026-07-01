@@ -18,6 +18,13 @@ comptime {
     core.assertInput(@This());
 }
 
+// Contract-version tag (labelle-assembler#453 item 1). The assembler emits a
+// directional `@compileError` version assert in the generated game's main.zig
+// comparing this against labelle-core's `INPUT_CONTRACT_VERSION`. v1 is the
+// initial revision of the input contract.
+/// Input contract (keyboard/mouse/touch/gamepad state) revision this backend targets.
+pub const targets_input_contract: u32 = 1;
+
 const is_android = builtin.target.os.tag == .linux and
     (builtin.target.abi == .android or builtin.target.abi == .androideabi);
 
