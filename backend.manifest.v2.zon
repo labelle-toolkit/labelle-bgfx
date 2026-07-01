@@ -1,0 +1,169 @@
+.{
+    // ── bgfx backend manifest, SCHEMA v2 (build-graph manifest, epic #453 item 3,
+    // manifest-v2 Phase A cutover) — the DATA form of everything the assembler
+    // otherwise hardcodes for bgfx. Derived faithfully from this package's v1
+    // `backend.manifest.zon` + `build_fragments/{backend_dep,link}.txt` + the enum
+    // `backend_bgfx`/`link_bgfx`/`backend_bgfx_android`/`android_link_bgfx` sections
+    // + `templates/{desktop,android}.txt`. See docs/design/manifest-v2-build-graph.md
+    // §3/§4 in labelle-assembler.
+    //
+    // bgfx is the LAST + HARDEST backend converted to v2 (design §8). It is the
+    // first backend needing BOTH per-platform `loop_style` AND a platform-only
+    // `extra_modules` with a non-default `root_alias`:
+    //   - DESKTOP: `loop_style = .loop` (the generated main drives
+    //     `while (!window.shouldQuit())`). The fully-DECLARATIVE generic desktop path
+    //     (design §7 golden cell, NOT the sokol byte anchor). HOOKLESS on desktop:
+    //     the enum `link_bgfx` links the `bgfx` + `glfw` artifacts, no per-OS
+    //     frameworks — pure declarative graph data. `.target = .native`.
+    //   - ANDROID: `loop_style = .callback` (the NativeActivity runtime owns the
+    //     loop; the generated `main.zig` registers init/tick callbacks on the
+    //     `android_app` shell and calls `run`). This is the HOOK-BEARING conversion:
+    //     `resolve_target` picks the ABI before any `b.dependency`, and `post_wire`
+    //     supplies the bgfx-Android NDK residual (`addLibraryPath` + libc.txt — the
+    //     non-declarative NDK ordering the v1 manifest flagged as "not declarative").
+    //     `.target = .resolved`, `.package = .apk`.
+    //
+    // The `android_app` extra module is the load-bearing correctness bit (design §3
+    // review-correction #3): the enum path pulls it as `backend_dep.module("android_app")`
+    // and publishes it to the generated root under the alias `backend_app`, and the
+    // generated `main.zig` imports the NativeActivity shell via `@import("backend_app")`
+    // (see `templates/android.txt`). The DEFAULT alias would be `backend_android_app`,
+    // which breaks that import — so this module MUST declare
+    // `.root_alias = "backend_app"`.
+    //
+    // Core-diamond: bgfx-desktop's `input` module transitively pulls the desktop
+    // `sdl_gamepad` sub-package, which imports `labelle_core` (UNDERSCORE key) —
+    // handled generically by the `unifyCoreDiamond` walk rooted at `backend_input`
+    // (design §5), reproducing the enum `backend_bgfx` `if`-guarded override (see
+    // `build_fragments/backend_dep.txt`) without a per-backend site. bgfx-Android's
+    // `input` module imports `labelle-core` (HYPHEN key) directly for the
+    // `AndroidBackendContext` vtable (#310) — also covered by the same walk.
+    //
+    // Ships ALONGSIDE the retained v1 `backend.manifest.zon`: `generate` auto-detects
+    // this file (probing the resolved backend package for `backend.manifest.v2.zon`,
+    // #472 P2) and threads it + the `.build_hook` below through codegen. Both are
+    // listed in `build.zig.zon` `.paths` so they stage with the package.
+    .manifest_version = 2,
+    .dir_name = "bgfx",
+    .dep_name = "labelle_bgfx",
+    .id = "labelle.bgfx",
+
+    // Carried forward UNCHANGED from the v1 manifest — what bgfx ACTUALLY supports
+    // (verified against its src/, not copied from sokol): an Android build, GPU
+    // surface loss/restore, ASTC compressed-texture upload, screenshots, gamepad
+    // polling, and the in-backend imgui adapter. A non-empty set opts into
+    // resolve-time capability enforcement (design §3 review-correction #8); v2 must
+    // not drop capability negotiation.
+    .capabilities = .{
+        .android,
+        .surface_loss,
+        .compressed_textures,
+        .screenshots,
+        .gamepad_polling,
+        .raw_gui_adapter,
+    },
+
+    // root_alias defaults to `backend_<name>`, so the generated root imports these
+    // as `backend_gfx`/`backend_input`/… exactly as the enum path does. The
+    // platform-only `android_app` module (bgfx-Android's NativeActivity shell) is
+    // declared under `.platforms.android.extra_modules` with an explicit
+    // `root_alias = "backend_app"`.
+    .modules = .{
+        .{ .name = "gfx", .source = "src/gfx.zig" },
+        .{ .name = "input", .source = "src/input.zig" },
+        .{ .name = "audio", .source = "src/audio.zig" },
+        .{ .name = "window", .source = "src/window.zig" },
+    },
+
+    // BASE dep_options: `gui_enabled` (bgfx's spelling of the imgui-only predicate —
+    // sokol spells the same thing `with_imgui`) is forwarded on BOTH desktop AND
+    // android (enum `backend_bgfx` + `backend_bgfx_android`), so it belongs in the
+    // base. `gamepad_*` is desktop-only (the shared SDL desktop gamepad source —
+    // android uses android_gamepad), so it is a desktop-only per-platform append,
+    // NOT a base entry (design §3 merge contract). Option NAMES are declarative;
+    // VALUES come from the closed predicate set (design §4).
+    .dep_options = .{
+        .{ .name = "gui_enabled", .value = .gui_is_imgui },
+    },
+
+    // Android NDK system libs (enum `android_link_bgfx`), in the enum's link order.
+    // `android`/`log` back the NativeActivity glue + `__android_log_*`;
+    // `EGL`/`GLESv3` back bgfx's GLES renderer; `m`/`dl` are pulled by Bionic;
+    // `mediandk` backs the in-engine video decoder (#549); `aaudio` backs the AAudio
+    // output device (#306). Desktop links via artifacts only (no per-OS system libs
+    // or frameworks — enum `link_bgfx` / `build_fragments/link.txt` link `bgfx` +
+    // `glfw` only).
+    .system_libs = .{
+        .android = .{ "android", "log", "EGL", "GLESv3", "m", "dl", "mediandk", "aaudio" },
+    },
+
+    .platforms = .{
+        .desktop = .{
+            .entry = "templates/desktop.txt",
+            // bgfx-desktop drives the loop itself (`while (!window.shouldQuit())`),
+            // matching the v1 manifest's `loop_style = .loop`.
+            .loop_style = .loop,
+            .target = .native,
+            // bgfx-desktop links BOTH the `bgfx` renderer archive and the `glfw`
+            // windowing archive (enum `backend_bgfx` / `link_bgfx`). Android exposes
+            // only `bgfx` (no glfw — zglfw is desktop-only), which is why artifacts
+            // are per-platform.
+            .artifacts = .{ .{ .name = "bgfx" }, .{ .name = "glfw" } },
+            // gamepad_* is desktop-only (the shared SDL desktop gamepad source) —
+            // APPENDED to the base `gui_enabled`, so desktop's literal forwards all
+            // three flags (enum `backend_bgfx` / `build_fragments/backend_dep.txt`).
+            .dep_options = .{
+                .{ .name = "gamepad_enabled", .value = .gamepad_enabled },
+                .{ .name = "gamepad_hidapi", .value = .gamepad_hidapi },
+            },
+            .package = .binary,
+        },
+        .android = .{
+            .entry = "templates/android.txt",
+            // bgfx-Android is a NativeActivity CALLBACK backend: the runtime owns
+            // the loop and the generated main registers init/tick callbacks on the
+            // `android_app` shell (contrast desktop's `.loop`). This is the whole
+            // point of per-platform `loop_style` (design §3).
+            .loop_style = .callback,
+            // arm64/x86_64 by -Demulator/-Dandroid_arch/host — resolved by the hook
+            // `resolve_target` phase BEFORE any b.dependency (design §4).
+            .target = .resolved,
+            // Root-module PIC for the Android `.so` (design §2 note 1); the shared
+            // `android_exe_start` section also sets it on the createModule.
+            .pic = true,
+            // libc for the NDK build (enum `android_link_bgfx`).
+            .link_libc = true,
+            // Only the `bgfx` renderer archive on Android — no glfw (zglfw is
+            // desktop-only, #303). The bgfx C++ TUs are NDK-sysroot-wired by the
+            // backend's own build.zig, so the artifact needs no `.pic` here (contrast
+            // sokol_clib, whose include paths the hook wires) — enum
+            // `android_link_bgfx` links it without touching its module.
+            .artifacts = .{ .{ .name = "bgfx" } },
+            // The NativeActivity shell module (enum `backend_bgfx_android`): pulled as
+            // `backend_dep.module("android_app")` and published to the generated root
+            // under the alias `backend_app` (enum `android_exe_app_import`), which the
+            // generated `main.zig` imports as `@import("backend_app")` (see
+            // `templates/android.txt`). The default `backend_<name>` alias would be
+            // `backend_android_app` and break that import — so this MUST set
+            // `.root_alias = "backend_app"` (design §3 review-correction #3, the
+            // load-bearing correctness bit).
+            .extra_modules = .{
+                .{ .name = "android_app", .root_alias = "backend_app", .source = "src/android_app.zig" },
+            },
+            // Empty per-platform list → inherits the base `gui_enabled` UNCHANGED
+            // (design §3 merge contract) — matching the enum `backend_bgfx_android`,
+            // which forwards only `gui_enabled` (no gamepad flags on android).
+            .dep_options = .{},
+            .package = .{ .apk = .{ .manifest = "AndroidManifest.xml.tmpl" } },
+        },
+        // No ios/wasm — bgfx ships no iOS/wasm templates (mobile is Android-only).
+    },
+
+    // Dedicated hook file (NOT bgfx's own build.zig, which carries package-local
+    // top-level imports absent from the generated root package — design §3/§4).
+    // Desktop is fully declarative and never invokes the hook; the hook exists ONLY
+    // for the android residual: `resolve_target` (the ABI, design §4) + `post_wire`
+    // (the bgfx-Android NDK ordering — `addLibraryPath(usr/lib/<triple>/<api>)` +
+    // libc.txt — the non-declarative piece the v1 manifest flagged).
+    .build_hook = "backend.hook.zig",
+}

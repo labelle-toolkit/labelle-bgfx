@@ -71,6 +71,11 @@
         "build.zig.zon",
         // Assembler-consumed at codegen time (pluggable-backends #386):
         "backend.manifest.zon",
+        // Build-graph manifest v2 + its dedicated build hook (epic #453,
+        // manifest-v2 Phase A cutover). `generate` auto-detects the v2 manifest and
+        // stages the hook it names; both must ship with the package.
+        "backend.manifest.v2.zon",
+        "backend.hook.zig",
         "build_fragments",
         "templates",
         // Build inputs:
