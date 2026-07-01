@@ -31,6 +31,15 @@ comptime {
     core.assertBackend(@This());
 }
 
+// Contract-version tags (labelle-assembler#453 item 1). The assembler emits
+// directional `@compileError` version asserts in the generated game's main.zig
+// comparing these against labelle-core's `*_CONTRACT_VERSION` consts. v1 is the
+// initial revision of each contract.
+/// Draw contract (shape/sprite/camera primitives) revision this backend targets.
+pub const targets_draw_contract: u32 = 1;
+/// Loader contract (texture/image decode + upload) revision this backend targets.
+pub const targets_loader_contract: u32 = 1;
+
 // ── Backend types ──────────────────────────────────────────────────────
 
 pub const Texture = types.Texture;

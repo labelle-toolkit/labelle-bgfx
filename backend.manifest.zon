@@ -75,4 +75,48 @@
         .backend_dep = .{ "gamepad_enabled", "gamepad_hidapi", "gui_enabled" },
         .link = .{},
     },
+
+    // Canonical provider identity (#453). bgfx is an official provider, so it
+    // lives under the reserved `labelle.` namespace. The enum tag `.bgfx` is a
+    // shorthand for exactly this id — `validateProviderIdentity` drift-checks
+    // `id == "labelle." ++ @tagName(tag)`.
+    .id = "labelle.bgfx",
+
+    // Declared capabilities (#453) — what bgfx ACTUALLY supports, VERIFIED
+    // against the src/templates in this package (not copied from sokol):
+    //   - `.android`            — templates/android.txt exists (the bgfx Android
+    //                             backend, epic #296). NO wasm/ios templates, so
+    //                             those platform caps are deliberately absent.
+    //   - `.surface_loss`       — src/android_app.zig registers
+    //                             `setSurfaceLostCallback`/`setSurfaceRestoredCallback`
+    //                             for the Android GPU surface destroy/recreate
+    //                             lifecycle; also the android-derived requirement.
+    //   - `.compressed_textures`— src/gfx.zig re-exports `isCompressed`/
+    //                             `uploadCompressed` over src/gfx/astc.zig (ASTC
+    //                             GPU-native upload, #340).
+    //   - `.screenshots`        — src/window.zig `takeScreenshot`.
+    //   - `.gamepad_polling`    — src/input.zig exposes `isGamepadAvailable`/
+    //                             `isGamepadButtonDown`/`getGamepadAxisValue`
+    //                             (GLFW desktop + SDL HIDAPI + Android gamepad).
+    //   - `.raw_gui_adapter`    — the labelle-imgui bgfx bridge: src/input.zig
+    //                             forwards mouse/char input to the `imgui_bridge_*`
+    //                             externs under `gui_enabled`, and the bridge
+    //                             renders through bgfx's own sprite pipeline
+    //                             (raw_backend), not a separate GL bridge.
+    // NOT declared (code lacks them — declaring would let a project resolve to
+    // bgfx then hit a deep compile error):
+    //   - `.fonts`     — src/gfx/font.zig is an embedded 8x8 bitmap + drawText
+    //                    only; no `decodeFont`/`uploadFontAtlas` TTF-baking decls.
+    //   - `.audio_ogg` — src/audio.zig loads WAV only (labelle-audio 0.2.1 WAV
+    //                    decode); no OGG/Vorbis decoder.
+    //   - `.headless`  — bgfx always creates a GLFW window; the true no-window
+    //                    path is the separate `null` backend.
+    .capabilities = .{
+        .android,
+        .surface_loss,
+        .compressed_textures,
+        .screenshots,
+        .gamepad_polling,
+        .raw_gui_adapter,
+    },
 }

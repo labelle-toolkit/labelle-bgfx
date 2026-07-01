@@ -48,6 +48,15 @@ else
 /// surface; the public fns below forward to it.
 const Audio = labelle_audio.Mixer(device_backend);
 
+// Contract-version tags (labelle-assembler#453 item 1). The assembler emits
+// directional `@compileError` version asserts in the generated game's main.zig
+// comparing these against labelle-core's `AUDIO_PLAYBACK_CONTRACT_VERSION` /
+// `AUDIO_LOADER_CONTRACT_VERSION` consts. v1 is the initial revision of each.
+/// Audio playback contract (play/stop/volume of sounds + music) revision this backend targets.
+pub const targets_audio_playback_contract: u32 = 1;
+/// Audio loader contract (load/unload sound + music assets) revision this backend targets.
+pub const targets_audio_loader_contract: u32 = 1;
+
 // ── Lifecycle ────────────────────────────────────────────────────────
 
 /// Open the playback device on first use, driving the mixer from its

@@ -33,6 +33,13 @@ comptime {
     core.assertWindow(@This());
 }
 
+// Contract-version tag (labelle-assembler#453 item 1). The assembler emits a
+// directional `@compileError` version assert in the generated game's main.zig
+// comparing this against labelle-core's `WINDOW_CONTRACT_VERSION`. v1 is the
+// initial revision of the window contract.
+/// Window contract (lifecycle: width/height/frameDuration/shouldQuit) revision this backend targets.
+pub const targets_window_contract: u32 = 1;
+
 pub const ConfigFlags = struct {
     window_hidden: bool = false,
 };
