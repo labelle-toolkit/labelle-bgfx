@@ -39,6 +39,22 @@ pub fn build(b: *std.Build) void {
     const is_android = target.result.os.tag == .linux and
         (target.result.abi == .android or target.result.abi == .androideabi);
 
+    // ── WASM (Emscripten) — SKELETON, spike-blocked (bgfx-wasm epic
+    // labelle-bgfx#8) ────────────────────────────────────────────────────────
+    // Self-contained early branch so the DESKTOP + ANDROID graph below is
+    // byte-unchanged (they never reach `buildWasm`; `is_wasm` is false for
+    // them). `buildWasm` mirrors the `is_android` carve-outs (no zglfw, no
+    // sdl_gamepad — both desktop-only — emsdk sysroot for the C compile) but
+    // hard-fails at the load-bearing seam: HOW zbgfx exposes an
+    // emscripten/WebGL-built bgfx artifact is exactly what the parallel
+    // zbgfx-wasm-build spike is determining, so it is stubbed rather than
+    // guessed. Desktop/android are unaffected.
+    const is_wasm = target.result.cpu.arch.isWasm();
+    if (is_wasm) {
+        buildWasm(b, target, optimize);
+        return;
+    }
+
     // Desktop gamepad source toggle (core#28 slice 5), mirroring raylib/sokol.
     // When true (default, `.gamepad = .auto`), the shared windowless-SDL desktop
     // gamepad source is wired into `input` and SDL2 is linked on desktop, so the
@@ -579,6 +595,56 @@ pub fn build(b: *std.Build) void {
     wireMiniaudio(b, audio_test_mod, host_target.result.os.tag);
     const audio_tests = b.addTest(.{ .root_module = audio_test_mod });
     test_step.dependOn(&b.addRunArtifact(audio_tests).step);
+}
+
+/// WASM (Emscripten) build — SKELETON, spike-blocked (bgfx-wasm epic
+/// labelle-bgfx#8).
+///
+/// Mirrors the PROVEN sokol/raylib wasm pattern for the pieces that DON'T depend
+/// on the parallel zbgfx-wasm-build spike:
+///   * emsdk sysroot plumbed into the C compile so `stb_image_impl.c` finds
+///     `<stdlib.h>`/`<stdio.h>` — Zig ships no libc headers for
+///     wasm32-emscripten; they live in emsdk's sysroot (mirrors labelle-sokol's
+///     build.zig). Fetched lazily so a desktop/android build never pulls emsdk.
+///   * no zglfw and no sdl_gamepad (both desktop-only), matching the is_android
+///     carve-outs in `build()`.
+///
+/// The load-bearing seam — resolving the zbgfx wasm/WebGL bgfx artifact + the
+/// bgfx WebGL context init — is what the spike determines, so it is a
+/// TODO(#8 spike) rather than a guess. Until then this hard-fails so a
+/// `zig build -Dtarget=wasm32-emscripten` errors LOUDLY + clearly instead of
+/// silently linking a desktop artifact.
+///
+/// NOTE: a literal top-level `@compileError` cannot serve as the guard — the
+/// wasm target is a RUNTIME value from `-Dtarget`, so a `@compileError` would be
+/// analyzed (and fire) for the desktop/android builds too and break their
+/// `zig build`. This build-configuration `@panic`, reachable ONLY when
+/// `is_wasm` is true, is the loud-fail equivalent that keeps desktop/android
+/// byte-unchanged.
+fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    // target + optimize are consumed by the real module wiring (below TODO); a
+    // skeleton keeps the intended signature so the seam is drop-in once the
+    // spike resolves.
+    _ = target;
+    _ = optimize;
+
+    // emsdk sysroot for the stb_image C compile (mirrors labelle-sokol's
+    // build.zig + labelle-raylib). Lazily fetched so only a real wasm build
+    // pulls emsdk. TODO(#8 spike): attach this to the gfx module via
+    // `gfx_mod.addSystemIncludePath(...)` BEFORE `addCSourceFile` (see the sokol
+    // backend's build.zig), once the wasm module graph is wired below.
+    if (b.lazyDependency("emsdk", .{})) |emsdk_dep| {
+        _ = emsdk_dep.path("upstream/emscripten/cache/sysroot/include");
+    }
+
+    // TODO(#8 spike): wire the gfx/input/audio/window modules for wasm WITHOUT
+    // zglfw or sdl_gamepad (both desktop-only), mirroring the `is_android`
+    // branch in `build()`, then resolve + link the zbgfx wasm/WebGL bgfx
+    // artifact and create the bgfx WebGL canvas context. HOW zbgfx exposes an
+    // emscripten-built bgfx artifact is the parallel zbgfx-wasm-build spike's
+    // deliverable, so it is stubbed here rather than guessed. The emcc link
+    // step itself lives in `backend.hook.zig`'s wasm `post_wire` arm.
+    @panic("bgfx wasm build pending zbgfx emscripten support — labelle-bgfx#8");
 }
 
 /// Attach miniaudio's implementation TU + include path, and link the

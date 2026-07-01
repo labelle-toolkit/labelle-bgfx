@@ -1,0 +1,81 @@
+const screen_w: u32 = {{width}};
+const screen_h: u32 = {{height}};
+const screen_title = "{{title}}";
+const target_fps: u32 = {{fps}};
+
+const BackendGfxType = @import("backend_gfx");
+
+// --- WASM/Emscripten main loop (bgfx) ---
+// Mirrors the raylib wasm template shape, adapted to bgfx's window API. bgfx's
+// web target drives the frame through `emscripten_set_main_loop` (a per-frame
+// callback) instead of the desktop `while (!window.shouldQuit())` loop: the
+// browser owns the event loop, so a blocking while-loop would freeze the page.
+// The callback body mirrors the bgfx DESKTOP template's loop body
+// (tick -> beginFrame -> render -> endFrame), minus the desktop-only
+// headless / screenshot / fullscreen / vsync plumbing (none of which applies in
+// the browser).
+//
+// TODO(#8 spike): the bgfx WebGL context is created against an emscripten
+// canvas. Confirm whether `window.initWindow` needs a wasm-specific canvas
+// selector arg (or a distinct init entry) once the zbgfx-wasm-build spike
+// lands — the desktop `initWindow(w, h, title)` shape is assumed here as a
+// placeholder. `beginFrame`/`clearBackground`/`render`/`endFrame` are the same
+// backend-agnostic gfx seam the desktop + android templates use.
+
+{{module_vars}}var g: AssembledGame = undefined;
+{{hooks_init_block}}
+var g_allocator: std.mem.Allocator = undefined;
+
+fn gameFrame() callconv(.c) void {
+    // Frame-rate-independent sim: derive dt from the real frame period
+    // (`window.frameDuration` measures it with a monotonic clock). Clamp to 4
+    // frames at target_fps so a stall / backgrounded tab can't explode physics.
+    // @max(target_fps, 1) guards a target_fps=0 (unlimited) config. Mirrors the
+    // desktop template.
+    const dt: f32 = @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
+
+    // Aspect-fit the design canvas (config) into the real canvas size, so
+    // content renders correctly regardless of the browser canvas dimensions.
+    BackendGfxType.setScreenSize(window.width(), window.height());
+    BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
+{{preview_heartbeat}}{{tick_code}}    g.tick(dt);
+
+    window.beginFrame();
+    window.clearBackground(245, 245, 245, 255);
+    g.render();
+    g.renderGizmos();
+{{gui_draw_code}}    window.drawText(screen_title, 10, 10, 20, 80, 80, 80, 255);
+    window.endFrame();
+}
+
+// Hand-rolled extern shim instead of `@cImport(emscripten.h)` — Zig 0.16's
+// translate-c rejects recent emsdk headers (multi-arg
+// `__attribute__((deprecated("msg1","msg2")))`, translate-c issue #306). We only
+// need the main-loop entry; emcc resolves the symbol at link time. Mirrors the
+// raylib wasm template.
+extern "c" fn emscripten_set_main_loop(
+    func: *const fn () callconv(.c) void,
+    fps: c_int,
+    simulate_infinite_loop: c_int,
+) void;
+
+pub fn main() !void {
+    // Use c_allocator for Emscripten — it delegates to emscripten's malloc/free
+    // which respects ALLOW_MEMORY_GROWTH. page_allocator uses wasm memory.grow
+    // directly and conflicts with emscripten's memory management. Mirrors the
+    // raylib wasm template.
+    const allocator = std.heap.c_allocator;
+    g_allocator = allocator;
+
+{{hidden_setup}}    window.initWindow(screen_w, screen_h, screen_title);
+    // Note: no `defer window.closeWindow()` — Emscripten keeps running after
+    // main returns (the main-loop callback drives the app).
+
+    g = AssembledGame.init(allocator);
+
+    g.setHooks(&hooks);
+
+    g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
+
+{{preview_setup}}{{setup_code}}    emscripten_set_main_loop(&gameFrame, @intCast(target_fps), 1);
+}

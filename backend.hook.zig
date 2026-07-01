@@ -7,12 +7,23 @@
 //! import assumptions: it may `@import("std")` (and `@import("builtin")` for the
 //! host tag) and take everything else through the hook context.
 //!
-//! ## Scope — bgfx is DESKTOP + ANDROID; only ANDROID is hook-bearing
+//! ## Scope — bgfx is DESKTOP + ANDROID + WASM; ANDROID + WASM are hook-bearing
 //!
 //! DESKTOP has no residual: it is fully declarative (the `bgfx` + `glfw` artifacts
 //! are linked by the assembler from the manifest) and `.target = .native` resolves
 //! without a hook, so the assembler never invokes this hook on a desktop build.
-//! bgfx ships NO ios/wasm templates, so this hook has NO ios/wasm arms.
+//! bgfx ships NO ios template, so this hook has NO ios arm.
+//!
+//! WASM (bgfx-wasm epic labelle-bgfx#8) — SCAFFOLDING. Its target is the STATIC
+//! `.triple` "wasm32-emscripten" (resolved directly in the generated build.zig),
+//! so there is NO `resolve_target`. Its `post_wire` .wasm arm supplies the
+//! Emscripten `emcc` link step, reconstructed here from ONLY `std.Build` + the
+//! emsdk dependency (resolved via `b.dependency("emsdk", .{})`) — mirroring the
+//! proven raylib wasm hook. TODO(#8 spike): the bgfx-specific emcc flag set (GLFW
+//! emulation vs bgfx's own WebGL canvas init, whether ASYNCIFY is required) and
+//! the wasm bgfx artifact exposure are what the parallel zbgfx-wasm-build spike
+//! determines; the arm links the desktop `bgfx` artifact + raylib's standard
+//! flags as a placeholder and is marked accordingly.
 //!
 //! ANDROID exercises BOTH hook phases:
 //!
@@ -47,9 +58,10 @@ const builtin = @import("builtin");
 pub const HOOK_ABI_VERSION: u8 = 2;
 
 /// The platform tag the hook branches on. Mirrors `config.Platform` structurally so
-/// the hook needs no assembler import. bgfx supports only desktop + android; the
-/// ios/wasm variants exist for `HookContext` shape-compatibility with `manifest_v2`
-/// and are never reached (bgfx declares no ios/wasm platform entry).
+/// the hook needs no assembler import. bgfx supports desktop + android + wasm
+/// (labelle-bgfx#8 scaffolding); the ios variant exists for `HookContext`
+/// shape-compatibility with `manifest_v2` and is never reached (bgfx declares no
+/// ios platform entry).
 pub const Platform = enum { desktop, ios, android, wasm };
 
 /// Error surface for the pure decision helpers (so they stay unit-testable without a
@@ -254,6 +266,111 @@ fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
     return null;
 }
 
+// ── wasm emcc residual — the emLinkStep reconstruction (labelle-bgfx#8) ─────
+//
+// SCAFFOLDING, mirrors the proven raylib wasm hook. The hook is std-only and
+// cannot import the provider package, so — like raylib — the emcc link step is
+// reconstructed from ONLY `std.Build` + the emsdk dependency: it locates `emcc`
+// under the resolved emsdk (`emTool`) and shells out with the web settings.
+//
+// TODO(#8 spike): the bgfx-specific emcc flag set is provisional. raylib's web
+// build uses Emscripten's GLFW3 emulation + asyncify; whether bgfx-on-emscripten
+// wants GLFW emulation (vs bgfx creating its own WebGL2 canvas context) and
+// whether ASYNCIFY is required are exactly what the zbgfx-wasm-build spike
+// determines. The memory-growth / stack-size / assertions gating below is
+// backend-agnostic and carried forward as-is.
+
+/// The C-stack bump the wasm build needs (Emscripten defaults to a 64 KB stack,
+/// which the engine's scene-load + atlas-decode path overflows). Mirrors raylib.
+pub const wasm_stack_size_arg = "-sSTACK_SIZE=524288";
+
+/// Allow the WASM heap to grow at runtime. Mirrors raylib.
+pub const wasm_allow_memory_growth_arg = "-sALLOW_MEMORY_GROWTH=1";
+
+/// TODO(#8 spike): raylib's web build uses GLFW3 emulation + asyncify. Retained
+/// here as placeholders mirroring raylib; the spike confirms whether bgfx wants
+/// GLFW emulation (or its own WebGL canvas init) and whether asyncify is needed.
+pub const wasm_use_glfw_arg = "-sUSE_GLFW=3";
+pub const wasm_asyncify_arg = "-sASYNCIFY";
+
+/// Options for `emLinkStep` — the subset of emcc options the wasm residual sets.
+/// Uses only `std.Build`/`std.builtin` types so the hook stays provider-free.
+pub const EmLinkOptions = struct {
+    optimize: std.builtin.OptimizeMode,
+    /// The Zig code compiled to a static lib that emcc links into the module.
+    lib_main: *std.Build.Step.Compile,
+    /// The bgfx C++ archive (`backend_dep.artifact("bgfx")`) — passed to emcc
+    /// explicitly. TODO(#8 spike): the wasm bgfx artifact exposure is the spike's
+    /// deliverable; the desktop `bgfx` artifact name is a placeholder.
+    lib_backend: *std.Build.Step.Compile,
+    /// The emsdk dependency, resolved by the caller via `b.dependency("emsdk", .{})`.
+    emsdk: *std.Build.Dependency,
+};
+
+/// Path to an emscripten tool (e.g. `emcc`) inside the resolved emsdk dependency.
+/// Forward-slash join (NOT `b.pathJoin`) so the emsdk-relative sub-path is
+/// portable — mirrors raylib's hook.
+fn emTool(b: *std.Build, emsdk: *std.Build.Dependency, tool: []const u8) std.Build.LazyPath {
+    return emsdk.path(b.fmt("upstream/emscripten/{s}", .{tool}));
+}
+
+/// Reconstruction of the emcc link step using only `std.Build` + the emsdk
+/// dependency (mirrors raylib's hook). Builds the `emcc` shell-out that links
+/// `lib_main` + the `bgfx` archive into the `.html`/`.wasm`/`.js` module and
+/// installs them under `web/`. Returns the install step so the caller can wire it
+/// into `b.getInstallStep()` + the run step.
+pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.InstallDir {
+    // Pass emcc as a LazyPath via addFileArg so the emsdk path resolves lazily at
+    // step-execution time — NOT eagerly at build-configuration time. `Run.create`
+    // + `addFileArg` is the lazy-safe form; the step name "emcc" also hides the
+    // resolved path in the log. Mirrors raylib's hook.
+    const emcc = std.Build.Step.Run.create(b, "emcc");
+    emcc.addFileArg(emTool(b, options.emsdk, "emcc"));
+    if (options.optimize == .Debug) {
+        emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1" });
+    } else {
+        // Non-Debug: optimize. Emscripten DEFAULTS assertions off (ASSERTIONS=0)
+        // in optimized (-O1+) builds, so keeping them for ReleaseSafe (a safety
+        // build) requires setting -sASSERTIONS=1 EXPLICITLY — merely omitting
+        // -sASSERTIONS=0 would still leave them off. ReleaseFast/ReleaseSmall
+        // disable them for the fastest/smallest builds. (Reused verbatim from
+        // raylib's hook — the exact ReleaseSafe fix.)
+        if (options.optimize == .ReleaseSafe) {
+            emcc.addArg("-sASSERTIONS=1");
+        } else {
+            emcc.addArg("-sASSERTIONS=0");
+        }
+        if (options.optimize == .ReleaseSmall) {
+            emcc.addArg("-Oz");
+        } else {
+            emcc.addArg("-O3");
+        }
+    }
+    // TODO(#8 spike): web settings mirrored from raylib. Confirm the bgfx set
+    // (GLFW emulation vs bgfx's own WebGL init, asyncify need) once the spike
+    // lands. Memory growth + stack bump are backend-agnostic.
+    emcc.addArg(wasm_use_glfw_arg);
+    emcc.addArg(wasm_asyncify_arg);
+    emcc.addArg(wasm_allow_memory_growth_arg);
+    emcc.addArg(wasm_stack_size_arg);
+
+    // The main lib + the bgfx C archive, then emcc scans remaining static-lib
+    // deps transitively.
+    emcc.addArtifactArg(options.lib_main);
+    emcc.addArtifactArg(options.lib_backend);
+    emcc.addArg("-o");
+    const out_file = emcc.addOutputFileArg(b.fmt("{s}.html", .{options.lib_main.name}));
+
+    // emcc emits 3 files (.html/.wasm/.js) into out_file's dir → install to web/.
+    const install = b.addInstallDirectory(.{
+        .source_dir = out_file.dirname(),
+        .install_dir = .prefix,
+        .install_subdir = "web",
+    });
+    install.step.dependOn(&emcc.step);
+    return install;
+}
+
 /// Runs AFTER the generic module/artifact/system-lib wiring, to supply the residual
 /// the manifest cannot express statically (design §2 residual (a) — the bgfx-Android
 /// NDK ordering). DESKTOP is empty (fully declarative — no residual). ANDROID adds
@@ -261,11 +378,37 @@ fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
 /// `linkLibrary`, `linkSystemLibrary`, `link_libc`, root `.pic` — are emitted
 /// declaratively by the assembler from the manifest, NOT here). Unlike sokol there
 /// is NO `addSystemIncludePath` on the artifact: the bgfx/bx/bimg C++ TUs are
-/// NDK-sysroot-wired by the backend's own build.zig. bgfx has no ios/wasm platform,
-/// so those arms are unreachable.
+/// NDK-sysroot-wired by the backend's own build.zig. WASM does the Emscripten emcc
+/// link step + install/run wiring (labelle-bgfx#8 scaffolding, spike-pending). bgfx
+/// has no ios platform, so that arm is unreachable.
 pub fn post_wire(b: *std.Build, ctx: HookContext) void {
     switch (ctx.platform) {
         .desktop => {}, // fully declarative — no residual
+        .wasm => {
+            // The Emscripten emcc link step + install/run wiring (mirrors
+            // raylib's wasm arm). emsdk is resolved via `b.dependency` — declared
+            // as a root build dep by the manifest's `.root_build_deps`. The
+            // declarative `linkLibrary(bgfx)` is emitted by the assembler BEFORE
+            // this call, so the bgfx archive is reachable via the backend dep.
+            //
+            // TODO(#8 spike): `backend_dep.artifact("bgfx")` names the DESKTOP
+            // artifact. HOW zbgfx exposes an emscripten/WebGL-built bgfx artifact
+            // is the parallel spike's deliverable — this arm is scaffolding and
+            // will NOT link end-to-end until the spike resolves.
+            const emsdk = b.dependency("emsdk", .{});
+            const bgfx_artifact = ctx.backend_dep.artifact("bgfx");
+            const install = emLinkStep(b, .{
+                .optimize = ctx.optimize,
+                .lib_main = ctx.root_artifact,
+                .lib_backend = bgfx_artifact,
+                .emsdk = emsdk,
+            });
+            // `post_wire` is void, so it owns the install/run wiring (mirrors
+            // raylib's wasm arm).
+            b.getInstallStep().dependOn(&install.step);
+            const run_step = b.step("run", "Serve WASM build");
+            run_step.dependOn(&install.step);
+        },
         .android => {
             const sysroot = getAndroidNdkSysroot(b) orelse
                 @panic("Could not find Android NDK. Set ANDROID_NDK_HOME or ANDROID_HOME.");
@@ -287,7 +430,7 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
             const android_libc = b.addWriteFiles();
             ctx.root_artifact.setLibCFile(android_libc.add("android-libc.txt", libc_content));
         },
-        .ios, .wasm => @panic("bgfx backend has no ios/wasm platform"),
+        .ios => @panic("bgfx backend has no ios platform"),
     }
 }
 
@@ -366,6 +509,17 @@ test "libcTxt: body points the compiler at the NDK sysroot (matches the enum blo
             "gcc_dir=\n",
         out,
     );
+}
+
+test "wasm emcc args: memory-growth + 512 KB stack (labelle-bgfx#8 scaffolding)" {
+    // The backend-agnostic wasm settings are pinned here; `emLinkStep` itself is
+    // typechecked against std.Build by compiling this file as a test target. The
+    // GLFW/asyncify args are TODO(#8 spike) placeholders and are only asserted to
+    // match raylib's spelling, not to be final for bgfx.
+    try testing.expectEqualStrings("-sSTACK_SIZE=524288", wasm_stack_size_arg);
+    try testing.expectEqualStrings("-sALLOW_MEMORY_GROWTH=1", wasm_allow_memory_growth_arg);
+    try testing.expectEqualStrings("-sUSE_GLFW=3", wasm_use_glfw_arg);
+    try testing.expectEqualStrings("-sASYNCIFY", wasm_asyncify_arg);
 }
 
 test "selectGreatestValidNdk: a stray dir doesn't shadow a valid older NDK" {

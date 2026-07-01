@@ -61,6 +61,14 @@
         .screenshots,
         .gamepad_polling,
         .raw_gui_adapter,
+        // WASM/Emscripten scaffolding (bgfx-wasm epic labelle-bgfx#8). The web
+        // PlatformEntry + template + emcc hook arm mirror the proven sokol/raylib
+        // wasm pattern. NOTE: does NOT yet build end-to-end — the actual wasm bgfx
+        // artifact link is blocked on the zbgfx-wasm-build spike (see the
+        // `.platforms.wasm` TODO + backend.hook.zig / build.zig `TODO(#8 spike)`
+        // seams). Declared here so capability negotiation + codegen wiring are in
+        // place the moment the spike resolves.
+        .wasm,
     },
 
     // root_alias defaults to `backend_<name>`, so the generated root imports these
@@ -156,7 +164,43 @@
             .dep_options = .{},
             .package = .{ .apk = .{ .manifest = "src/video/apk/AndroidManifest.xml" } },
         },
-        // No ios/wasm — bgfx ships no iOS/wasm templates (mobile is Android-only).
+        // WASM/Emscripten (bgfx-wasm epic labelle-bgfx#8) — SCAFFOLDING, mirrors
+        // the proven raylib wasm PlatformEntry (`.callback` loop driven by
+        // `emscripten_set_main_loop`, static `wasm32-emscripten` triple, emcc
+        // `post_wire` residual, `.web` package). Like raylib+android, wasm has NO
+        // per-platform `dep_options`, so it inherits the base `gui_enabled`
+        // UNCHANGED (merge contract).
+        //
+        // TODO(#8 spike): this does NOT build end-to-end yet. The `.artifacts`
+        // below name the desktop `bgfx` archive as a placeholder, but HOW zbgfx
+        // exposes an emscripten/WebGL-built bgfx artifact is exactly what the
+        // parallel zbgfx-wasm-build spike is determining — so the artifact name
+        // (and whether a distinct wasm artifact/module is needed) is spike-pending.
+        // The backend's own `build.zig` wasm branch hard-panics until then, and
+        // its `backend.hook.zig` wasm arm carries the same TODO for the
+        // bgfx-specific emcc flag set. No glfw artifact (zglfw is desktop-only,
+        // like android).
+        .wasm = .{
+            .entry = "templates/wasm.txt",
+            // bgfx's web target drives the loop via `emscripten_set_main_loop`
+            // (templates/wasm.txt) — a callback, NOT the desktop generated
+            // `while`. Matches raylib's wasm entry (contrast desktop `.loop`).
+            .loop_style = .callback,
+            .target = .{ .triple = "wasm32-emscripten" }, // static
+            // TODO(#8 spike): placeholder — the wasm bgfx artifact exposure is the
+            // spike's deliverable. Only `bgfx` (no glfw — zglfw is desktop-only,
+            // like android).
+            .artifacts = .{ .{ .name = "bgfx" } },
+            // Empty per-platform list → inherits the base `gui_enabled` UNCHANGED
+            // (merge contract), matching android + raylib-wasm.
+            .dep_options = .{},
+            // The hook's wasm `post_wire` resolves emcc via
+            // `b.dependency("emsdk", .{})`; `.builtin` reuses the assembler's
+            // pinned emsdk section, and the backend build.zig.zon declares emsdk.
+            .root_build_deps = .{ .{ .name = "emsdk", .resolution = .builtin } },
+            .package = .{ .web = .{ .shell = null } },
+        },
+        // No ios — bgfx ships no iOS template (mobile is Android-only).
     },
 
     // Dedicated hook file (NOT bgfx's own build.zig, which carries package-local

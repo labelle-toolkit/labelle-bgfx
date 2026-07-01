@@ -65,6 +65,17 @@
             .url = "https://github.com/labelle-toolkit/labelle-audio/archive/refs/tags/v0.2.1.tar.gz",
             .hash = "labelle_audio-0.2.1-QQRmYI4eAQDChv7DVK74-HPS9_J2bJw5ZDKFOazffYjU",
         },
+        // Emscripten SDK (bgfx-wasm epic labelle-bgfx#8). Provides `emcc` (the
+        // WASM link step in `backend.hook.zig`'s wasm `post_wire`) and the
+        // emscripten sysroot headers the stb_image C compile needs (Zig ships no
+        // libc headers for wasm32-emscripten). Same pin the sokol + raylib
+        // backends use — copied verbatim from labelle-raylib's build.zig.zon so
+        // all three web backends resolve one shared emsdk. Only fetched on a wasm
+        // build (`b.lazyDependency`); desktop/android never pull it.
+        .emsdk = .{
+            .url = "git+https://github.com/emscripten-core/emsdk?ref=4.0.9#3bcf1dcd01f040f370e10fe673a092d9ed79ebb5",
+            .hash = "N-V-__8AAJl1DwBezhYo_VE6f53mPVm00R-Fk28NPW7P14EQ",
+        },
     },
     .paths = .{
         "build.zig",
