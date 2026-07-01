@@ -4,7 +4,7 @@
     .backend = .bgfx,
     .y_axis = .up,
     .ecs = .mock,
-    .core_version = "1.21.0",
+    .core_version = "1.22.0",
     .engine_version = "1.65.0",
     .gfx_version = "1.19.0",
     .labelle_version = "local:../../../labelle-cli",
