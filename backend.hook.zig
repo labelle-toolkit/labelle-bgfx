@@ -303,10 +303,14 @@ pub const wasm_gl_get_proc_address_arg = "-sGL_ENABLE_GET_PROC_ADDRESS=1";
 pub const EmLinkOptions = struct {
     optimize: std.builtin.OptimizeMode,
     /// The Zig code compiled to a static lib that emcc links into the module.
+    /// `emLinkStep` walks its transitive compile-dependency set (element 0 IS
+    /// `lib_main`) so emcc also receives bgfx/bx/bimg AND any sibling archives
+    /// in the game's link graph — the GUI bridge (bgfx_imgui_bridge + cimgui_clib)
+    /// and plugin C libs — not just bgfx's own subtree.
     lib_main: *std.Build.Step.Compile,
     /// The bgfx C++ archive (`backend_dep.artifact("bgfx")`, compiled for
-    /// wasm32-emscripten by the apotema/zbgfx fork). `emLinkStep` walks its
-    /// transitive compile-dependency set so emcc also receives bx + bimg.
+    /// wasm32-emscripten by the apotema/zbgfx fork). Retained for callers/context;
+    /// its subtree is already covered by walking `lib_main`'s graph.
     lib_backend: *std.Build.Step.Compile,
     /// The emsdk dependency, resolved by the caller via `b.dependency("emsdk", .{})`.
     emsdk: *std.Build.Dependency,
@@ -361,14 +365,12 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
     emcc.addArg(wasm_allow_memory_growth_arg);
     emcc.addArg(wasm_stack_size_arg);
 
-    // The Zig main lib, then EVERY static lib the bgfx artifact pulls in. zbgfx
-    // builds three archives — bgfx, bx, bimg — where bx/bimg are `other_step` link
-    // objects of bgfx; `addArtifactArg(bgfx)` alone leaves bx/bimg's symbols
-    // (bx::memCopy, bx::vsnprintf, …) undefined at link. Walk the transitive
-    // compile-dependency set of the backend artifact and hand emcc every lib in
-    // it (the set includes bgfx itself). Mirrors the sokol backend's emLinkStep.
-    emcc.addArtifactArg(options.lib_main);
-    for (options.lib_backend.getCompileDependencies(false)) |dep| {
+    // EVERY static lib reachable from the game's link graph (element 0 IS lib_main
+    // itself): the game, bgfx/bx/bimg, AND any GUI bridge (bgfx_imgui_bridge +
+    // its cimgui_clib) or plugin C libs the game links. Walking lib_backend would
+    // catch only bgfx's subtree and leave siblings (e.g. the imgui bridge)
+    // undefined at link. Mirrors the sokol backend's emLinkStep.
+    for (options.lib_main.getCompileDependencies(false)) |dep| {
         if (dep.kind == .lib) emcc.addArtifactArg(dep);
     }
     emcc.addArg("-o");
@@ -403,8 +405,9 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
             // `.root_build_deps`. The declarative `linkLibrary(bgfx)` is emitted by
             // the assembler BEFORE this call, so the bgfx archive (compiled for
             // wasm32-emscripten by the apotema/zbgfx fork) is reachable via the
-            // backend dep; `emLinkStep` walks its transitive libs (bgfx+bx+bimg)
-            // and hands them all to emcc.
+            // backend dep. `emLinkStep` walks the GAME's transitive libs
+            // (lib_main + bgfx+bx+bimg + any GUI bridge / plugin C archives) and
+            // hands them all to emcc.
             const emsdk = b.dependency("emsdk", .{});
             const bgfx_artifact = ctx.backend_dep.artifact("bgfx");
             const install = emLinkStep(b, .{
