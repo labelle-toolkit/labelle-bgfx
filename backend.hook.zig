@@ -14,16 +14,18 @@
 //! without a hook, so the assembler never invokes this hook on a desktop build.
 //! bgfx ships NO ios template, so this hook has NO ios arm.
 //!
-//! WASM (bgfx-wasm epic labelle-bgfx#8) — SCAFFOLDING. Its target is the STATIC
-//! `.triple` "wasm32-emscripten" (resolved directly in the generated build.zig),
-//! so there is NO `resolve_target`. Its `post_wire` .wasm arm supplies the
-//! Emscripten `emcc` link step, reconstructed here from ONLY `std.Build` + the
-//! emsdk dependency (resolved via `b.dependency("emsdk", .{})`) — mirroring the
-//! proven raylib wasm hook. TODO(#8 spike): the bgfx-specific emcc flag set (GLFW
-//! emulation vs bgfx's own WebGL canvas init, whether ASYNCIFY is required) and
-//! the wasm bgfx artifact exposure are what the parallel zbgfx-wasm-build spike
-//! determines; the arm links the desktop `bgfx` artifact + raylib's standard
-//! flags as a placeholder and is marked accordingly.
+//! WASM (bgfx-wasm epic labelle-bgfx#8). Its target is the STATIC `.triple`
+//! "wasm32-emscripten" (resolved directly in the generated build.zig), so there
+//! is NO `resolve_target`. Its `post_wire` .wasm arm supplies the Emscripten
+//! `emcc` link step, reconstructed here from ONLY `std.Build` + the emsdk
+//! dependency (resolved via `b.dependency("emsdk", .{})`). bgfx creates its own
+//! WebGL2 context on the emscripten canvas (the canvas selector is handed to bgfx
+//! via `PlatformData.nwh` in src/window.zig), so — unlike raylib — there is no
+//! GLFW emulation and no asyncify; the flag set is WebGL2 + the GL proc-address
+//! helper + memory-growth/stack. The wasm bgfx artifact is the same
+//! `zbgfx.artifact("bgfx")` (the apotema/zbgfx fork compiles it for
+//! wasm32-emscripten when handed `-Demsdk_sysroot`), and emcc is given bgfx's full
+//! transitive lib set (bgfx + bx + bimg).
 //!
 //! ANDROID exercises BOTH hook phases:
 //!
@@ -273,12 +275,9 @@ fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
 // reconstructed from ONLY `std.Build` + the emsdk dependency: it locates `emcc`
 // under the resolved emsdk (`emTool`) and shells out with the web settings.
 //
-// TODO(#8 spike): the bgfx-specific emcc flag set is provisional. raylib's web
-// build uses Emscripten's GLFW3 emulation + asyncify; whether bgfx-on-emscripten
-// wants GLFW emulation (vs bgfx creating its own WebGL2 canvas context) and
-// whether ASYNCIFY is required are exactly what the zbgfx-wasm-build spike
-// determines. The memory-growth / stack-size / assertions gating below is
-// backend-agnostic and carried forward as-is.
+// The bgfx-specific emcc flag set: WebGL2 (bgfx creates its own context — no GLFW
+// emulation, no asyncify) + the GL proc-address helper bgfx needs, plus the
+// backend-agnostic memory-growth / stack-size / assertions gating.
 
 /// The C-stack bump the wasm build needs (Emscripten defaults to a 64 KB stack,
 /// which the engine's scene-load + atlas-decode path overflows). Mirrors raylib.
@@ -287,11 +286,17 @@ pub const wasm_stack_size_arg = "-sSTACK_SIZE=524288";
 /// Allow the WASM heap to grow at runtime. Mirrors raylib.
 pub const wasm_allow_memory_growth_arg = "-sALLOW_MEMORY_GROWTH=1";
 
-/// TODO(#8 spike): raylib's web build uses GLFW3 emulation + asyncify. Retained
-/// here as placeholders mirroring raylib; the spike confirms whether bgfx wants
-/// GLFW emulation (or its own WebGL canvas init) and whether asyncify is needed.
-pub const wasm_use_glfw_arg = "-sUSE_GLFW=3";
-pub const wasm_asyncify_arg = "-sASYNCIFY";
+/// bgfx creates its OWN WebGL2 context against the emscripten canvas (the canvas
+/// selector is handed to bgfx via `PlatformData.nwh`, see src/window.zig's
+/// `initWindowWasm`), so — unlike raylib's web build — there is NO GLFW emulation
+/// and NO asyncify: the frame is driven by `emscripten_set_main_loop`. These force
+/// a WebGL2 context (bgfx's GL renderer prefers GLES3).
+pub const wasm_min_webgl_arg = "-sMIN_WEBGL_VERSION=2";
+pub const wasm_max_webgl_arg = "-sMAX_WEBGL_VERSION=2";
+/// bgfx loads GL entry points via `emscripten_webgl_get_proc_address`; recent
+/// emscripten gates that helper behind this flag (else it is an undefined symbol
+/// at link).
+pub const wasm_gl_get_proc_address_arg = "-sGL_ENABLE_GET_PROC_ADDRESS=1";
 
 /// Options for `emLinkStep` — the subset of emcc options the wasm residual sets.
 /// Uses only `std.Build`/`std.builtin` types so the hook stays provider-free.
@@ -299,9 +304,9 @@ pub const EmLinkOptions = struct {
     optimize: std.builtin.OptimizeMode,
     /// The Zig code compiled to a static lib that emcc links into the module.
     lib_main: *std.Build.Step.Compile,
-    /// The bgfx C++ archive (`backend_dep.artifact("bgfx")`) — passed to emcc
-    /// explicitly. TODO(#8 spike): the wasm bgfx artifact exposure is the spike's
-    /// deliverable; the desktop `bgfx` artifact name is a placeholder.
+    /// The bgfx C++ archive (`backend_dep.artifact("bgfx")`, compiled for
+    /// wasm32-emscripten by the apotema/zbgfx fork). `emLinkStep` walks its
+    /// transitive compile-dependency set so emcc also receives bx + bimg.
     lib_backend: *std.Build.Step.Compile,
     /// The emsdk dependency, resolved by the caller via `b.dependency("emsdk", .{})`.
     emsdk: *std.Build.Dependency,
@@ -346,18 +351,26 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
             emcc.addArg("-O3");
         }
     }
-    // TODO(#8 spike): web settings mirrored from raylib. Confirm the bgfx set
-    // (GLFW emulation vs bgfx's own WebGL init, asyncify need) once the spike
-    // lands. Memory growth + stack bump are backend-agnostic.
-    emcc.addArg(wasm_use_glfw_arg);
-    emcc.addArg(wasm_asyncify_arg);
+    // bgfx-specific web settings: force WebGL2, expose the GL proc-address helper
+    // bgfx needs, allow heap growth + bump the C stack (backend-agnostic). No GLFW
+    // emulation / no asyncify — bgfx owns its WebGL context and the main loop is
+    // emscripten_set_main_loop-driven.
+    emcc.addArg(wasm_min_webgl_arg);
+    emcc.addArg(wasm_max_webgl_arg);
+    emcc.addArg(wasm_gl_get_proc_address_arg);
     emcc.addArg(wasm_allow_memory_growth_arg);
     emcc.addArg(wasm_stack_size_arg);
 
-    // The main lib + the bgfx C archive, then emcc scans remaining static-lib
-    // deps transitively.
+    // The Zig main lib, then EVERY static lib the bgfx artifact pulls in. zbgfx
+    // builds three archives — bgfx, bx, bimg — where bx/bimg are `other_step` link
+    // objects of bgfx; `addArtifactArg(bgfx)` alone leaves bx/bimg's symbols
+    // (bx::memCopy, bx::vsnprintf, …) undefined at link. Walk the transitive
+    // compile-dependency set of the backend artifact and hand emcc every lib in
+    // it (the set includes bgfx itself). Mirrors the sokol backend's emLinkStep.
     emcc.addArtifactArg(options.lib_main);
-    emcc.addArtifactArg(options.lib_backend);
+    for (options.lib_backend.getCompileDependencies(false)) |dep| {
+        if (dep.kind == .lib) emcc.addArtifactArg(dep);
+    }
     emcc.addArg("-o");
     const out_file = emcc.addOutputFileArg(b.fmt("{s}.html", .{options.lib_main.name}));
 
@@ -379,22 +392,19 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
 /// declaratively by the assembler from the manifest, NOT here). Unlike sokol there
 /// is NO `addSystemIncludePath` on the artifact: the bgfx/bx/bimg C++ TUs are
 /// NDK-sysroot-wired by the backend's own build.zig. WASM does the Emscripten emcc
-/// link step + install/run wiring (labelle-bgfx#8 scaffolding, spike-pending). bgfx
-/// has no ios platform, so that arm is unreachable.
+/// link step + install/run wiring (labelle-bgfx#8). bgfx has no ios platform, so
+/// that arm is unreachable.
 pub fn post_wire(b: *std.Build, ctx: HookContext) void {
     switch (ctx.platform) {
         .desktop => {}, // fully declarative — no residual
         .wasm => {
-            // The Emscripten emcc link step + install/run wiring (mirrors
-            // raylib's wasm arm). emsdk is resolved via `b.dependency` — declared
-            // as a root build dep by the manifest's `.root_build_deps`. The
-            // declarative `linkLibrary(bgfx)` is emitted by the assembler BEFORE
-            // this call, so the bgfx archive is reachable via the backend dep.
-            //
-            // TODO(#8 spike): `backend_dep.artifact("bgfx")` names the DESKTOP
-            // artifact. HOW zbgfx exposes an emscripten/WebGL-built bgfx artifact
-            // is the parallel spike's deliverable — this arm is scaffolding and
-            // will NOT link end-to-end until the spike resolves.
+            // The Emscripten emcc link step + install/run wiring. emsdk is resolved
+            // via `b.dependency` — declared as a root build dep by the manifest's
+            // `.root_build_deps`. The declarative `linkLibrary(bgfx)` is emitted by
+            // the assembler BEFORE this call, so the bgfx archive (compiled for
+            // wasm32-emscripten by the apotema/zbgfx fork) is reachable via the
+            // backend dep; `emLinkStep` walks its transitive libs (bgfx+bx+bimg)
+            // and hands them all to emcc.
             const emsdk = b.dependency("emsdk", .{});
             const bgfx_artifact = ctx.backend_dep.artifact("bgfx");
             const install = emLinkStep(b, .{
@@ -511,15 +521,16 @@ test "libcTxt: body points the compiler at the NDK sysroot (matches the enum blo
     );
 }
 
-test "wasm emcc args: memory-growth + 512 KB stack (labelle-bgfx#8 scaffolding)" {
-    // The backend-agnostic wasm settings are pinned here; `emLinkStep` itself is
-    // typechecked against std.Build by compiling this file as a test target. The
-    // GLFW/asyncify args are TODO(#8 spike) placeholders and are only asserted to
-    // match raylib's spelling, not to be final for bgfx.
+test "wasm emcc args: WebGL2 + proc-address + memory-growth + 512 KB stack (labelle-bgfx#8)" {
+    // The bgfx-specific wasm settings are pinned here; `emLinkStep` itself is
+    // typechecked against std.Build by compiling this file as a test target. bgfx
+    // owns its WebGL2 context (no GLFW emulation / no asyncify), so the flag set is
+    // WebGL2 + the GL proc-address helper + the backend-agnostic memory/stack args.
     try testing.expectEqualStrings("-sSTACK_SIZE=524288", wasm_stack_size_arg);
     try testing.expectEqualStrings("-sALLOW_MEMORY_GROWTH=1", wasm_allow_memory_growth_arg);
-    try testing.expectEqualStrings("-sUSE_GLFW=3", wasm_use_glfw_arg);
-    try testing.expectEqualStrings("-sASYNCIFY", wasm_asyncify_arg);
+    try testing.expectEqualStrings("-sMIN_WEBGL_VERSION=2", wasm_min_webgl_arg);
+    try testing.expectEqualStrings("-sMAX_WEBGL_VERSION=2", wasm_max_webgl_arg);
+    try testing.expectEqualStrings("-sGL_ENABLE_GET_PROC_ADDRESS=1", wasm_gl_get_proc_address_arg);
 }
 
 test "selectGreatestValidNdk: a stray dir doesn't shadow a valid older NDK" {

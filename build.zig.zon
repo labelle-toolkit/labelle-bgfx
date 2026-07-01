@@ -7,9 +7,17 @@
         // Pinned to specific commits — same class of fix as #146.
         // Bumping either dep requires `zig fetch <new-url>` to get
         // the new hash, then updating the url and hash together.
+        // wasm/WebGL-capable zbgfx (bgfx-wasm epic labelle-bgfx#8). Repinned from
+        // upstream `cyberegoorg/zbgfx` to the `apotema/zbgfx` fork's
+        // `feat/wasm-emscripten` branch (commit 0b229b7, PR cyberegoorg/zbgfx#9):
+        // it adds a `-Demsdk_sysroot` option + `is_emscripten` build arm that
+        // compiles bgfx/bx/bimg for wasm32-emscripten (forces single-threaded,
+        // drops the ASTC encoder's std::thread path, aliases bx's version macros,
+        // hosts shaderc). NATIVE builds are byte-for-byte unchanged — every wasm
+        // change is guarded by `target.result.os.tag == .emscripten`.
         .zbgfx = .{
-            .url = "https://codeberg.org/cyberegoorg/zbgfx/archive/8f01ea0ab6.tar.gz",
-            .hash = "zbgfx-0.12.0-Sm4IxEuHywb45XqoIhv3iEOxKXc01aKNNVjI63FHvqFw",
+            .url = "https://codeberg.org/apotema/zbgfx/archive/0b229b7.tar.gz",
+            .hash = "zbgfx-0.12.0-Sm4IxMKiywbXKIaoZ3_Bx1PVfeR0SM85KjPInWSi7f6t",
         },
         .zglfw = .{
             .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",
@@ -92,5 +100,8 @@
         // Build inputs:
         "src",
         "libs",
+        // Standalone wasm/WebGL smoke example built by `zig build wasm-example`
+        // (bgfx-wasm #8).
+        "example",
     },
 }

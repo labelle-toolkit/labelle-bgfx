@@ -17,10 +17,29 @@ const core = @import("labelle-core");
 const is_android = builtin.target.os.tag == .linux and
     (builtin.target.abi == .android or builtin.target.abi == .androideabi);
 
-/// zglfw is only imported on desktop targets. On Android `glfw` resolves
+/// wasm/WebGL (emscripten) target (bgfx-wasm epic #8). Like Android, there is no
+/// GLFW: the browser owns the canvas + event loop. bgfx creates a WebGL2 context
+/// against an emscripten canvas selector (`#canvas`), fed through
+/// `PlatformData.nwh` at init, and the frame is driven per-`emscripten_set_main_loop`
+/// callback (see templates/wasm.txt). Every zglfw reference below is comptime-gated
+/// on `no_glfw` so the module compiles for wasm32-emscripten with no zglfw import.
+const is_wasm = builtin.target.cpu.arch.isWasm();
+
+/// True on the two GLFW-less targets (Android + wasm). Used to gate the zglfw
+/// import + every desktop-only GLFW reference so those code paths are
+/// comptime-eliminated on the surface-handed-over platforms.
+const no_glfw = is_android or is_wasm;
+
+/// zglfw is only imported on desktop targets. On Android/wasm `glfw` resolves
 /// to an empty namespace so any accidental desktop-only reference fails
 /// at compile time rather than dragging in the zglfw module.
-const glfw = if (is_android) struct {} else @import("zglfw");
+const glfw = if (no_glfw) struct {} else @import("zglfw");
+
+/// bgfx's HTML5 (emscripten) backend takes `PlatformData.nwh` as a
+/// `const char*` CSS selector naming the target `<canvas>` element. The default
+/// emcc HTML shell ships a `<canvas id="canvas">`, so `#canvas` is the selector
+/// bgfx's own entry examples use.
+const wasm_canvas_selector: [:0]const u8 = "#canvas";
 
 // Prove this module satisfies labelle-core's canonical window contract (#386
 // Phase 3): `width`/`height`/`frameDuration`/`requestQuit` (required) plus the
@@ -44,7 +63,7 @@ pub const ConfigFlags = struct {
     window_hidden: bool = false,
 };
 
-var glfw_window: if (is_android) ?*anyopaque else ?*glfw.Window = null;
+var glfw_window: if (no_glfw) ?*anyopaque else ?*glfw.Window = null;
 var target_fps_val: i32 = 60;
 var screen_w: i32 = 800;
 var screen_h: i32 = 600;
@@ -107,6 +126,18 @@ pub fn height() i32 {
 /// logical window size (e.g. 2x), and it's the size the GPU swapchain must
 /// match for crisp rendering.
 fn framebufferSize() [2]i32 {
+    if (is_wasm) {
+        // Query the live drawing-buffer size of the emscripten canvas so a CSS
+        // resize (or a canvas sized by the shell) is reflected in the bgfx
+        // swapchain via `ensureSurface`. On any failure fall back to the cached
+        // dims (seeded from the config at init).
+        var w: c_int = screen_w;
+        var h: c_int = screen_h;
+        if (em.emscripten_get_canvas_element_size(wasm_canvas_selector.ptr, &w, &h) == 0 and w > 0 and h > 0) {
+            return .{ @intCast(w), @intCast(h) };
+        }
+        return .{ screen_w, screen_h };
+    }
     if (is_android) return .{ screen_w, screen_h };
     if (glfw_window) |win| {
         const fb = win.getFramebufferSize();
@@ -114,6 +145,14 @@ fn framebufferSize() [2]i32 {
     }
     return .{ screen_w, screen_h };
 }
+
+/// Hand-rolled emscripten HTML5 externs (bgfx-wasm #8). We avoid
+/// `@cImport(<emscripten.h>)` because Zig 0.16's translate-c rejects recent emsdk
+/// headers (multi-arg `__attribute__((deprecated))`, translate-c issue #306);
+/// emcc resolves these symbols at link time. Only referenced on wasm.
+const em = struct {
+    extern "c" fn emscripten_get_canvas_element_size(target: [*:0]const u8, width: *c_int, height: *c_int) c_int;
+};
 
 /// Reconcile the bgfx backbuffer with the current physical framebuffer size.
 ///
@@ -156,11 +195,46 @@ pub fn initWindow(w: i32, h: i32, title: [:0]const u8) void {
     screen_w = w;
     screen_h = h;
 
-    if (is_android) {
+    if (is_wasm) {
+        initWindowWasm(w, h);
+    } else if (is_android) {
         initWindowAndroid(w, h);
     } else {
         initWindowDesktop(w, h, title);
     }
+}
+
+/// wasm/WebGL init path (bgfx-wasm #8): no GLFW. bgfx creates its own WebGL2
+/// context against the emscripten canvas named by `wasm_canvas_selector`
+/// (`#canvas`), handed over as the `const char*` selector in `PlatformData.nwh`
+/// per bgfx's HTML5 backend. The zbgfx wasm build forces BGFX_CONFIG_MULTITHREADED
+/// off, so `bgfx.init` + `bgfx.frame` run in-thread and the render frame is driven
+/// synchronously from the `emscripten_set_main_loop` callback — no `renderFrame`
+/// pump is needed. `RendererType.Count` auto-selects OpenGLES (WebGL) on
+/// emscripten.
+fn initWindowWasm(w: i32, h: i32) void {
+    var init: bgfx.Init = undefined;
+    bgfx.initCtor(&init);
+
+    init.type = .Count; // auto-select renderer (OpenGLES/WebGL on emscripten)
+    init.resolution.width = @intCast(w);
+    init.resolution.height = @intCast(h);
+    init.resolution.reset = current_reset;
+
+    // On emscripten `nwh` is a CSS selector C-string for the target canvas; bgfx
+    // creates the WebGL context against it. `ndt`/`context`/`queue` are unused.
+    init.platformData.ndt = null;
+    init.platformData.nwh = @constCast(@ptrCast(wasm_canvas_selector.ptr));
+    init.platformData.context = null;
+    init.platformData.queue = null;
+    init.platformData.backBuffer = null;
+    init.platformData.backBufferDS = null;
+    init.platformData.type = .Default;
+
+    _ = bgfx.init(&init);
+
+    bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
+    bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));
 }
 
 /// Android init path: no GLFW. The `ANativeWindow*` surface must have
@@ -311,10 +385,10 @@ pub fn closeWindow() void {
     // (valid-handle guarded), so it is a safe no-op if rendering never
     // initialized. Runs on both the desktop and Android paths.
     teardownSurface();
-    if (is_android) {
-        // No GLFW to tear down; the surface lifecycle is owned by the
-        // NativeActivity glue (phase 3). Clear the native-window handle so
-        // state is consistent after teardown.
+    if (no_glfw) {
+        // No GLFW to tear down; the surface lifecycle is owned by the host
+        // (Android NativeActivity glue / the browser canvas). Clear the
+        // native-window handle so state is consistent after teardown.
         android_native_window = null;
         glfw_window = null;
         return;
@@ -325,6 +399,11 @@ pub fn closeWindow() void {
 }
 
 pub fn shouldQuit() bool {
+    if (is_wasm) {
+        // The browser owns the event loop (emscripten_set_main_loop); there is
+        // no per-frame close flag. Never request close.
+        return false;
+    }
     if (is_android) {
         // The Android activity lifecycle (onDestroy) drives shutdown, not
         // a per-frame close flag. Phase 3 (#302) wires the real signal;
@@ -345,7 +424,7 @@ pub fn shouldQuit() bool {
 /// Mirrors the sokol backend's `sapp.requestQuit`. Android shutdown is driven
 /// by the activity lifecycle, not this flag (see `shouldQuit`).
 pub fn requestQuit() void {
-    if (is_android) return;
+    if (no_glfw) return;
     if (glfw_window) |win| win.setShouldClose(true);
 }
 
@@ -461,6 +540,7 @@ pub fn frameDuration() f64 {
 /// fullscreen; desktop asks GLFW whether the window is bound to a monitor.
 pub fn isFullscreen() bool {
     if (is_android) return true;
+    if (is_wasm) return false; // fullscreen is a browser/DOM concern, not bgfx's
     const win = glfw_window orelse return false;
     return win.getMonitor() != null;
 }
@@ -479,7 +559,7 @@ pub fn isFullscreen() bool {
 /// `beginFrame` in the same frame), which resets the bgfx swapchain to the
 /// new framebuffer size — so no resize is done here.
 pub fn setFullscreen(on: bool) void {
-    if (is_android) return;
+    if (no_glfw) return; // Android is permanently fullscreen; wasm defers to the DOM
     const win = glfw_window orelse return;
     const already = win.getMonitor() != null;
     if (already == on) return;

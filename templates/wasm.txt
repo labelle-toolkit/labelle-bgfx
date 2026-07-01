@@ -15,12 +15,44 @@ const BackendGfxType = @import("backend_gfx");
 // headless / screenshot / fullscreen / vsync plumbing (none of which applies in
 // the browser).
 //
-// TODO(#8 spike): the bgfx WebGL context is created against an emscripten
-// canvas. Confirm whether `window.initWindow` needs a wasm-specific canvas
-// selector arg (or a distinct init entry) once the zbgfx-wasm-build spike
-// lands — the desktop `initWindow(w, h, title)` shape is assumed here as a
-// placeholder. `beginFrame`/`clearBackground`/`render`/`endFrame` are the same
+// The bgfx WebGL context is created against the emscripten `#canvas` element:
+// `window.initWindow(w, h, title)` comptime-selects `initWindowWasm`, which hands
+// bgfx the canvas selector via `PlatformData.nwh` (see the backend's
+// src/window.zig). `beginFrame`/`clearBackground`/`render`/`endFrame` are the same
 // backend-agnostic gfx seam the desktop + android templates use.
+
+// ── Zig 0.16 emscripten std shims (bgfx-wasm labelle-bgfx#8) ────────────────
+// Zig 0.16.0's DEFAULT panic + log handlers reach `std.Io.Threaded`'s
+// child-process wait code (via the debug stack-trace printer), which does NOT
+// compile for wasm32-emscripten (a std regression: `posix.W.STOPSIG` returns
+// `u32` but `statusToTerm` expects the SIG enum). Overriding BOTH the panic entry
+// (trap) and the log fn (route to the browser console, formatting into a stack
+// buffer — never `debug_io`) severs that reference so the browser build links.
+extern "c" fn emscripten_console_log(str: [*:0]const u8) void;
+
+pub const std_options: std.Options = .{
+    .logFn = struct {
+        fn logFn(
+            comptime level: std.log.Level,
+            comptime scope: @TypeOf(.enum_literal),
+            comptime format: []const u8,
+            args: anytype,
+        ) void {
+            _ = scope;
+            var buf: [512]u8 = undefined;
+            const line = std.fmt.bufPrintZ(&buf, "[" ++ level.asText() ++ "] " ++ format, args) catch return;
+            emscripten_console_log(line.ptr);
+        }
+    }.logFn,
+};
+
+pub const panic = std.debug.FullPanic(struct {
+    fn handler(msg: []const u8, ret_addr: ?usize) noreturn {
+        _ = msg;
+        _ = ret_addr;
+        @trap();
+    }
+}.handler);
 
 {{module_vars}}var g: AssembledGame = undefined;
 {{hooks_init_block}}

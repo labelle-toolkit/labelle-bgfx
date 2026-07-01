@@ -622,29 +622,165 @@ pub fn build(b: *std.Build) void {
 /// `is_wasm` is true, is the loud-fail equivalent that keeps desktop/android
 /// byte-unchanged.
 fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    // target + optimize are consumed by the real module wiring (below TODO); a
-    // skeleton keeps the intended signature so the seam is drop-in once the
-    // spike resolves.
-    _ = target;
-    _ = optimize;
+    // ── emscripten sysroot ───────────────────────────────────────────
+    // bgfx/bx/bimg (C++) and stb_image (C) need emscripten's libc/libc++/EGL/GLES
+    // headers, which the Zig toolchain does NOT ship for wasm32-emscripten. The
+    // proven spike recipe threads a `-Demsdk_sysroot` path into zbgfx (which
+    // `addSystemIncludePath`s it onto bx/bimg/bgfx) and reuses it for our own
+    // stb C compile. Default to the Homebrew emscripten sysroot (matching the
+    // `emcc` on PATH used for the link below); override with `-Demsdk_sysroot`.
+    const emsdk_sysroot = b.option(
+        []const u8,
+        "emsdk_sysroot",
+        "Path to the emscripten sysroot 'include' dir for the wasm C/C++ compiles",
+    ) orelse "/opt/homebrew/Cellar/emscripten/4.0.23/libexec/cache/sysroot/include";
 
-    // emsdk sysroot for the stb_image C compile (mirrors labelle-sokol's
-    // build.zig + labelle-raylib). Lazily fetched so only a real wasm build
-    // pulls emsdk. TODO(#8 spike): attach this to the gfx module via
-    // `gfx_mod.addSystemIncludePath(...)` BEFORE `addCSourceFile` (see the sokol
-    // backend's build.zig), once the wasm module graph is wired below.
-    if (b.lazyDependency("emsdk", .{})) |emsdk_dep| {
-        _ = emsdk_dep.path("upstream/emscripten/cache/sysroot/include");
+    // ── wasm/WebGL-capable zbgfx (apotema/zbgfx fork, #8) ────────────
+    // Force `with_shaderc = false` (the host codegen tool can't build for wasm)
+    // and thread the sysroot so bx/bimg/bgfx find emscripten's headers. The fork
+    // also force-disables BGFX_CONFIG_MULTITHREADED for emscripten, so bgfx runs
+    // single-threaded and `bgfx.frame` renders in-thread from the main-loop cb.
+    const zbgfx_dep = b.dependency("zbgfx", .{
+        .target = target,
+        .optimize = optimize,
+        .with_shaderc = false,
+        .emsdk_sysroot = emsdk_sysroot,
+    });
+    const zbgfx_mod = zbgfx_dep.module("zbgfx");
+    const bgfx_artifact = zbgfx_dep.artifact("bgfx");
+
+    // labelle-core — comptime contract conformance for gfx/window/input (same as
+    // desktop/android). No core type crosses the engine seam through these
+    // modules, so the backend's own pin resolves it.
+    const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
+    const core_mod = core_dep.module("labelle-core");
+
+    // ── Gfx backend module ──────────────────────────────────────────
+    // `link_libc = true` for stb_image (malloc/free/memcpy) + gfx/texture.zig's
+    // libc file loader. The emscripten sysroot MUST be attached BEFORE
+    // `addCSourceFile` so the C TU finds <stdlib.h>/<stdio.h> (mirrors the sokol
+    // backend's ordering — setting it after made emcc bail with 'stdio.h' not
+    // found).
+    const gfx_mod = b.addModule("gfx", .{
+        .root_source_file = b.path("src/gfx.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    gfx_mod.addImport("zbgfx", zbgfx_mod);
+    gfx_mod.addImport("labelle-core", core_mod);
+    gfx_mod.addIncludePath(b.path("src"));
+    gfx_mod.addSystemIncludePath(.{ .cwd_relative = emsdk_sysroot });
+    gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_image_impl.c"), .flags = &.{} });
+
+    // ── Input backend module ────────────────────────────────────────
+    // No zglfw / no sdl_gamepad (both desktop-only) — src/input.zig comptime-gates
+    // every zglfw reference behind `no_glfw` (Android OR wasm) and stubs the
+    // getters, so the wasm example needs no input wiring. `android_gamepad` is
+    // imported on every target (its Android symbols are internally gated).
+    const input_opts = b.addOptions();
+    input_opts.addOption(bool, "gamepad_enabled", false);
+    input_opts.addOption(bool, "gamepad_hidapi", false);
+    input_opts.addOption(bool, "gui_enabled", false);
+    const input_mod = b.addModule("input", .{
+        .root_source_file = b.path("src/input.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    input_mod.addImport("build_options", input_opts.createModule());
+    input_mod.addImport("labelle-core", core_mod);
+    const android_gp_dep = b.dependency("labelle_android_gamepad", .{ .target = target, .optimize = optimize });
+    input_mod.addImport("android_gamepad", android_gp_dep.module("android_gamepad"));
+
+    // ── Window backend module ───────────────────────────────────────
+    // No zglfw; src/window.zig comptime-selects `initWindowWasm`, which hands
+    // bgfx the `#canvas` selector via `PlatformData.nwh`.
+    const window_mod = b.addModule("window", .{
+        .root_source_file = b.path("src/window.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    window_mod.addImport("zbgfx", zbgfx_mod);
+    window_mod.addImport("input", input_mod);
+    window_mod.addImport("labelle-core", core_mod);
+    window_mod.addImport("gfx", gfx_mod);
+
+    // ── Self-contained wasm/WebGL example → static lib → emcc link ───
+    // Built directly by the backend (no assembler/engine) so the whole wasm
+    // build+link chain is verifiable in-repo (`zig build wasm-example`). The
+    // assembler-generated app takes the same shape via templates/wasm.txt +
+    // backend.hook.zig's emcc arm.
+    const example_mod = b.createModule(.{
+        .root_source_file = b.path("example/wasm_demo.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    example_mod.addImport("window", window_mod);
+    example_mod.addImport("backend_gfx", gfx_mod);
+
+    // Compile the Zig side to a static lib; emcc links it + the bgfx C++ archive
+    // into the final .wasm/.js/.html.
+    const example_lib = b.addLibrary(.{
+        .name = "wasm_demo",
+        .linkage = .static,
+        .root_module = example_mod,
+    });
+
+    // Re-export the bgfx artifact (parity with the desktop/android installs).
+    b.installArtifact(bgfx_artifact);
+
+    // emcc link step. Use the `emcc` on PATH (the sysroot above matches it), so
+    // the build works without an installed emsdk dependency. bgfx creates its own
+    // WebGL2 context on `#canvas`, so — unlike raylib — there is NO GLFW emulation
+    // and NO asyncify; the frame is driven by emscripten_set_main_loop.
+    const emcc = b.addSystemCommand(&.{"emcc"});
+    if (optimize == .Debug) {
+        emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1", "-sASSERTIONS=1" });
+    } else if (optimize == .ReleaseSmall) {
+        emcc.addArgs(&.{ "-Oz", "-sASSERTIONS=0" });
+    } else if (optimize == .ReleaseSafe) {
+        emcc.addArgs(&.{ "-O3", "-sASSERTIONS=1" });
+    } else {
+        emcc.addArgs(&.{ "-O3", "-sASSERTIONS=0" });
     }
+    emcc.addArgs(&.{
+        "-sMIN_WEBGL_VERSION=2",
+        "-sMAX_WEBGL_VERSION=2",
+        // bgfx loads GL entry points via emscripten_webgl_get_proc_address; recent
+        // emscripten gates that helper behind this flag (else it's a link error).
+        "-sGL_ENABLE_GET_PROC_ADDRESS=1",
+        "-sALLOW_MEMORY_GROWTH=1",
+        "-sSTACK_SIZE=524288",
+    });
+    emcc.addArtifactArg(example_lib);
+    // zbgfx builds THREE static libs — bgfx, bx, bimg — where bx/bimg are linked
+    // into bgfx as `other_step` link objects. `addArtifactArg(bgfx)` alone only
+    // hands emcc `libbgfx.a`, leaving bx/bimg's symbols undefined at link. Walk
+    // bgfx's transitive compile dependencies and hand emcc every static lib
+    // (bgfx + bx + bimg), mirroring the sokol backend's emLinkStep. The set
+    // includes bgfx itself, so we don't add it separately.
+    for (bgfx_artifact.getCompileDependencies(false)) |dep| {
+        if (dep.kind == .lib) emcc.addArtifactArg(dep);
+    }
+    emcc.addArg("-o");
+    const html = emcc.addOutputFileArg("wasm_demo.html");
 
-    // TODO(#8 spike): wire the gfx/input/audio/window modules for wasm WITHOUT
-    // zglfw or sdl_gamepad (both desktop-only), mirroring the `is_android`
-    // branch in `build()`, then resolve + link the zbgfx wasm/WebGL bgfx
-    // artifact and create the bgfx WebGL canvas context. HOW zbgfx exposes an
-    // emscripten-built bgfx artifact is the parallel zbgfx-wasm-build spike's
-    // deliverable, so it is stubbed here rather than guessed. The emcc link
-    // step itself lives in `backend.hook.zig`'s wasm `post_wire` arm.
-    @panic("bgfx wasm build pending zbgfx emscripten support — labelle-bgfx#8");
+    // emcc emits wasm_demo.{html,js,wasm} into html's dir → install to web/.
+    const install_web = b.addInstallDirectory(.{
+        .source_dir = html.dirname(),
+        .install_dir = .prefix,
+        .install_subdir = "web",
+    });
+    b.getInstallStep().dependOn(&install_web.step);
+
+    const wasm_step = b.step("wasm-example", "Build the bgfx WebGL/wasm smoke example (emcc → zig-out/web/wasm_demo.html)");
+    wasm_step.dependOn(&install_web.step);
+
+    // A `test` step is expected by CI even on wasm; wire a no-op so `zig build
+    // test -Dtarget=wasm32-emscripten` succeeds (the real unit tests run on the
+    // host target in the desktop/android graph).
+    _ = b.step("test", "(wasm target: unit tests run on the host graph)");
 }
 
 /// Attach miniaudio's implementation TU + include path, and link the
