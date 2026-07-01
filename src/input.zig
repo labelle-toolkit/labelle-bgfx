@@ -28,7 +28,17 @@ pub const targets_input_contract: u32 = 1;
 const is_android = builtin.target.os.tag == .linux and
     (builtin.target.abi == .android or builtin.target.abi == .androideabi);
 
-const glfw = if (is_android) struct {} else @import("zglfw");
+/// wasm/WebGL (emscripten) target (bgfx-wasm epic #8). Like Android, zglfw is not
+/// in the build graph, so `glfw` resolves to an empty namespace and every zglfw
+/// reference below is comptime-gated on `no_glfw`. Input is minimal for the wasm
+/// example (no keyboard/mouse/gamepad wiring yet); the getters return the empty
+/// state, matching the pre-input Android path.
+const is_wasm = builtin.target.cpu.arch.isWasm();
+
+/// True on the two GLFW-less targets (Android + wasm).
+const no_glfw = is_android or is_wasm;
+
+const glfw = if (no_glfw) struct {} else @import("zglfw");
 
 // ── Android analog gamepad state (#310 Stage 4 / #250) ──────────────
 //
@@ -139,13 +149,13 @@ var pointer_down: bool = false;
 // for mouse button 0 from the raw down signal the glue pushes.
 var pointer_down_prev: bool = false;
 
-var glfw_window: if (is_android) ?*anyopaque else ?*glfw.Window = null;
+var glfw_window: if (no_glfw) ?*anyopaque else ?*glfw.Window = null;
 
-/// Bind to a GLFW window for input polling. Android has no GLFW window;
-/// the type is `*anyopaque` there and `setWindow` is a no-op (touch
-/// input is wired in phase 3, #302).
-pub fn setWindow(win: if (is_android) *anyopaque else *glfw.Window) void {
-    if (is_android) {
+/// Bind to a GLFW window for input polling. Android/wasm have no GLFW window;
+/// the type is `*anyopaque` there and `setWindow` is a no-op (Android touch
+/// input is wired in phase 3, #302; wasm html5 input is a follow-up).
+pub fn setWindow(win: if (no_glfw) *anyopaque else *glfw.Window) void {
+    if (no_glfw) {
         glfw_window = win;
         return;
     }
@@ -242,6 +252,11 @@ pub fn newFrame() void {
         agp.newFrame();
         return;
     }
+
+    // wasm: no GLFW poll and no html5 input feed yet — the per-frame edge arrays
+    // were already cleared above, so the getters report the empty state. Returning
+    // before the GLFW path keeps every zglfw reference comptime-eliminated.
+    if (comptime is_wasm) return;
 
     glfw.pollEvents();
 
@@ -350,7 +365,7 @@ fn forwardGuiInput() void {
 // ── Keyboard ──────────────────────────────────────────────
 
 pub fn isKeyDown(key: u32) bool {
-    if (is_android) return false; // no keyboard on Android (phase 3 touch)
+    if (no_glfw) return false; // no keyboard on Android (phase 3 touch) / wasm (follow-up)
     if (glfw_window) |win| {
         return win.getKey(@enumFromInt(key)) == .press;
     }
@@ -380,6 +395,7 @@ pub fn isMouseButtonDown(button: u32) bool {
         // Touch maps onto mouse button 0 (see the Android touch state).
         return button < MAX_MOUSE_BUTTONS and mouse_down[button];
     }
+    if (comptime is_wasm) return false; // no html5 pointer feed yet
     if (glfw_window) |win| {
         return win.getMouseButton(@enumFromInt(button)) == .press;
     }
@@ -569,6 +585,7 @@ pub fn isGamepadAvailable(gamepad: u32) bool {
     // keyed by Android device id. Connection is established by the JNI
     // detection glue (InputManager enumeration) + first input event.
     if (comptime is_android) return agp.connected(gamepad);
+    if (comptime is_wasm) return false; // no html5 gamepad feed yet
     // Desktop with the SDL source wired (`.gamepad = .auto`): route through
     // SDL's HIDAPI drivers (Switch/8BitDo raw-HID GLFW can't decode). The
     // Source emits the same canonical numbering as the GLFW path.
@@ -578,6 +595,7 @@ pub fn isGamepadAvailable(gamepad: u32) bool {
 
 pub fn isGamepadButtonDown(gamepad: u32, button: u32) bool {
     if (comptime is_android) return agp.buttonDown(gamepad, button);
+    if (comptime is_wasm) return false; // no html5 gamepad feed yet
     if (comptime use_sdl_gamepad) return sdl_gp.Source.isButtonDown(gamepad, button);
     if (gamepad >= MAX_GAMEPADS or button >= CANON_BUTTON_COUNT) return false;
     const state = glfw.getGamepadState(@enumFromInt(gamepad)) catch return false;
@@ -586,6 +604,7 @@ pub fn isGamepadButtonDown(gamepad: u32, button: u32) bool {
 
 pub fn isGamepadButtonPressed(gamepad: u32, button: u32) bool {
     if (comptime is_android) return agp.buttonPressed(gamepad, button);
+    if (comptime is_wasm) return false; // no html5 gamepad feed yet
     if (comptime use_sdl_gamepad) return sdl_gp.Source.isButtonPressed(gamepad, button);
     // Rising edge computed in `newFrame` from the GLFW state snapshot.
     if (gamepad >= MAX_GAMEPADS or button >= CANON_BUTTON_COUNT) return false;
@@ -594,6 +613,7 @@ pub fn isGamepadButtonPressed(gamepad: u32, button: u32) bool {
 
 pub fn getGamepadAxisValue(gamepad: u32, axis: u32) f32 {
     if (comptime is_android) return agp.axisValue(gamepad, axis);
+    if (comptime is_wasm) return 0; // no html5 gamepad feed yet
     if (comptime use_sdl_gamepad) return sdl_gp.Source.axisValue(gamepad, axis);
     // Canonical axes 0..5 == GLFW axes 0..5 (LX, LY, RX, RY, LT, RT).
     if (gamepad >= MAX_GAMEPADS or axis >= glfw.Gamepad.Axis.count) return 0;

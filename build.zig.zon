@@ -7,9 +7,17 @@
         // Pinned to specific commits — same class of fix as #146.
         // Bumping either dep requires `zig fetch <new-url>` to get
         // the new hash, then updating the url and hash together.
+        // wasm/WebGL-capable zbgfx (bgfx-wasm epic labelle-bgfx#8). Repinned from
+        // upstream `cyberegoorg/zbgfx` to the `apotema/zbgfx` fork's
+        // `feat/wasm-emscripten` branch (commit 0b229b7, PR cyberegoorg/zbgfx#9):
+        // it adds a `-Demsdk_sysroot` option + `is_emscripten` build arm that
+        // compiles bgfx/bx/bimg for wasm32-emscripten (forces single-threaded,
+        // drops the ASTC encoder's std::thread path, aliases bx's version macros,
+        // hosts shaderc). NATIVE builds are byte-for-byte unchanged — every wasm
+        // change is guarded by `target.result.os.tag == .emscripten`.
         .zbgfx = .{
-            .url = "https://codeberg.org/cyberegoorg/zbgfx/archive/8f01ea0ab6.tar.gz",
-            .hash = "zbgfx-0.12.0-Sm4IxEuHywb45XqoIhv3iEOxKXc01aKNNVjI63FHvqFw",
+            .url = "https://codeberg.org/apotema/zbgfx/archive/0b229b7.tar.gz",
+            .hash = "zbgfx-0.12.0-Sm4IxMKiywbXKIaoZ3_Bx1PVfeR0SM85KjPInWSi7f6t",
         },
         .zglfw = .{
             .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",
@@ -65,6 +73,17 @@
             .url = "https://github.com/labelle-toolkit/labelle-audio/archive/refs/tags/v0.2.1.tar.gz",
             .hash = "labelle_audio-0.2.1-QQRmYI4eAQDChv7DVK74-HPS9_J2bJw5ZDKFOazffYjU",
         },
+        // Emscripten SDK (bgfx-wasm epic labelle-bgfx#8). Provides `emcc` (the
+        // WASM link step in `backend.hook.zig`'s wasm `post_wire`) and the
+        // emscripten sysroot headers the stb_image C compile needs (Zig ships no
+        // libc headers for wasm32-emscripten). Same pin the sokol + raylib
+        // backends use — copied verbatim from labelle-raylib's build.zig.zon so
+        // all three web backends resolve one shared emsdk. Only fetched on a wasm
+        // build (`b.lazyDependency`); desktop/android never pull it.
+        .emsdk = .{
+            .url = "git+https://github.com/emscripten-core/emsdk?ref=4.0.9#3bcf1dcd01f040f370e10fe673a092d9ed79ebb5",
+            .hash = "N-V-__8AAJl1DwBezhYo_VE6f53mPVm00R-Fk28NPW7P14EQ",
+        },
     },
     .paths = .{
         "build.zig",
@@ -81,5 +100,8 @@
         // Build inputs:
         "src",
         "libs",
+        // Standalone wasm/WebGL smoke example built by `zig build wasm-example`
+        // (bgfx-wasm #8).
+        "example",
     },
 }

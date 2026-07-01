@@ -93,14 +93,19 @@ fn initShaders() void {
     if (shaders_initialized) return;
 
     // Select shader variant based on active renderer
+    // `.OpenGLES` = WebGL2 (emscripten) / GLES; it needs the essl `#version
+    // 300 es` variants — the desktop GLSL arrays are `-p 120` and render blank
+    // on WebGL2. Desktop `.OpenGL` (2.1) stays on the `-p 120` glsl `else` arm.
     const vs_data: []const u8 = switch (bgfx.getRendererType()) {
         .Metal => &shaders_data.vs_sprite_mtl,
         .Vulkan => &shaders_data.vs_sprite_spv,
+        .OpenGLES => &shaders_data.vs_sprite_essl,
         else => &shaders_data.vs_sprite_glsl,
     };
     const fs_data: []const u8 = switch (bgfx.getRendererType()) {
         .Metal => &shaders_data.fs_sprite_mtl,
         .Vulkan => &shaders_data.fs_sprite_spv,
+        .OpenGLES => &shaders_data.fs_sprite_essl,
         else => &shaders_data.fs_sprite_glsl,
     };
 
@@ -161,11 +166,13 @@ fn initYuvProgram() void {
     const vs_data: []const u8 = switch (bgfx.getRendererType()) {
         .Metal => &shaders_data.vs_sprite_mtl,
         .Vulkan => &shaders_data.vs_sprite_spv,
+        .OpenGLES => &shaders_data.vs_sprite_essl,
         else => &shaders_data.vs_sprite_glsl,
     };
     const fs_data: []const u8 = switch (bgfx.getRendererType()) {
         .Metal => &shaders_data.fs_yuv_mtl,
         .Vulkan => &shaders_data.fs_yuv_spv,
+        .OpenGLES => &shaders_data.fs_yuv_essl,
         else => &shaders_data.fs_yuv_glsl,
     };
 

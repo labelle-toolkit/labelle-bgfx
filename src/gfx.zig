@@ -108,13 +108,20 @@ pub const compressedDims = texture.compressedDims;
 // VideoPlayer wires a decoder → dynamic texture → drawTexturePro. Generic over
 // the decoder so the same player drives ffmpeg (desktop) or AMediaCodec
 // (Android). The Android decoder is hardware-verified (see video/apk/).
-pub const VideoPlayer = @import("video/player.zig").Player;
-pub const DesktopVideoDecoder = @import("video/desktop.zig").VideoDecoder;
-pub const AndroidVideoDecoder = @import("video/android.zig").VideoDecoder;
+// Video decode is a desktop/Android-only feature: the desktop decoder shells out
+// to ffmpeg and the CPU YUV path uses `std.Thread.spawn`, neither of which is
+// available (or wanted) on wasm32-emscripten (single-threaded WebGL, no
+// subprocesses). Gate the whole video surface off wasm so its `std.Thread` /
+// libc-process references are not analyzed for the browser target — WebGL video
+// is out of scope for the bgfx-wasm milestone (#8).
+const is_wasm = @import("builtin").target.cpu.arch.isWasm();
+pub const VideoPlayer = if (is_wasm) struct {} else @import("video/player.zig").Player;
+pub const DesktopVideoDecoder = if (is_wasm) struct {} else @import("video/desktop.zig").VideoDecoder;
+pub const AndroidVideoDecoder = if (is_wasm) struct {} else @import("video/android.zig").VideoDecoder;
 // VideoBackend satisfies core.VideoInterface: a name → player handle pool the
 // assembler wires into the engine's VideoImpl slot, so a game plays a clip with
 // just its asset name (#549).
-pub const VideoBackend = @import("video/backend.zig").VideoBackend;
+pub const VideoBackend = if (is_wasm) struct {} else @import("video/backend.zig").VideoBackend;
 
 // ── Text rendering ─────────────────────────────────────────────────────
 
