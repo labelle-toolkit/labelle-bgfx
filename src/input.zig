@@ -378,13 +378,34 @@ fn setWasmTouchPos(t: *const em.TouchPoint) void {
     // Engine touch getters (Android-parity): expose as touch index 0.
     touch_x = mouse_x;
     touch_y = mouse_y;
-    touch_id = @intCast(t.identifier);
     if (comptime gui_enabled) imgui.imgui_bridge_mouse_pos(mouse_x, mouse_y);
 }
 
+/// Number of valid entries in the event's touch array (clamped to the fixed 32).
+fn wasmTouchCount(e: *const em.TouchEvent) usize {
+    if (e.numTouches <= 0) return 0;
+    return @min(@as(usize, @intCast(e.numTouches)), e.touches.len);
+}
+
+/// The touch point matching `id`, if present in this event.
+fn findWasmTouch(e: *const em.TouchEvent, id: u64) ?*const em.TouchPoint {
+    for (e.touches[0..wasmTouchCount(e)]) |*t| {
+        if (@as(u64, @intCast(t.identifier)) == id) return t;
+    }
+    return null;
+}
+
+// Single-primary-pointer model (Android-parity): the FIRST finger down becomes
+// the pointer, tracked by its `identifier`; other fingers are ignored until it
+// lifts. This prevents a second finger from emitting an extra button-0 press or
+// a stray finger's `touchend` from releasing an in-progress drag. (Multi-touch /
+// pinch is a follow-up.)
 fn wasmTouchStart(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bool {
     if (e.numTouches <= 0) return true;
-    setWasmTouchPos(&e.touches[0]);
+    if (touch_active) return true; // already tracking a primary finger
+    const t = &e.touches[0];
+    touch_id = @intCast(t.identifier);
+    setWasmTouchPos(t);
     touch_active = true;
     pointer_down = true;
     wasm_mouse_down[0] = true;
@@ -394,18 +415,31 @@ fn wasmTouchStart(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) 
 }
 
 fn wasmTouchMove(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bool {
-    if (e.numTouches <= 0) return true;
-    setWasmTouchPos(&e.touches[0]);
+    if (!touch_active) return true;
+    if (findWasmTouch(e, touch_id)) |t| setWasmTouchPos(t);
     return true;
 }
 
 fn wasmTouchEnd(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bool {
-    if (e.numTouches > 0) setWasmTouchPos(&e.touches[0]);
+    if (!touch_active) return true;
+    // The primary is still down iff it appears in this event as an ACTIVE
+    // (not-changed) touch — true whether emscripten includes the ended touch
+    // (as `isChanged`) or omits it. If so, a non-primary finger ended: keep the
+    // pointer down and just refresh position.
+    for (e.touches[0..wasmTouchCount(e)]) |*t| {
+        if (@as(u64, @intCast(t.identifier)) == touch_id and !t.isChanged) {
+            setWasmTouchPos(t);
+            return true;
+        }
+    }
+    // Primary finger lifted → release the pointer.
     touch_active = false;
     pointer_down = false;
-    wasm_mouse_down[0] = false;
-    wasm_mouse_released_accum[0] = true;
-    if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(0, false);
+    if (wasm_mouse_down[0]) {
+        wasm_mouse_down[0] = false;
+        wasm_mouse_released_accum[0] = true;
+        if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(0, false);
+    }
     return true;
 }
 
