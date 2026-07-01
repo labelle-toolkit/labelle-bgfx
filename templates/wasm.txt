@@ -109,5 +109,5 @@ pub fn main() !void {
 
     g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
 
-{{preview_setup}}{{setup_code}}    emscripten_set_main_loop(&gameFrame, @intCast(target_fps), 1);
+{{preview_setup}}{{setup_code}}    emscripten_set_main_loop(&gameFrame, 0, 1); // fps=0 → requestAnimationFrame (labelle-bgfx#14); target_fps still drives the dt clamp
 }

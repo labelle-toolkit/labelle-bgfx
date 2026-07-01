@@ -5,6 +5,7 @@
 /// namespace — every zglfw reference below is comptime-gated on
 /// `is_android` so the module compiles for `aarch64-linux-android`.
 const builtin = @import("builtin");
+const std = @import("std");
 
 /// labelle-core, for the comptime input-contract conformance gate below.
 const core = @import("labelle-core");
@@ -47,8 +48,9 @@ const glfw = if (no_glfw) struct {} else @import("zglfw");
 // callbacks fire asynchronously between frames (browser event loop); `newFrame`
 // derives this-frame press/release edges and forwards to Dear ImGui, mirroring
 // the Android path. Hand-rolled externs (no `@cImport(<html5.h>)`, matching
-// window.zig): the `EmscriptenMouseEvent` layout is byte-faithful to emscripten
-// 4.x `html5.h`.
+// window.zig): the `EmscriptenMouseEvent`/`Touch`/`Keyboard` layouts are
+// byte-faithful to emscripten 4.x `html5.h`. Keyboard (#16) + two-finger
+// pinch-zoom (#16) complete the web input story alongside mouse (#24)/touch.
 const em = if (is_wasm) struct {
     const MouseEvent = extern struct {
         timestamp: f64,
@@ -102,9 +104,34 @@ const em = if (is_wasm) struct {
         metaKey: bool,
         touches: [32]TouchPoint,
     };
+    // EmscriptenKeyboardEvent (html5.h), byte-faithful. `EM_UTF8` is `char`,
+    // `EM_HTML5_SHORT_STRING_LEN_BYTES` is 32 → the four DOM string fields
+    // (`key`/`code`/`charValue`/`locale`) are `[32]u8`. We read `keyCode` (DOM
+    // legacy key code) for key state + `charCode`/`which` for typed text; the
+    // string fields are unused but present so the struct matches C's ABI.
+    const KeyboardEvent = extern struct {
+        timestamp: f64,
+        location: u32,
+        ctrlKey: bool,
+        shiftKey: bool,
+        altKey: bool,
+        metaKey: bool,
+        repeat: bool,
+        charCode: u32,
+        keyCode: u32,
+        which: u32,
+        key: [32]u8,
+        code: [32]u8,
+        charValue: [32]u8,
+        locale: [32]u8,
+    };
     const MouseCb = *const fn (event_type: i32, e: *const MouseEvent, user: ?*anyopaque) callconv(.c) bool;
     const WheelCb = *const fn (event_type: i32, e: *const WheelEvent, user: ?*anyopaque) callconv(.c) bool;
     const TouchCb = *const fn (event_type: i32, e: *const TouchEvent, user: ?*anyopaque) callconv(.c) bool;
+    const KeyCb = *const fn (event_type: i32, e: *const KeyboardEvent, user: ?*anyopaque) callconv(.c) bool;
+    // `em_focus_callback_func` — the EmscriptenFocusEvent payload is unused
+    // (we only need the blur edge), so take it as an opaque non-null pointer.
+    const FocusCb = *const fn (event_type: i32, e: *const anyopaque, user: ?*anyopaque) callconv(.c) bool;
     // `EM_CALLBACK_THREAD_CONTEXT_CALLING_THREAD` == (pthread_t)0x2 (html5.h).
     const CALLING_THREAD: ?*anyopaque = @ptrFromInt(2);
     extern "c" fn emscripten_set_mousemove_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: MouseCb, thread: ?*anyopaque) c_int;
@@ -115,6 +142,10 @@ const em = if (is_wasm) struct {
     extern "c" fn emscripten_set_touchend_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: TouchCb, thread: ?*anyopaque) c_int;
     extern "c" fn emscripten_set_touchmove_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: TouchCb, thread: ?*anyopaque) c_int;
     extern "c" fn emscripten_set_touchcancel_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: TouchCb, thread: ?*anyopaque) c_int;
+    extern "c" fn emscripten_set_keydown_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: KeyCb, thread: ?*anyopaque) c_int;
+    extern "c" fn emscripten_set_keyup_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: KeyCb, thread: ?*anyopaque) c_int;
+    extern "c" fn emscripten_set_keypress_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: KeyCb, thread: ?*anyopaque) c_int;
+    extern "c" fn emscripten_set_blur_callback_on_thread(target: [*:0]const u8, user: ?*anyopaque, use_capture: bool, cb: FocusCb, thread: ?*anyopaque) c_int;
     extern "c" fn emscripten_get_canvas_element_size(target: [*:0]const u8, w: *c_int, h: *c_int) c_int;
     extern "c" fn emscripten_get_element_css_size(target: [*:0]const u8, w: *f64, h: *f64) c_int;
 } else struct {};
@@ -130,6 +161,27 @@ var wasm_mouse_down: [MAX_MOUSE_BUTTONS]bool = [_]bool{false} ** MAX_MOUSE_BUTTO
 var wasm_mouse_pressed_accum: [MAX_MOUSE_BUTTONS]bool = [_]bool{false} ** MAX_MOUSE_BUTTONS;
 var wasm_mouse_released_accum: [MAX_MOUSE_BUTTONS]bool = [_]bool{false} ** MAX_MOUSE_BUTTONS;
 var wasm_wheel_accum: f32 = 0;
+
+// wasm keyboard down-state (#16). The desktop path live-polls GLFW for
+// `isKeyDown`; wasm has no poll, so the HTML5 keydown/keyup callbacks track the
+// held state here, indexed by GLFW keycode (== the engine's `KeyboardKey`).
+// The press/release EDGE arrays (`keys_pressed`/`keys_released`) are cleared at
+// the TOP of `newFrame`, before the wasm latch — so an async keydown between
+// frames would set the slot then have it wiped. Mirror the mouse edge fix:
+// accumulate edges here in the callbacks and OR them into `keys_pressed`/
+// `keys_released` in `newFrame`'s wasm branch (then clear).
+var wasm_key_down: [MAX_KEYS]bool = [_]bool{false} ** MAX_KEYS;
+var wasm_key_pressed_accum: [MAX_KEYS]bool = [_]bool{false} ** MAX_KEYS;
+var wasm_key_released_accum: [MAX_KEYS]bool = [_]bool{false} ** MAX_KEYS;
+
+// wasm multi-touch pinch-zoom state (#16). When ≥2 fingers are down we compute
+// the distance between the first two touch points and feed its frame-over-frame
+// delta into the wheel (mobile analog of the mouse wheel). `wasm_pinch_prev_dist`
+// is reset on entering/leaving pinch mode so the first pinch frame never jumps.
+var wasm_pinch_active: bool = false;
+var wasm_pinch_prev_dist: f32 = 0;
+// Pinch sensitivity: ~1 wheel-unit (one notch) per this many pixels of spread.
+const WASM_PINCH_PX_PER_WHEEL: f32 = 80.0;
 
 // ── Android analog gamepad state (#310 Stage 4 / #250) ──────────────
 //
@@ -276,6 +328,11 @@ pub fn setWindow(win: if (no_glfw) *anyopaque else *glfw.Window) void {
 // Only analyzed on wasm: referenced solely from `registerWasmMouse`, itself
 // reached only under `if (comptime is_wasm)`. `em`/`mouse_*` are the wasm defs.
 const wasm_canvas: [:0]const u8 = "#canvas";
+// Keyboard events don't target the canvas (it isn't keyboard-focusable) — they
+// go to the window. `EMSCRIPTEN_EVENT_TARGET_WINDOW` is the sentinel
+// `(const char*)2` (html5.h), which emscripten's findEventTarget special-cases
+// before treating the pointer as a selector string.
+const wasm_window_target: [*:0]const u8 = @ptrFromInt(2);
 
 /// DOM `MouseEvent.button` (0=left,1=middle,2=right) → the engine/GLFW canonical
 /// numbering (0=left,1=right,2=middle) that `mouse_down[]`, the engine getters,
@@ -362,13 +419,134 @@ fn wasmWheel(_: i32, e: *const em.WheelEvent, _: ?*anyopaque) callconv(.c) bool 
     return true;
 }
 
+// ── wasm/emscripten HTML5 keyboard/text input (#16) ─────────────────────
+// Mirror the desktop GLFW `keyCallback`/`charCallback`: keydown/keyup drive the
+// engine key state (`keys_pressed`/`keys_released` edges + `wasm_key_down` for
+// `isKeyDown`) and imgui key events; keypress feeds typed characters to imgui.
+//
+// The engine's `KeyboardKey` codes equal the GLFW keycodes (see `keyCallback`).
+// We map ENGINE key-state from the PHYSICAL `KeyboardEvent.code` token (e.g.
+// "KeyW"), NOT `keyCode`: `keyCode` reflects the PRODUCED CHARACTER, which is
+// layout-dependent — an AZERTY user pressing the physical W position reports
+// DOM `Z`, so keying off `keyCode` would break WASD vs desktop. `code` is
+// layout-INDEPENDENT (physical position), matching how desktop GLFW reports
+// keys. TEXT input stays on the keypress/char path (`imgui_bridge_char`), which
+// SHOULD be layout-dependent — only engine key-state uses physical `code`.
+// Unmapped keys (F-keys, punctuation, numpad, …) are ignored for now.
+
+/// Physical `KeyboardEvent.code` token → GLFW/engine keycode, or null when
+/// unmapped. GLFW letter/digit codes coincide with ASCII: A=65..Z=90, 0=48..9=57.
+fn codeToGlfwKey(code: []const u8) ?u32 {
+    // Letter keys "KeyA".."KeyZ" → GLFW 65..90 (== the ASCII uppercase letter).
+    if (code.len == 4 and std.mem.eql(u8, code[0..3], "Key")) {
+        const c = code[3];
+        if (c >= 'A' and c <= 'Z') return c;
+    }
+    // Top-row digit keys "Digit0".."Digit9" → GLFW 48..57 (numpad is ignored).
+    if (code.len == 6 and std.mem.eql(u8, code[0..5], "Digit")) {
+        const d = code[5];
+        if (d >= '0' and d <= '9') return d;
+    }
+    const eql = std.mem.eql;
+    if (eql(u8, code, "Space")) return 32;
+    if (eql(u8, code, "Enter")) return 257;
+    if (eql(u8, code, "Escape")) return 256;
+    if (eql(u8, code, "Backspace")) return 259;
+    if (eql(u8, code, "Tab")) return 258;
+    if (eql(u8, code, "Delete")) return 261;
+    if (eql(u8, code, "ArrowLeft")) return 263;
+    if (eql(u8, code, "ArrowUp")) return 265;
+    if (eql(u8, code, "ArrowRight")) return 262;
+    if (eql(u8, code, "ArrowDown")) return 264;
+    if (eql(u8, code, "ShiftLeft")) return 340; // GLFW LEFT_SHIFT
+    if (eql(u8, code, "ShiftRight")) return 344; // GLFW RIGHT_SHIFT
+    if (eql(u8, code, "ControlLeft")) return 341; // GLFW LEFT_CONTROL
+    if (eql(u8, code, "ControlRight")) return 345; // GLFW RIGHT_CONTROL
+    if (eql(u8, code, "AltLeft")) return 342; // GLFW LEFT_ALT
+    if (eql(u8, code, "AltRight")) return 346; // GLFW RIGHT_ALT
+    if (eql(u8, code, "MetaLeft")) return 343; // GLFW LEFT_SUPER (macOS Cmd)
+    if (eql(u8, code, "MetaRight")) return 347; // GLFW RIGHT_SUPER (macOS Cmd)
+    return null;
+}
+
+/// The physical `code` token as a NUL-terminated slice of the fixed [32]u8.
+fn wasmKeyCode(e: *const em.KeyboardEvent) []const u8 {
+    return std.mem.sliceTo(&e.code, 0);
+}
+
+// All three key callbacks return FALSE so emscripten does NOT call
+// `preventDefault()`. Returning true would suppress the follow-on `keypress`
+// event (so `wasmKeyPress`/`imgui_bridge_char` never fire → text input broken)
+// and swallow browser shortcuts. The FP web page is a fullscreen canvas, so we
+// don't need to consume keys to stop page-scroll; text-input correctness wins.
+fn wasmKeyDown(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) bool {
+    if (codeToGlfwKey(wasmKeyCode(e))) |code| {
+        wasm_key_down[code] = true; // held-state for isKeyDown (no poll on wasm)
+        // Auto-repeat isn't a fresh press: skip the edge accum + the imgui key
+        // event (imgui auto-repeats from held state), matching desktop.
+        if (!e.repeat) {
+            wasm_key_pressed_accum[code] = true; // latched into keys_pressed in newFrame
+            if (comptime gui_enabled) imgui.imgui_bridge_key(@intCast(code), true);
+        }
+    }
+    return false;
+}
+
+fn wasmKeyUp(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) bool {
+    if (codeToGlfwKey(wasmKeyCode(e))) |code| {
+        wasm_key_down[code] = false;
+        wasm_key_released_accum[code] = true; // latched into keys_released in newFrame
+        if (comptime gui_enabled) imgui.imgui_bridge_key(@intCast(code), false);
+    }
+    return false;
+}
+
+fn wasmKeyPress(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) bool {
+    // keypress carries the typed Unicode codepoint (post-layout/shift). Feed it
+    // to imgui text fields exactly like the desktop `charCallback`; the bridge
+    // drops control chars. No-op / comptime-eliminated without the imgui bridge.
+    if (comptime gui_enabled) {
+        const cp: u32 = if (e.charCode != 0) e.charCode else e.which;
+        if (cp != 0) imgui.imgui_bridge_char(cp);
+    }
+    return false;
+}
+
+/// Window blur (focus loss): a key held when the tab/window loses focus never
+/// gets its `keyup`, so `wasm_key_down` would stay stuck true forever. Clear all
+/// held key + pointer state on blur (forwarding key-up to imgui for anything
+/// that was down), so returning to the tab starts from a clean slate.
+fn wasmBlur(_: i32, _: *const anyopaque, _: ?*anyopaque) callconv(.c) bool {
+    for (0..MAX_KEYS) |k| {
+        if (wasm_key_down[k]) {
+            wasm_key_down[k] = false;
+            wasm_key_released_accum[k] = true;
+            if (comptime gui_enabled) imgui.imgui_bridge_key(@intCast(k), false);
+        }
+    }
+    // Also release any held mouse button / touch pointer / pinch, so a
+    // button-down that loses focus doesn't stick either.
+    for (0..MAX_MOUSE_BUTTONS) |b| {
+        if (wasm_mouse_down[b]) {
+            wasm_mouse_down[b] = false;
+            wasm_mouse_released_accum[b] = true;
+            if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(@intCast(b), false);
+        }
+    }
+    touch_active = false;
+    pointer_down = false;
+    wasm_pinch_active = false;
+    wasm_pinch_prev_dist = 0;
+    return false;
+}
+
 // ── wasm/emscripten HTML5 touch callbacks (mobile web) ──────────────────
 // Mirror the Android NativeActivity glue's single-primary-pointer model: map
 // the first touch point onto mouse button 0 + the cursor position, so imgui and
 // the engine's mouse-driven hit-testing see touch transparently. Also drive the
 // engine's touch getters (getTouchX/Y/Count/Id) for games that read touch
-// directly. Multi-touch (pinch) is a follow-up. Desktop fires mouse callbacks;
-// mobile fires these — a device just uses whichever it has.
+// directly. Two fingers pinch-zoom (see `handleWasmPinch`, #16). Desktop fires
+// mouse callbacks; mobile fires these — a device just uses whichever it has.
 
 /// Position (scaled CSS→framebuffer) from the primary touch point.
 fn setWasmTouchPos(t: *const em.TouchPoint) void {
@@ -395,13 +573,124 @@ fn findWasmTouch(e: *const em.TouchEvent, id: u64) ?*const em.TouchPoint {
     return null;
 }
 
+// ── wasm two-finger pinch-zoom (#16) ────────────────────────────────────
+// Mobile analog of the mouse wheel: with ≥2 fingers down, feed the change in
+// the first-two-fingers distance into `wasm_wheel_accum` (+ the imgui wheel),
+// so games that map `getMouseWheelMove()` → camera zoom (e.g. FP's
+// camera_control) get pinch-to-zoom for free. Spreading fingers apart grows
+// the distance → positive wheel (zoom in); pinching in → negative (zoom out).
+
+// A touch point is ACTIVE (still on the surface after this event) unless this
+// is a touchend/cancel AND the point is one of the lifted (`isChanged`) ones.
+// emscripten's `touches` array is the UNION of on-surface + changed points, so
+// on touchend a lifted finger is still listed (with `isChanged=true`); on
+// touchstart the just-placed finger is also `isChanged` but IS active — hence
+// the `is_end` gate (a plain skip-`isChanged` would undercount on start).
+fn touchIsActive(t: *const em.TouchPoint, is_end: bool) bool {
+    return !(is_end and t.isChanged);
+}
+
+/// Count of touches that remain active after this event (drives the pinch gate).
+fn wasmActiveTouchCount(e: *const em.TouchEvent, is_end: bool) usize {
+    var count: usize = 0;
+    for (e.touches[0..wasmTouchCount(e)]) |*t| {
+        if (touchIsActive(t, is_end)) count += 1;
+    }
+    return count;
+}
+
+/// Framebuffer-pixel distance between the first two ACTIVE touch points (0 if
+/// <2). Skips lifted fingers on touchend so a 3→2 finger lift measures the two
+/// surviving fingers, never a finger that's leaving.
+fn wasmPinchDist(e: *const em.TouchEvent, is_end: bool) f32 {
+    var pts: [2]*const em.TouchPoint = undefined;
+    var k: usize = 0;
+    for (e.touches[0..wasmTouchCount(e)]) |*t| {
+        if (touchIsActive(t, is_end)) {
+            pts[k] = t;
+            k += 1;
+            if (k == 2) break;
+        }
+    }
+    if (k < 2) return 0;
+    const s = wasmScale();
+    const ax = @as(f32, @floatFromInt(pts[0].targetX)) * s.x;
+    const ay = @as(f32, @floatFromInt(pts[0].targetY)) * s.y;
+    const bx = @as(f32, @floatFromInt(pts[1].targetX)) * s.x;
+    const by = @as(f32, @floatFromInt(pts[1].targetY)) * s.y;
+    const dx = bx - ax;
+    const dy = by - ay;
+    return @sqrt(dx * dx + dy * dy);
+}
+
+/// Cancel any in-progress single-finger primary pointer WITHOUT leaving a
+/// phantom click. The primary's imgui down was already sent event-driven in
+/// `wasmTouchStart`, so we always balance it with an imgui up (else imgui's
+/// button sticks). But the ENGINE release EDGE is only emitted when the press
+/// was actually LATCHED (`mouse_down[0]`): if the 2nd finger lands before any
+/// `newFrame`, the press never reached the engine, so a release would be a
+/// phantom — we just drop the pending press accum instead.
+fn cancelWasmPrimary() void {
+    touch_active = false;
+    pointer_down = false;
+    wasm_mouse_pressed_accum[0] = false; // drop an as-yet-unlatched press
+    wasm_mouse_down[0] = false;
+    if (mouse_down[0]) wasm_mouse_released_accum[0] = true; // only if latched
+    if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(0, false);
+}
+
+/// Drive pinch mode from an incoming touch event (`is_end` true for
+/// touchend/cancel). Returns true when the event is consumed as a pinch (the
+/// caller then skips the single-pointer logic). Entering pinch cancels the
+/// single-finger press so the gesture zooms instead of dragging; leaving pinch
+/// (back to ≤1 active touch) re-seeds the primary pointer (position only, no
+/// press) from the remaining finger so single-pointer tracking resumes without
+/// a phantom click. `wasm_pinch_prev_dist` is reset on both transitions so
+/// neither the first nor a later pinch frame jumps.
+fn handleWasmPinch(e: *const em.TouchEvent, is_end: bool) bool {
+    const n = wasmActiveTouchCount(e, is_end);
+    if (n >= 2) {
+        const dist = wasmPinchDist(e, is_end);
+        if (!wasm_pinch_active) {
+            wasm_pinch_active = true;
+            wasm_pinch_prev_dist = dist; // seed → no jump on the first move
+            cancelWasmPrimary();
+        } else {
+            const delta = (dist - wasm_pinch_prev_dist) / WASM_PINCH_PX_PER_WHEEL;
+            wasm_pinch_prev_dist = dist;
+            if (delta != 0) {
+                wasm_wheel_accum += delta;
+                if (comptime gui_enabled) imgui.imgui_bridge_mouse_wheel(0, delta);
+            }
+        }
+        return true;
+    }
+    if (wasm_pinch_active) {
+        wasm_pinch_active = false;
+        wasm_pinch_prev_dist = 0;
+        if (n == 1) {
+            // Re-seed from the first ACTIVE touch (index 0 may be the lifted one).
+            for (e.touches[0..wasmTouchCount(e)]) |*t| {
+                if (touchIsActive(t, is_end)) {
+                    touch_id = @intCast(t.identifier);
+                    setWasmTouchPos(t);
+                    touch_active = true; // resume single-pointer tracking (no press)
+                    break;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 // Single-primary-pointer model (Android-parity): the FIRST finger down becomes
 // the pointer, tracked by its `identifier`; other fingers are ignored until it
 // lifts. This prevents a second finger from emitting an extra button-0 press or
-// a stray finger's `touchend` from releasing an in-progress drag. (Multi-touch /
-// pinch is a follow-up.)
+// a stray finger's `touchend` from releasing an in-progress drag. A second
+// finger instead triggers pinch-zoom (`handleWasmPinch`), not a click.
 fn wasmTouchStart(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bool {
     if (e.numTouches <= 0) return true;
+    if (handleWasmPinch(e, false)) return true; // ≥2 fingers → pinch-zoom, not a click
     if (touch_active) return true; // already tracking a primary finger
     const t = &e.touches[0];
     touch_id = @intCast(t.identifier);
@@ -415,12 +704,17 @@ fn wasmTouchStart(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) 
 }
 
 fn wasmTouchMove(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bool {
+    if (handleWasmPinch(e, false)) return true; // ≥2 fingers → feed wheel delta, no move
     if (!touch_active) return true;
     if (findWasmTouch(e, touch_id)) |t| setWasmTouchPos(t);
     return true;
 }
 
 fn wasmTouchEnd(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bool {
+    // Count only ACTIVE (non-lifted) touches: a touchend still LISTS the lifted
+    // finger (isChanged), so `is_end=true` excludes it. Still ≥2 active → stay
+    // in pinch; dropping below 2 exits pinch + re-seeds the single pointer.
+    if (handleWasmPinch(e, true)) return true;
     if (!touch_active) return true;
     // The primary is still down iff it appears in this event as an ACTIVE
     // (not-changed) touch — true whether emscripten includes the ended touch
@@ -461,6 +755,15 @@ fn registerWasmInput() void {
     _ = em.emscripten_set_touchmove_callback_on_thread(wasm_canvas.ptr, null, true, wasmTouchMove, em.CALLING_THREAD);
     _ = em.emscripten_set_touchend_callback_on_thread(wasm_canvas.ptr, null, true, wasmTouchEnd, em.CALLING_THREAD);
     _ = em.emscripten_set_touchcancel_callback_on_thread(wasm_canvas.ptr, null, true, wasmTouchEnd, em.CALLING_THREAD);
+    // Keyboard / text (desktop web) — key state + imgui key/char feed (#16).
+    // Registered on the WINDOW (not the canvas): keyboard events target the
+    // focused element / window, and the canvas isn't keyboard-focusable, so
+    // canvas-targeted key callbacks never fire.
+    _ = em.emscripten_set_keydown_callback_on_thread(wasm_window_target, null, true, wasmKeyDown, em.CALLING_THREAD);
+    _ = em.emscripten_set_keyup_callback_on_thread(wasm_window_target, null, true, wasmKeyUp, em.CALLING_THREAD);
+    _ = em.emscripten_set_keypress_callback_on_thread(wasm_window_target, null, true, wasmKeyPress, em.CALLING_THREAD);
+    // Window blur → clear stuck held keys/pointer on focus loss (#16 review).
+    _ = em.emscripten_set_blur_callback_on_thread(wasm_window_target, null, true, wasmBlur, em.CALLING_THREAD);
 }
 
 fn scrollCallback(_: *glfw.Window, _: f64, yoffset: f64) callconv(.c) void {
@@ -559,6 +862,19 @@ pub fn newFrame() void {
         wasm_mouse_released_accum = [_]bool{false} ** MAX_MOUSE_BUTTONS;
         mouse_wheel = wasm_wheel_accum;
         wasm_wheel_accum = 0;
+        // Latch the async keyboard edges accumulated by the key callbacks into
+        // this frame's `keys_pressed`/`keys_released` (both just cleared at the
+        // top of `newFrame`), then drain — mirrors the mouse edge accumulators.
+        for (0..MAX_KEYS) |k| {
+            if (wasm_key_pressed_accum[k]) {
+                keys_pressed[k] = true;
+                wasm_key_pressed_accum[k] = false;
+            }
+            if (wasm_key_released_accum[k]) {
+                keys_released[k] = true;
+                wasm_key_released_accum[k] = false;
+            }
+        }
         return;
     }
 
@@ -670,7 +986,10 @@ fn forwardGuiInput() void {
 // ── Keyboard ──────────────────────────────────────────────
 
 pub fn isKeyDown(key: u32) bool {
-    if (no_glfw) return false; // no keyboard on Android (phase 3 touch) / wasm (follow-up)
+    // wasm: no GLFW poll — the HTML5 keydown/keyup callbacks maintain the
+    // held-state array, indexed by GLFW keycode (#16).
+    if (comptime is_wasm) return key < MAX_KEYS and wasm_key_down[key];
+    if (no_glfw) return false; // no keyboard on Android (phase 3 touch)
     if (glfw_window) |win| {
         return win.getKey(@enumFromInt(key)) == .press;
     }
