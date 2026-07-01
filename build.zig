@@ -803,11 +803,18 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // Re-export the bgfx artifact (parity with the desktop/android installs).
     b.installArtifact(bgfx_artifact);
 
-    // emcc link step. Use the `emcc` on PATH (the sysroot above matches it), so
-    // the build works without an installed emsdk dependency. bgfx creates its own
-    // WebGL2 context on `#canvas`, so — unlike raylib — there is NO GLFW emulation
-    // and NO asyncify; the frame is driven by emscripten_set_main_loop.
-    const emcc = b.addSystemCommand(&.{"emcc"});
+    // emcc link step. Use the PACKAGED emcc (from the same emsdk dep whose sysroot
+    // the C/C++ TUs above include), so the example links on any host — no local
+    // Emscripten install, and no risk of a PATH `emcc` mismatching the packaged
+    // sysroot. bgfx creates its own WebGL2 context on `#canvas`, so — unlike
+    // raylib — there is NO GLFW emulation and NO asyncify; the frame is driven by
+    // emscripten_set_main_loop.
+    const emcc_exe = if (builtin.os.tag == .windows)
+        emsdk_dep.path("upstream/emscripten/emcc.bat").getPath(b)
+    else
+        emsdk_dep.path("upstream/emscripten/emcc").getPath(b);
+    const emcc = b.addSystemCommand(&.{emcc_exe});
+    if (emsdk_setup) |setup| emcc.step.dependOn(&setup.step);
     if (optimize == .Debug) {
         emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1", "-sASSERTIONS=1" });
     } else if (optimize == .ReleaseSmall) {
