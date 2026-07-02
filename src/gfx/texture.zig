@@ -38,6 +38,15 @@ var texture_handles: [MAX_TEXTURES]bgfx.TextureHandle = [_]bgfx.TextureHandle{.{
 /// Stored so we can free on unload/shutdown. null means no decoded data.
 var texture_pixel_data: [MAX_TEXTURES]?[]u8 = [_]?[]u8{null} ** MAX_TEXTURES;
 
+/// Look up the raw bgfx handle backing a pool id (used by `gfx.drawMesh` to
+/// bind a `Texture` returned by `uploadTexture`/`createTexture2D` — e.g. a Spine
+/// atlas page — through the sprite pipeline). Returns an invalid handle for
+/// out-of-range / unloaded ids so callers can skip the submit.
+pub fn handleForId(id: u32) bgfx.TextureHandle {
+    if (id >= MAX_TEXTURES) return .{ .idx = std.math.maxInt(u16) };
+    return texture_handles[id];
+}
+
 /// Find a free texture slot by scanning for invalid handles (supports reuse after unload).
 fn findFreeTextureSlot() ?u32 {
     // Start from 1 (slot 0 is reserved/unused)
