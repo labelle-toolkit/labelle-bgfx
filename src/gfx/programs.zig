@@ -22,6 +22,39 @@ pub const STATE_BLEND_ALPHA: u64 = stateBlendFuncSeparate(
     bgfx.StateFlags_BlendInvSrcAlpha,
 );
 
+// ── Premultiplied-alpha blend states for `drawMesh` (labelle-gfx#290) ──
+// Spine's default export uses a premultiplied-alpha (PMA) atlas, so the four
+// Spine blend modes map to PMA blend funcs (src factor is ONE / DST_COLOR, not
+// SRC_ALPHA). These mirror the spine-glfw reference renderer's blend table.
+/// PMA "normal": ONE, INV_SRC_ALPHA.
+pub const STATE_BLEND_PMA_NORMAL: u64 = stateBlendFuncSeparate(
+    bgfx.StateFlags_BlendOne,
+    bgfx.StateFlags_BlendInvSrcAlpha,
+    bgfx.StateFlags_BlendOne,
+    bgfx.StateFlags_BlendInvSrcAlpha,
+);
+/// PMA additive: ONE, ONE.
+pub const STATE_BLEND_PMA_ADD: u64 = stateBlendFuncSeparate(
+    bgfx.StateFlags_BlendOne,
+    bgfx.StateFlags_BlendOne,
+    bgfx.StateFlags_BlendOne,
+    bgfx.StateFlags_BlendOne,
+);
+/// PMA multiply: DST_COLOR, INV_SRC_ALPHA.
+pub const STATE_BLEND_PMA_MULTIPLY: u64 = stateBlendFuncSeparate(
+    bgfx.StateFlags_BlendDstColor,
+    bgfx.StateFlags_BlendInvSrcAlpha,
+    bgfx.StateFlags_BlendDstColor,
+    bgfx.StateFlags_BlendInvSrcAlpha,
+);
+/// PMA screen: ONE, INV_SRC_COLOR.
+pub const STATE_BLEND_PMA_SCREEN: u64 = stateBlendFuncSeparate(
+    bgfx.StateFlags_BlendOne,
+    bgfx.StateFlags_BlendInvSrcColor,
+    bgfx.StateFlags_BlendOne,
+    bgfx.StateFlags_BlendInvSrcColor,
+);
+
 // ── Vertex layout ─────────────────────────────────────────────────────
 
 /// Unified 2D vertex: position (x, y) + texcoord (u, v) + ABGR color packed as u32.
@@ -365,6 +398,59 @@ pub fn submitTexturedTriangles(vertices: []const PosTexColorVertex, texture_hand
     bgfx.setTransientVertexBuffer(0, &tvb, 0, num);
     bgfx.setTexture(0, s_tex_uniform, texture_handle, 0);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
+    bgfx.submit(VIEW_ID, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+}
+
+/// Submit an INDEXED textured triangle mesh through the sprite program — the
+/// bgfx impl of labelle-core's optional `drawMesh` contract (skeletal animation,
+/// labelle-gfx#290). Reuses the exact sprite pipeline (same `vertex_layout`,
+/// `sprite_program`, `s_tex_uniform`) as `submitTexturedTriangles`, but adds a
+/// transient INDEX buffer (Spine meshes are indexed) and takes an explicit
+/// `blend_state` (Spine attachments request per-command blend modes). The
+/// vertices are expected already in NDC (`gfx.drawMesh` applies `toNdcX/Y`).
+pub fn submitMesh(
+    vertices: []const PosTexColorVertex,
+    indices: []const u16,
+    texture_handle: bgfx.TextureHandle,
+    blend_state: u64,
+) void {
+    ensureShadersInitialized();
+    if (!isValidProgram(sprite_program)) return;
+    if (!isValidHandle(s_tex_uniform.idx)) return;
+    if (vertices.len == 0 or indices.len == 0) return;
+    ensureLayouts();
+
+    // Identity viewProj — vertices are already in NDC (parity with the sprite path).
+    const identity = [16]f32{
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    };
+    bgfx.setViewTransform(VIEW_ID, &identity, &identity);
+
+    const num_v: u32 = @intCast(vertices.len);
+    const num_i: u32 = @intCast(indices.len);
+
+    var tvb: bgfx.TransientVertexBuffer = undefined;
+    var tib: bgfx.TransientIndexBuffer = undefined;
+
+    // Guard against over-allocating the transient ring (bgfx would assert).
+    if (bgfx.getAvailTransientVertexBuffer(num_v, &vertex_layout) < num_v) return;
+    if (bgfx.getAvailTransientIndexBuffer(num_i, false) < num_i) return;
+
+    bgfx.allocTransientVertexBuffer(&tvb, num_v, &vertex_layout);
+    bgfx.allocTransientIndexBuffer(&tib, num_i, false); // 16-bit indices
+
+    const vdest: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
+    @memcpy(vdest[0..vertices.len], vertices);
+    const idest: [*]u16 = @ptrCast(@alignCast(tib.data));
+    @memcpy(idest[0..indices.len], indices);
+
+    bgfx.setTransientVertexBuffer(0, &tvb, 0, num_v);
+    bgfx.setTransientIndexBuffer(&tib, 0, num_i);
+    bgfx.setTexture(0, s_tex_uniform, texture_handle, 0);
+    bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | blend_state, 0);
     bgfx.submit(VIEW_ID, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
 }
 

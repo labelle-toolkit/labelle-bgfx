@@ -83,6 +83,69 @@ pub const drawLine = draw.drawLine;
 pub const drawTriangle = draw.drawTriangle;
 pub const drawPolygon = draw.drawPolygon;
 
+// ── Textured mesh primitive (drawMesh contract, labelle-gfx#290) ───────
+// Scratch for repacking a Spine RenderCommand's separate position/uv/color
+// arrays into the sprite pipeline's interleaved vertex. Sized to Spine's
+// per-command batch cap (indices are u16, so a batch tops out below 65536
+// vertices). A global (BSS) buffer keeps drawMesh allocation-free per frame.
+const MAX_MESH_VERTS: usize = 65536;
+var mesh_vertex_scratch: [MAX_MESH_VERTS]programs.PosTexColorVertex = undefined;
+
+/// Optional textured-mesh primitive — the bgfx impl of labelle-core's `drawMesh`
+/// contract (skeletal animation, labelle-gfx#290). REUSES the sprite pipeline
+/// (`programs.submitMesh` → same `vertex_layout` + `sprite_program` +
+/// `s_tex_uniform`); the only addition over the sprite path is a transient INDEX
+/// buffer (Spine meshes are indexed) and per-command blend selection.
+///
+/// The buffers mirror Spine's `RenderCommand` (see the core contract doc):
+///   - `positions`: xy pairs in screen space (caller applied center+scale).
+///     `len == 2 * numVerts`. Converted to NDC via the sprite path's `toNdcX/Y`.
+///   - `uvs`: normalised uv pairs, `len == 2 * numVerts`.
+///   - `colors`: one packed RGBA8 per vertex, `len == numVerts`. Spine packs
+///     ARGB (0xAARRGGBB); bgfx's `Color0` (Uint8×4) wants ABGR (0xAABBGGRR),
+///     so R and B are swapped here.
+///   - `indices`: u16 triangle list, `len == 3 * numTris`.
+pub fn drawMesh(
+    tex: Texture,
+    positions: []const f32,
+    uvs: []const f32,
+    colors: []const u32,
+    indices: []const u16,
+    blend: core.BlendMode,
+) void {
+    const num_verts = colors.len;
+    if (num_verts == 0 or indices.len == 0) return;
+    if (num_verts > MAX_MESH_VERTS) return;
+    if (positions.len < num_verts * 2 or uvs.len < num_verts * 2) return;
+
+    const handle = texture.handleForId(tex.id);
+
+    var i: usize = 0;
+    while (i < num_verts) : (i += 1) {
+        const argb = colors[i]; // Spine: 0xAARRGGBB
+        // Swap R (bits 16..23) and B (bits 0..7) → bgfx 0xAABBGGRR.
+        const abgr = (argb & 0xFF00FF00) |
+            ((argb >> 16) & 0x000000FF) |
+            ((argb & 0x000000FF) << 16);
+        mesh_vertex_scratch[i] = .{
+            .x = state.toNdcX(positions[i * 2 + 0]),
+            .y = state.toNdcY(positions[i * 2 + 1]),
+            .u = uvs[i * 2 + 0],
+            .v = uvs[i * 2 + 1],
+            .abgr = abgr,
+        };
+    }
+
+    const blend_state: u64 = switch (blend) {
+        .normal => programs.STATE_BLEND_PMA_NORMAL,
+        .additive => programs.STATE_BLEND_PMA_ADD,
+        .multiply => programs.STATE_BLEND_PMA_MULTIPLY,
+        .screen => programs.STATE_BLEND_PMA_SCREEN,
+    };
+
+    programs.submitMesh(mesh_vertex_scratch[0..num_verts], indices, handle, blend_state);
+}
+
 // ── Texture / Sprite rendering ────────────────────────────────────────
 
 pub const DecodedImage = texture.DecodedImage;
@@ -136,3 +199,29 @@ pub const getScreenHeight = state.getScreenHeight;
 pub const setDesignSize = state.setDesignSize;
 pub const screenToWorld = state.screenToWorld;
 pub const worldToScreen = state.worldToScreen;
+
+// ── Tests ─────────────────────────────────────────────────────────────
+// drawMesh (labelle-gfx#290) touches bgfx transient buffers + submit, which
+// need a live device (GPU/window) — not available headless — so its runtime
+// behaviour is exercised on-device. What we CAN pin without a device is the
+// compile-time conformance: that this façade actually declares the optional
+// `drawMesh` capability with the exact signature core's `assertBackend` /
+// conformance suite dispatch on. `core.assertBackend(@This())` already runs at
+// struct scope (top of file); this test makes the drawMesh contract explicit
+// and fails loudly if the decl is dropped or its signature drifts.
+test "drawMesh satisfies the optional textured-mesh capability" {
+    comptime {
+        if (!@hasDecl(@This(), "drawMesh")) {
+            @compileError("bgfx backend must declare the optional drawMesh primitive (labelle-gfx#290)");
+        }
+        // Signature must match core's BlendMode-terminated drawMesh contract so
+        // the assembler's `Backend(Impl).drawMesh` wrapper can forward to it.
+        const Fn = @TypeOf(drawMesh);
+        const info = @typeInfo(Fn).@"fn";
+        const params = info.params;
+        if (params.len != 6) @compileError("drawMesh must take 6 params");
+        if (params[5].type.? != core.BlendMode) {
+            @compileError("drawMesh's last param must be core.BlendMode");
+        }
+    }
+}
