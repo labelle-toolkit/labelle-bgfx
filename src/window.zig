@@ -87,6 +87,15 @@ var current_reset: u32 = RESET_VSYNC;
 var window_hidden: bool = false;
 var clear_color: u32 = 0x1e1e2eff; // dark background RGBA
 
+/// Whether the GPU surface is currently LIVE (labelle-core #53 window-contract
+/// surface-loss hooks, epic #386 Phase 4). Starts true (a fresh init means a
+/// live surface) and is flipped by `surfaceLost`/`surfaceRestored`. Guards
+/// `ensureSurface` so a `bgfx.reset` never fires against a surface that has
+/// been torn down (Android `APP_CMD_TERM_WINDOW`). On desktop/wasm — and on the
+/// Android path still driven by the NativeActivity glue — nothing calls the
+/// hooks, so this stays true and the guard is a no-op (desktop unaffected).
+var surface_valid: bool = true;
+
 /// The current surface dimensions, in PHYSICAL framebuffer pixels.
 ///
 /// On desktop (GLFW) `screen_w/h` are seeded from `getFramebufferSize()` at
@@ -163,6 +172,11 @@ const em = struct {
 /// skips minimized windows (a 0-size reset is invalid). The viewport rect is
 /// set by `beginFrame` right after this, so we don't touch `setViewRect` here.
 fn ensureSurface() void {
+    // A torn-down surface (post-`surfaceLost`, pre-`surfaceRestored`) has no
+    // valid swapchain to reset — resetting a dead context is UB. Skip until the
+    // surface is restored. No-op on every path that never loses its surface
+    // (desktop/wasm), where `surface_valid` is permanently true.
+    if (!surface_valid) return;
     const fb = framebufferSize();
     if (fb[0] > 0 and fb[1] > 0 and (fb[0] != screen_w or fb[1] != screen_h)) {
         screen_w = fb[0];
@@ -194,6 +208,11 @@ pub fn setConfigFlags(flags: ConfigFlags) void {
 pub fn initWindow(w: i32, h: i32, title: [:0]const u8) void {
     screen_w = w;
     screen_h = h;
+    // A successful (re-)init means the surface is live again — covers the
+    // Android glue's `APP_CMD_INIT_WINDOW` restore path, which re-inits bgfx
+    // directly, so the `ensureSurface` guard resumes even if only
+    // `surfaceLost` (not `surfaceRestored`) drove the loss.
+    surface_valid = true;
 
     if (is_wasm) {
         initWindowWasm(w, h);
@@ -600,6 +619,70 @@ pub fn setVsync(on: bool) void {
     }
 }
 
+// ── GPU surface loss (labelle-core #53 window contract, epic #386 Phase 4) ──
+//
+// bgfx CAN lose its GPU surface at runtime, so this backend declares the paired
+// surface-loss hooks and advertises the capability. On Android
+// `APP_CMD_TERM_WINDOW` (pause/background) destroys the swapchain and every GPU
+// texture/shader while the CPU game state + allocator survive;
+// `APP_CMD_INIT_WINDOW` recreates the surface. A lost WebGL/GL context is the
+// same shape. Desktop GLFW never loses its surface, but the capability is a
+// backend-wide property (one module serves every target), so the hooks are
+// declared uniformly and no-op where no loss occurs.
+//
+// LIVE vs contract seam: on-device the actual bgfx teardown + re-init is driven
+// by the NativeActivity glue's TERM_WINDOW/INIT_WINDOW handlers
+// (`teardownSurface` / `initWindow`, which also fire the engine's
+// `surface_lost_fn` / `surface_restored_fn`). These contract hooks are the
+// canonical pluggable-backend seam (`core.Window(@This())`) that ADVERTISE the
+// capability and carry the forget-then-restore state; routing the glue through
+// them as the sole driver is a follow-up that needs on-device verification.
+
+/// `true` — bgfx can lose and restore its GPU surface (Android context loss on
+/// pause/resume; a lost WebGL/GL context). The core `Window(Impl)` wrapper also
+/// derives this from the presence of BOTH hooks (`@hasDecl`), so the paired
+/// decls below and this probe agree; declaring it here states the intent
+/// explicitly at the backend.
+pub fn supportsSurfaceLoss() bool {
+    return true;
+}
+
+/// The GPU surface died (Android `APP_CMD_TERM_WINDOW`; a lost WebGL/GL
+/// context). Per the contract every GPU handle is ALREADY DEAD — we FORGET the
+/// surface here and must NEVER free/destroy handles against the dead context
+/// (that is UB). Concretely we only mark the swapchain invalid so no
+/// `bgfx.reset`/draw touches it until `surfaceRestored`. (The actual bgfx
+/// context + program/texture teardown on Android remains owned by the glue's
+/// `teardownSurface`, which fires the engine's `surface_lost_fn` first.)
+pub fn surfaceLost() void {
+    surface_valid = false;
+    // Invalidate the cached size so restore ALWAYS rebinds. If `surfaceRestored`
+    // runs while the framebuffer is transiently 0 (minimized / early OS init) it
+    // skips its `bgfx.reset`; the next `ensureSurface` must then reset even when
+    // the surface comes back at the SAME size as before the loss — its guard is
+    // `fb != screen_w/h`, which would be false at the unchanged size. Zeroing
+    // here guarantees that mismatch, so the surface can't stay unbound.
+    screen_w = 0;
+    screen_h = 0;
+}
+
+/// A fresh GPU surface exists again (Android `APP_CMD_INIT_WINDOW`; a restored
+/// context). The native handle was handed back via `setAndroidNativeWindow`
+/// before this runs. Re-establish the bgfx backbuffer against the current
+/// physical framebuffer size using the existing `bgfx.reset` primitive (the
+/// same one `ensureSurface`/`setVsync` use) and mark the surface live so the
+/// frame loop resumes. Safe on a still-live surface (an idempotent reset).
+pub fn surfaceRestored() void {
+    surface_valid = true;
+    const fb = framebufferSize();
+    if (fb[0] > 0 and fb[1] > 0) {
+        screen_w = fb[0];
+        screen_h = fb[1];
+        // `.Count` = keep the current backbuffer format (no change).
+        bgfx.reset(@intCast(screen_w), @intCast(screen_h), current_reset, .Count);
+    }
+}
+
 pub fn beginFrame() void {
     const input = @import("input");
     input.newFrame();
@@ -695,4 +778,44 @@ pub fn drawText(text: [:0]const u8, x: i32, y: i32, font_size: i32, r: u8, g: u8
     _ = b;
     _ = a;
     // bgfx debug text could be used here but requires setDebug(BGFX_DEBUG_TEXT)
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+const testing = std.testing;
+
+test "window advertises the surface-loss capability via the paired contract hooks" {
+    // The surface-loss capability (labelle-core #53) is a PAIRED unit: a backend
+    // must declare BOTH `surfaceLost` and `surfaceRestored` or neither. Pin the
+    // both-present shape and that the explicit probe agrees. Once this repo's
+    // labelle-core pin advances to the #53 release, the core `Window(Impl)`
+    // wrapper derives the same `supportsSurfaceLoss()` from these two `@hasDecl`s
+    // and its conformance suite asserts the probe-truthfulness; we check the
+    // backend decls directly here so the test is independent of the core pin.
+    try testing.expect(supportsSurfaceLoss());
+    try testing.expect(@hasDecl(@This(), "surfaceLost") and @hasDecl(@This(), "surfaceRestored"));
+}
+
+test "surfaceLost forgets the surface, surfaceRestored marks it live again" {
+    // `surfaceLost` must only FORGET (flip the guard) — never free — so a later
+    // `ensureSurface` won't reset a dead context. `surfaceRestored` clears the
+    // guard. To keep this host-safe with no live bgfx context, zero the cached
+    // dims first: without a GLFW window `framebufferSize()` returns the cached
+    // `screen_w/h`, so 0×0 makes `surfaceRestored`'s `bgfx.reset` guard skip the
+    // GPU call while still exercising the state flip. All mutated globals are
+    // restored on the way out.
+    const saved_w = screen_w;
+    const saved_h = screen_h;
+    defer {
+        screen_w = saved_w;
+        screen_h = saved_h;
+        surface_valid = true;
+    }
+    screen_w = 0;
+    screen_h = 0;
+    surface_valid = true;
+
+    surfaceLost();
+    try testing.expect(!surface_valid);
+    surfaceRestored();
+    try testing.expect(surface_valid);
 }
