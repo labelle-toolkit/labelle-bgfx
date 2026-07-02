@@ -183,6 +183,16 @@ var wasm_pinch_prev_dist: f32 = 0;
 // Pinch sensitivity: ~1 wheel-unit (one notch) per this many pixels of spread.
 const WASM_PINCH_PX_PER_WHEEL: f32 = 80.0;
 
+// Deferred-press state (pinch-vs-tap disambiguation). The FIRST finger down is
+// recorded as the primary but is NOT yet committed to a button-0 press: no imgui
+// down, no `wasm_mouse_down[0]`, no press edge. This defers the press until we
+// know the gesture is a single tap and not the start of a two-finger pinch. It
+// is promoted to a real press either on the next `newFrame` (still the lone
+// active touch → hold/drag) or synthesized as a same-frame down+up on touchend
+// (fast tap). If a 2nd finger arrives first, `cancelWasmPrimary` drops the
+// pending primary WITHOUT any imgui down/up → the pinch leaves zero clicks.
+var wasm_primary_pending: bool = false;
+
 // ── Android analog gamepad state (#310 Stage 4 / #250) ──────────────
 //
 // The shared `android_gamepad` module (`../android_gamepad`, also used by the
@@ -535,6 +545,7 @@ fn wasmBlur(_: i32, _: *const anyopaque, _: ?*anyopaque) callconv(.c) bool {
     }
     touch_active = false;
     pointer_down = false;
+    wasm_primary_pending = false; // drop any uncommitted deferred tap on focus loss
     wasm_pinch_active = false;
     wasm_pinch_prev_dist = 0;
     return false;
@@ -624,15 +635,26 @@ fn wasmPinchDist(e: *const em.TouchEvent, is_end: bool) f32 {
 }
 
 /// Cancel any in-progress single-finger primary pointer WITHOUT leaving a
-/// phantom click. The primary's imgui down was already sent event-driven in
-/// `wasmTouchStart`, so we always balance it with an imgui up (else imgui's
-/// button sticks). But the ENGINE release EDGE is only emitted when the press
-/// was actually LATCHED (`mouse_down[0]`): if the 2nd finger lands before any
-/// `newFrame`, the press never reached the engine, so a release would be a
-/// phantom — we just drop the pending press accum instead.
+/// phantom click — called when a 2nd finger promotes the gesture to a pinch.
+///
+/// Two cases, keyed on `wasm_primary_pending`:
+///   • Still DEFERRED (the common quick-pinch): no imgui down was ever sent and
+///     no press edge latched, so we just drop the pending primary. This is the
+///     whole fix — the primary never became a press, so the pinch leaks zero
+///     clicks (previously `wasmTouchStart` latched button 0 down immediately and
+///     this balancing up registered a phantom imgui click).
+///   • Already PROMOTED (fingers landed >1 frame apart, so the primary became a
+///     real hold): the imgui down was sent, so balance it with an imgui up (else
+///     imgui's button sticks). The ENGINE release EDGE is only emitted when the
+///     press was actually LATCHED (`mouse_down[0]`); otherwise a release would be
+///     a phantom, so we just drop the still-unlatched press accum.
 fn cancelWasmPrimary() void {
     touch_active = false;
     pointer_down = false;
+    if (wasm_primary_pending) {
+        wasm_primary_pending = false; // deferred press never committed → nothing to undo
+        return;
+    }
     wasm_mouse_pressed_accum[0] = false; // drop an as-yet-unlatched press
     wasm_mouse_down[0] = false;
     if (mouse_down[0]) wasm_mouse_released_accum[0] = true; // only if latched
@@ -697,9 +719,13 @@ fn wasmTouchStart(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) 
     setWasmTouchPos(t);
     touch_active = true;
     pointer_down = true;
-    wasm_mouse_down[0] = true;
-    wasm_mouse_pressed_accum[0] = true;
-    if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(0, true);
+    // Deferred press: record the primary but do NOT commit a button-0 press yet
+    // (no imgui down, no `wasm_mouse_down[0]`, no press edge). If a 2nd finger
+    // arrives before promotion → pinch, and the primary never became a press, so
+    // no phantom click. A genuine single tap is committed later: promoted to a
+    // real held press on the next `newFrame` (drag), or synthesized as a
+    // same-frame down+up on `touchend` (fast tap that lifts within one frame).
+    wasm_primary_pending = true;
     return true;
 }
 
@@ -729,7 +755,21 @@ fn wasmTouchEnd(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bo
     // Primary finger lifted → release the pointer.
     touch_active = false;
     pointer_down = false;
-    if (wasm_mouse_down[0]) {
+    if (wasm_primary_pending) {
+        // Fast tap: the finger lifted before any `newFrame` promoted the
+        // deferred press, and no 2nd finger turned it into a pinch. Synthesize a
+        // full down+up at the release point so imgui still registers a click and
+        // the engine sees a press+release edge this frame. (`setWasmTouchPos`
+        // already forwarded the imgui position on touchstart/touchmove.)
+        wasm_primary_pending = false;
+        wasm_mouse_pressed_accum[0] = true;
+        wasm_mouse_released_accum[0] = true;
+        if (comptime gui_enabled) {
+            imgui.imgui_bridge_mouse_button(0, true);
+            imgui.imgui_bridge_mouse_button(0, false);
+        }
+    } else if (wasm_mouse_down[0]) {
+        // Promoted press (hold/drag) → normal release edge.
         wasm_mouse_down[0] = false;
         wasm_mouse_released_accum[0] = true;
         if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(0, false);
@@ -846,6 +886,19 @@ pub fn newFrame() void {
     // Android pointer path), copy the live down-state, drain the wheel, and forward
     // to Dear ImGui. Returning here keeps every zglfw reference comptime-eliminated.
     if (comptime is_wasm) {
+        // Promote a deferred single-tap press: if the primary finger is still the
+        // lone active touch one frame after touchdown — i.e. no 2nd finger turned
+        // it into a pinch — commit it to a real button-0 press now so holds/drags
+        // work. A pinch would have cleared `wasm_primary_pending` via
+        // `cancelWasmPrimary` before reaching here, so a pinch never promotes → no
+        // phantom click. Done BEFORE the latch loop so the press edge lands this
+        // same frame.
+        if (wasm_primary_pending and touch_active and !wasm_pinch_active) {
+            wasm_primary_pending = false;
+            wasm_mouse_down[0] = true;
+            wasm_mouse_pressed_accum[0] = true;
+            if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(0, true);
+        }
         // Latch the async-callback state into this frame's engine getters
         // (isMouseButton{Down,Pressed,Released}, getMouseWheelMove). imgui is fed
         // event-driven directly from the callbacks (see wasmMouse*), so no
