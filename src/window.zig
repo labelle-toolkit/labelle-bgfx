@@ -656,6 +656,14 @@ pub fn supportsSurfaceLoss() bool {
 /// `teardownSurface`, which fires the engine's `surface_lost_fn` first.)
 pub fn surfaceLost() void {
     surface_valid = false;
+    // Invalidate the cached size so restore ALWAYS rebinds. If `surfaceRestored`
+    // runs while the framebuffer is transiently 0 (minimized / early OS init) it
+    // skips its `bgfx.reset`; the next `ensureSurface` must then reset even when
+    // the surface comes back at the SAME size as before the loss — its guard is
+    // `fb != screen_w/h`, which would be false at the unchanged size. Zeroing
+    // here guarantees that mismatch, so the surface can't stay unbound.
+    screen_w = 0;
+    screen_h = 0;
 }
 
 /// A fresh GPU surface exists again (Android `APP_CMD_INIT_WINDOW`; a restored
