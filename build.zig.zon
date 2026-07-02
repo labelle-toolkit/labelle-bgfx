@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0x9cd73c2cb5d6d1eb,
     .name = .labelle_bgfx,
-    .version = "0.5.1",
+    .version = "0.5.2",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Pinned to specific commits — same class of fix as #146.
