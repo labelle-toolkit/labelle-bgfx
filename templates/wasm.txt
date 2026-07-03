@@ -20,6 +20,16 @@ const BackendGfxType = @import("backend_gfx");
 // bgfx the canvas selector via `PlatformData.nwh` (see the backend's
 // src/window.zig). `beginFrame`/`clearBackground`/`render`/`endFrame` are the same
 // backend-agnostic gfx seam the desktop + android templates use.
+//
+// Editor-preview holes (labelle-studio Play mode, assembler ≥ 0.74.0):
+// `{{editor_sim_open}}` / `{{editor_sim_close}}` bracket the SIM half of
+// `gameFrame` (tick block + `g.tick(dt)`; render stays unconditional) and
+// `{{editor_bind}}` sits between `{{setup_code}}` and the
+// `emscripten_set_main_loop` call. A NON-preview generation fills all three
+// EMPTY — the hole placement is chosen so that empty fill reproduces the
+// pre-preview template bytes exactly. NOTE: an assembler that predates the
+// holes (< 0.74.0) leaves them verbatim in the generated main.zig (a compile
+// error) — this template version must be paired with assembler ≥ 0.74.0.
 
 // ── Zig 0.16 emscripten std shims (bgfx-wasm labelle-bgfx#8) ────────────────
 // Zig 0.16.0's DEFAULT panic + log handlers reach `std.Io.Threaded`'s
@@ -70,8 +80,8 @@ fn gameFrame() callconv(.c) void {
     // content renders correctly regardless of the browser canvas dimensions.
     BackendGfxType.setScreenSize(window.width(), window.height());
     BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
-{{preview_heartbeat}}{{tick_code}}    g.tick(dt);
-
+{{preview_heartbeat}}{{editor_sim_open}}{{tick_code}}    g.tick(dt);
+{{editor_sim_close}}
     window.beginFrame();
     window.clearBackground(245, 245, 245, 255);
     g.render();
@@ -109,5 +119,5 @@ pub fn main() !void {
 
     g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
 
-{{preview_setup}}{{setup_code}}    emscripten_set_main_loop(&gameFrame, 0, 1); // fps=0 → requestAnimationFrame (labelle-bgfx#14); target_fps still drives the dt clamp
+{{preview_setup}}{{setup_code}}{{editor_bind}}    emscripten_set_main_loop(&gameFrame, 0, 1); // fps=0 → requestAnimationFrame (labelle-bgfx#14); target_fps still drives the dt clamp
 }
