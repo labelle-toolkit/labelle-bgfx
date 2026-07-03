@@ -316,10 +316,13 @@ pub const wasm_gl_get_proc_address_arg = "-sGL_ENABLE_GET_PROC_ADDRESS=1";
 /// verified on emcc 4.0.x), and the `editor_*` symbols only exist when the
 /// generated main binds `engine.editor_api` (an editor-preview generation,
 /// assembler ≥ 0.74.0 + templates/wasm.txt's `{{editor_*}}` holes).
+///
+/// Contract v1.1 appends `_editor_set_state` (the engine-side digest gains
+/// `"state"`); appended LAST so the v1.0 prefix stays stable.
 pub const wasm_editor_exported_functions_arg =
     "-sEXPORTED_FUNCTIONS=_main,_editor_alloc,_editor_free,_editor_pause,_editor_step," ++
     "_editor_set_scene,_editor_load_scene,_editor_set_entity_position,_editor_pick," ++
-    "_editor_scene_digest,_editor_set_camera,_editor_release_camera";
+    "_editor_scene_digest,_editor_set_camera,_editor_release_camera,_editor_set_state";
 pub const wasm_editor_exported_runtime_methods_arg =
     "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8";
 
@@ -581,13 +584,14 @@ test "editor-preview exports: _main first (the flag REPLACES the default export 
 }
 
 test "editor-preview exports: every editor_* contract symbol is in the list" {
+    // Contract v1.1: `_editor_set_state` joins the v1.0 set (appended last).
     const contract = [_][]const u8{
         "_editor_alloc",        "_editor_free",
         "_editor_pause",        "_editor_step",
         "_editor_set_scene",    "_editor_load_scene",
         "_editor_set_entity_position", "_editor_pick",
         "_editor_scene_digest", "_editor_set_camera",
-        "_editor_release_camera",
+        "_editor_release_camera", "_editor_set_state",
     };
     for (contract) |sym| {
         try testing.expect(std.mem.indexOf(u8, wasm_editor_exported_functions_arg, sym) != null);
