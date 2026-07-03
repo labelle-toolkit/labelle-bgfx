@@ -132,6 +132,11 @@
             // `android_app` shell (contrast desktop's `.loop`). This is the whole
             // point of per-platform `loop_style` (design §3).
             .loop_style = .callback,
+            // #461: the bgfx-Android callback SHAPE as manifest data (was the
+            // `is_bgfx_android` enum branch in the assembler). The privileged
+            // `bgfx_shell` register is reserved to this manifest's `labelle.*`
+            // id (assembler-side `assertLifecyclePrivilege`).
+            .lifecycle = .{ .runner_module_var = true, .imgui_dispatch = true, .android_register = .bgfx_shell },
             // arm64/x86_64 by -Demulator/-Dandroid_arch/host — resolved by the hook
             // `resolve_target` phase BEFORE any b.dependency (design §4).
             .target = .resolved,
