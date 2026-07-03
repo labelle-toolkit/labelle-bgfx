@@ -22,7 +22,7 @@ const BackendGfxType = @import("backend_gfx");
 // backend-agnostic gfx seam the desktop + android templates use.
 //
 // Editor-preview holes (labelle-studio Play mode, assembler ≥ 0.74.0):
-// `editor_sim_open` / `editor_sim_close` (as `{{...}}` holes) bracket the SIM half of
+// `editor_sim_open` / `editor_sim_close` bracket the SIM half of
 // `gameFrame` (tick block + `g.tick(dt)`; render stays unconditional) and
 // `editor_bind` sits between the setup code and the
 // `emscripten_set_main_loop` call. A NON-preview generation fills all three
