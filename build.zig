@@ -366,6 +366,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run bgfx backend unit tests");
     test_step.dependOn(&b.addRunArtifact(platform_tests).step);
 
+    // ── Unit tests for the shipped build hook ───────────────────────
+    // `backend.hook.zig` is std-only (it's the file the assembler stages
+    // and `@import`s into a generated build.zig — see build.zig.zon's
+    // `paths`), so its pure residual/decision helpers (Android arch/NDK
+    // selection, the emcc arg set, and the `emToolPath` EMSDK-override
+    // branch, #535) run RIGHT here on the host — otherwise those tests
+    // ship dead, never executed by CI's `zig build test`.
+    const hook_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("backend.hook.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(hook_tests).step);
+
     // Run the gfx coordinate-math tests (#331). `gfx/state.zig` imports only
     // `types.zig` (pure), so it runs on the host independent of zbgfx — and
     // unlike the compile-only `gfx_tests` below, this EXECUTES the
