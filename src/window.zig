@@ -409,10 +409,25 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
         // (`.Count`/non-Windows already tried the platform's best; nothing to
         // retry there.) An explicit `LABELLE_BGFX_RENDERER=opengl` also lands
         // here directly and skips the retry.
+        var initialized = false;
         if (builtin.target.os.tag == .windows and init.type != .OpenGL) {
             std.log.warn("bgfx: renderer {} init failed; retrying with OpenGL", .{init.type});
             init.type = .OpenGL;
-            _ = bgfx.init(&init);
+            initialized = bgfx.init(&init);
+        }
+        // If bgfx is still not up — the OpenGL fallback also failed, or there was
+        // no fallback to try (non-Windows, or OpenGL was already the selection) —
+        // do NOT continue: `setViewClear`/`setViewRect` and every later bgfx call
+        // would run against a dead context (guaranteed crash / UB). Fail the same
+        // way the earlier GLFW steps do — tear the window/GLFW down and return, so
+        // `glfw_window` is null and `shouldQuit()` reports done on the first frame,
+        // exiting the loop cleanly instead of crashing.
+        if (!initialized) {
+            std.log.err("bgfx: renderer init failed (no usable graphics backend); aborting window init", .{});
+            win.destroy();
+            glfw.terminate();
+            glfw_window = null;
+            return;
         }
     }
 
