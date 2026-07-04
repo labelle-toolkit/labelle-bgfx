@@ -390,10 +390,14 @@ fn emTool(b: *std.Build, emsdk: *std.Build.Dependency, tool: []const u8) std.Bui
             return if (std.Io.Dir.cwd().access(self.b.graph.io, path, .{})) |_| true else |_| false;
         }
     };
-    switch (emToolPath(b.allocator, b.graph.environ_map.get("EMSDK"), tool, BuildFs{ .b = b })) {
+    // Windows can't execute the extensionless wrapper — emscripten ships `emcc.bat`
+    // there. Match the `.bat` suffix build.zig already appends, and use the SAME
+    // resolved name for BOTH the managed probe and the dep fallback so they agree.
+    const actual_tool = if (builtin.os.tag == .windows) b.fmt("{s}.bat", .{tool}) else tool;
+    switch (emToolPath(b.allocator, b.graph.environ_map.get("EMSDK"), actual_tool, BuildFs{ .b = b })) {
         // `b.allocator` is the build arena, so the absolute slice outlives config.
         .managed => |abs| return .{ .cwd_relative = abs },
-        .dep => return emsdk.path(b.fmt("upstream/emscripten/{s}", .{tool})),
+        .dep => return emsdk.path(b.fmt("upstream/emscripten/{s}", .{actual_tool})),
     }
 }
 
@@ -722,6 +726,24 @@ test "emToolPath: EMSDK set + tool present on disk → managed absolute path" {
             );
             defer testing.allocator.free(expected);
             try testing.expectEqualStrings(expected, p);
+        },
+        .dep => return error.TestExpectedManaged,
+    }
+}
+
+test "emToolPath: Windows tool name (emcc.bat) flows through → managed abs path" {
+    // On Windows `emTool` resolves `tool` to `emcc.bat`; the pure helper must
+    // probe/return that exact name (Windows can't exec the extensionless wrapper).
+    const Fs = struct {
+        fn exists(_: @This(), path: []const u8) bool {
+            return std.mem.endsWith(u8, path, "emcc.bat");
+        }
+    };
+    const root = "C:/Users/u/.labelle/emsdk/4.0.0";
+    switch (emToolPath(testing.allocator, root, "emcc.bat", Fs{})) {
+        .managed => |p| {
+            defer testing.allocator.free(p);
+            try testing.expect(std.mem.endsWith(u8, p, "emcc.bat"));
         },
         .dep => return error.TestExpectedManaged,
     }
