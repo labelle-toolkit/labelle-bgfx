@@ -293,6 +293,38 @@ fn initWindowAndroid(w: i32, h: i32) void {
     bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));
 }
 
+/// Choose the bgfx renderer type for the desktop init (labelle-bgfx#30).
+///
+/// bgfx's `.Count` auto-select resolves to **Direct3D11** on Windows, but this
+/// backend ships NO Direct3D shader variants — `gfx/programs.zig` only has
+/// Metal/Vulkan/OpenGLES/GLSL arms, so a D3D context is handed GLSL bytecode →
+/// invalid shaders, imgui disabled, and a crash at the first sprite draw
+/// (labelle-engine#683; the imgui-bgfx D3D11 bridge gap is the same root cause).
+/// Until DXBC variants exist, steer Windows onto a renderer that HAS variants:
+///   - default: Vulkan (`.spv` sprite/YUV variants exist),
+///   - fallback: OpenGL (the existing `-p 120` GLSL `else` arm) — see the
+///     init-failure retry in `initWindowDesktop`,
+///   - escape hatch: `LABELLE_BGFX_RENDERER=vulkan|opengl` forces one explicitly.
+///
+/// Only Windows is steered. Every other desktop OS keeps `.Count` (auto):
+/// macOS→Metal and Linux→OpenGL/Vulkan already resolve to renderers this backend
+/// has shader variants for.
+fn desktopRendererType() bgfx.RendererType {
+    if (builtin.target.os.tag != .windows) return .Count;
+    if (getenv("LABELLE_BGFX_RENDERER")) |raw| {
+        const val = std.mem.span(raw);
+        if (std.ascii.eqlIgnoreCase(val, "opengl") or std.ascii.eqlIgnoreCase(val, "gl"))
+            return .OpenGL;
+        if (std.ascii.eqlIgnoreCase(val, "vulkan") or std.ascii.eqlIgnoreCase(val, "vk"))
+            return .Vulkan;
+        std.log.warn(
+            "bgfx: ignoring unknown LABELLE_BGFX_RENDERER='{s}' (expected 'vulkan' or 'opengl')",
+            .{val},
+        );
+    }
+    return .Vulkan;
+}
+
 /// Desktop init path: GLFW window + bgfx, native handle per OS.
 fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     glfw.init() catch return;
@@ -331,7 +363,9 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     var init: bgfx.Init = undefined;
     bgfx.initCtor(&init);
 
-    init.type = .Count; // auto-select renderer
+    // Renderer: `.Count` (auto) on macOS/Linux; a variant-backed renderer on
+    // Windows, since auto → D3D11 there has no shaders (labelle-bgfx#30).
+    init.type = desktopRendererType();
     init.resolution.width = @intCast(screen_w);
     init.resolution.height = @intCast(screen_h);
     init.resolution.reset = current_reset;
@@ -368,7 +402,34 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     init.platformData.backBufferDS = null;
     init.platformData.type = .Default;
 
-    _ = bgfx.init(&init);
+    if (!bgfx.init(&init)) {
+        // The preferred renderer was unavailable. On Windows fall back to OpenGL
+        // — the last renderer with valid shader variants (labelle-bgfx#30) — so a
+        // box without Vulkan still renders instead of failing init outright.
+        // (`.Count`/non-Windows already tried the platform's best; nothing to
+        // retry there.) An explicit `LABELLE_BGFX_RENDERER=opengl` also lands
+        // here directly and skips the retry.
+        var initialized = false;
+        if (builtin.target.os.tag == .windows and init.type != .OpenGL) {
+            std.log.warn("bgfx: renderer {} init failed; retrying with OpenGL", .{init.type});
+            init.type = .OpenGL;
+            initialized = bgfx.init(&init);
+        }
+        // If bgfx is still not up — the OpenGL fallback also failed, or there was
+        // no fallback to try (non-Windows, or OpenGL was already the selection) —
+        // do NOT continue: `setViewClear`/`setViewRect` and every later bgfx call
+        // would run against a dead context (guaranteed crash / UB). Fail the same
+        // way the earlier GLFW steps do — tear the window/GLFW down and return, so
+        // `glfw_window` is null and `shouldQuit()` reports done on the first frame,
+        // exiting the loop cleanly instead of crashing.
+        if (!initialized) {
+            std.log.err("bgfx: renderer init failed (no usable graphics backend); aborting window init", .{});
+            win.destroy();
+            glfw.terminate();
+            glfw_window = null;
+            return;
+        }
+    }
 
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
     bgfx.setViewRect(0, 0, 0, @intCast(screen_w), @intCast(screen_h));
