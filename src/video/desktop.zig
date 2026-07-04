@@ -15,6 +15,7 @@
 //! and the `fs_yuv` shader use, so all three paths match.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const yuv = @import("yuv.zig");
 const planes = @import("planes.zig");
 
@@ -24,14 +25,54 @@ extern "c" fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *anyopaque) u
 extern "c" fn system(command: [*:0]const u8) c_int;
 extern "c" fn unlink(path: [*:0]const u8) c_int;
 
-/// Single-quote a path for safe interpolation into a `/bin/sh` command, so paths
-/// with spaces (or shell metacharacters) work and can't be an injection surface.
-/// Wraps the whole path in `'…'` and escapes any embedded single quote as the
-/// standard `'\''` sequence (close-quote, escaped quote, re-open-quote). Caller
-/// owns the returned buffer.
+/// `popen` mode for reading ffmpeg's raw binary output (PCM audio / I420 video).
+/// Only Windows needs the `"b"`: its C runtime otherwise CRLF-translates the
+/// pipe and treats the first 0x1A byte as EOF, corrupting/truncating the stream.
+/// On POSIX there is no text/binary distinction — `"r"` is already binary — and
+/// `popen` validates the mode string, so macOS/BSD libc reject a `"b"` with
+/// EINVAL. Hence `"rb"` on Windows, `"r"` on POSIX (labelle-bgfx#29).
+const binary_read_mode: [*:0]const u8 = if (builtin.os.tag == .windows) "rb" else "r";
+
+/// Quote a path for safe interpolation into the command string libc
+/// `popen`/`system` hand to the platform shell, so paths with spaces (or shell
+/// metacharacters) work and can't be an injection surface. Caller owns the
+/// returned buffer.
+///
+/// The shell differs by OS (labelle-bgfx#29): on POSIX `popen`/`system` run the
+/// command through `/bin/sh`, which strips single quotes; on Windows the C
+/// runtime runs it through `cmd.exe`, which does NOT treat single quotes as
+/// quoting — it passes them through as literal filename characters, so a POSIX
+/// single-quoted path reaches ffprobe/ffmpeg WITH the quotes and fails with
+/// `'…': No such file or directory`. So:
+///   - Windows: wrap in double quotes, which `cmd.exe` DOES strip. Media paths
+///     won't contain `"`, and there is no portable in-`cmd.exe` way to escape
+///     one, so a literal `"` is dropped (acceptable for the asset paths here).
+///     Any run of backslashes immediately before the closing quote is doubled:
+///     the CRT argument parser treats `\"` as an escaped literal quote, so a
+///     path ending in `\` (e.g. `assets\video\`) would otherwise escape our
+///     closing `"` and swallow the rest of the command line.
+///   - POSIX: wrap in `'…'`, escaping any embedded single quote as the standard
+///     `'\''` sequence (close-quote, escaped quote, re-open-quote).
 fn shellQuote(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
+    if (builtin.os.tag == .windows) {
+        try buf.append(allocator, '"');
+        var trailing_backslashes: usize = 0;
+        for (path) |c| {
+            if (c == '"') continue; // dropped (see doc comment)
+            try buf.append(allocator, c);
+            if (c == '\\') {
+                trailing_backslashes += 1;
+            } else {
+                trailing_backslashes = 0;
+            }
+        }
+        // Double the trailing backslash run so it can't escape the closing `"`.
+        try buf.appendNTimes(allocator, '\\', trailing_backslashes);
+        try buf.append(allocator, '"');
+        return buf.toOwnedSlice(allocator);
+    }
     try buf.append(allocator, '\'');
     for (path) |c| {
         if (c == '\'') {
@@ -134,7 +175,10 @@ pub const VideoDecoder = struct {
             "ffmpeg -hide_banner -loglevel error -i {s} -vn -f s16le -ar 48000 -ac 2 pipe:1",
             .{qpath}, 0) catch return null;
         defer allocator.free(cmd);
-        const stream = popen(cmd.ptr, "r") orelse return null;
+        // BINARY read: raw s16le PCM. See `spawn` — a text-mode pipe on Windows
+        // CRLF-translates and EOFs on the first 0x1A byte, corrupting/truncating
+        // the audio. `binary_read_mode` is "rb" on Windows, "r" on POSIX.
+        const stream = popen(cmd.ptr, binary_read_mode) orelse return null;
         defer _ = pclose(stream);
 
         var bytes: std.ArrayList(u8) = .empty;
@@ -191,7 +235,12 @@ pub const VideoDecoder = struct {
             "-f rawvideo -pix_fmt yuv420p -s {d}x{d} pipe:1",
             .{ qpath, w, h }, 0);
         defer allocator.free(cmd);
-        return popen(cmd.ptr, "r") orelse error.PopenFailed;
+        // BINARY read: the pipe carries raw I420 frames. On Windows a text-mode
+        // ("r") pipe does CRLF translation and treats the first 0x1A byte as EOF,
+        // truncating the binary stream almost immediately (the clip "finishes"
+        // at ~0.017 s and ffmpeg then hits a broken pipe). `binary_read_mode` is
+        // "rb" on Windows, "r" on POSIX.
+        return popen(cmd.ptr, binary_read_mode) orelse error.PopenFailed;
     }
 
     /// Read exactly one raw I420 frame into `self.yuv`. Returns false (and sets
