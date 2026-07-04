@@ -348,11 +348,53 @@ pub const EmLinkOptions = struct {
     editor_preview: bool = false,
 };
 
-/// Path to an emscripten tool (e.g. `emcc`) inside the resolved emsdk dependency.
-/// Forward-slash join (NOT `b.pathJoin`) so the emsdk-relative sub-path is
-/// portable — mirrors raylib's hook.
+/// Where `emTool` resolves an emscripten tool from.
+const EmToolResolution = union(enum) {
+    /// An external `EMSDK` is set AND the tool exists on disk under it — use this
+    /// ABSOLUTE tool path directly (a `cwd_relative`/absolute LazyPath, since it
+    /// lives OUTSIDE the build graph). Caller owns the returned slice.
+    managed: []const u8,
+    /// No usable `EMSDK` override — fall back to the emsdk build dependency.
+    dep,
+};
+
+/// Pure decision behind `emTool`: prefer an external `EMSDK` (the studio's
+/// managed emsdk, `~/.labelle/emsdk/<ver>/`, layout from cli#283) when it is set
+/// AND the tool actually exists at `<EMSDK>/upstream/emscripten/<tool>` on disk;
+/// otherwise fall back to the emsdk build dependency. EMSDK-unset (or an empty
+/// value, or a missing file) yields `.dep` — byte-identical to the pre-#535
+/// behavior for everyone who doesn't set EMSDK. `fs` is any value exposing
+/// `exists(path) bool`, so the branch is testable without a live `*std.Build`.
+fn emToolPath(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, tool: []const u8, fs: anytype) EmToolResolution {
+    const root = env_emsdk orelse return .dep;
+    if (root.len == 0) return .dep;
+    // The managed layout (cli#283) mirrors the zig-pkg dep EXACTLY — only the
+    // root differs — so the sub-path is the same `upstream/emscripten/<tool>`.
+    // Native-separator join (host path, used as an absolute LazyPath below).
+    const abs = std.fs.path.join(gpa, &.{ root, "upstream", "emscripten", tool }) catch return .dep;
+    if (fs.exists(abs)) return .{ .managed = abs };
+    gpa.free(abs);
+    return .dep;
+}
+
+/// Path to an emscripten tool (e.g. `emcc`). Prefers an external `EMSDK` (the
+/// studio's managed emsdk — labelle-studio#25 / assembler#535 Option A) when set
+/// AND present on disk; otherwise resolves inside the emsdk build dependency via
+/// a forward-slash join (NOT `b.pathJoin`) so the emsdk-relative sub-path stays
+/// portable — mirrors raylib's hook. The dep stays the default source; env is an
+/// override (no HookContext/EmLinkOptions ABI change — the dep is still passed in).
 fn emTool(b: *std.Build, emsdk: *std.Build.Dependency, tool: []const u8) std.Build.LazyPath {
-    return emsdk.path(b.fmt("upstream/emscripten/{s}", .{tool}));
+    const BuildFs = struct {
+        b: *std.Build,
+        fn exists(self: @This(), path: []const u8) bool {
+            return if (std.Io.Dir.cwd().access(self.b.graph.io, path, .{})) |_| true else |_| false;
+        }
+    };
+    switch (emToolPath(b.allocator, b.graph.environ_map.get("EMSDK"), tool, BuildFs{ .b = b })) {
+        // `b.allocator` is the build arena, so the absolute slice outlives config.
+        .managed => |abs| return .{ .cwd_relative = abs },
+        .dep => return emsdk.path(b.fmt("upstream/emscripten/{s}", .{tool})),
+    }
 }
 
 /// Reconstruction of the emcc link step using only `std.Build` + the emsdk
@@ -629,6 +671,77 @@ test "editor-preview defaults OFF: a pre-preview HookContext/EmLinkOptions liter
         .emsdk = undefined,
     };
     try testing.expect(!opts.editor_preview);
+}
+
+test "emToolPath: EMSDK unset → emsdk dependency (behavior byte-identical to pre-#535)" {
+    const Fs = struct {
+        fn exists(_: @This(), _: []const u8) bool {
+            return true; // even if "everything exists", a null env must NOT go managed
+        }
+    };
+    switch (emToolPath(testing.allocator, null, "emcc", Fs{})) {
+        .dep => {}, // no allocation happens on this path — nothing to free
+        .managed => |p| {
+            testing.allocator.free(p);
+            return error.TestUnexpectedManaged;
+        },
+    }
+}
+
+test "emToolPath: empty EMSDK → emsdk dependency (treated as unset)" {
+    const Fs = struct {
+        fn exists(_: @This(), _: []const u8) bool {
+            return true;
+        }
+    };
+    switch (emToolPath(testing.allocator, "", "emcc", Fs{})) {
+        .dep => {},
+        .managed => |p| {
+            testing.allocator.free(p);
+            return error.TestUnexpectedManaged;
+        },
+    }
+}
+
+test "emToolPath: EMSDK set + tool present on disk → managed absolute path" {
+    // Fake fs where only the managed emcc under the studio root exists — mirrors
+    // the cli#283 layout `<EMSDK>/upstream/emscripten/emcc`.
+    const Fs = struct {
+        fn exists(_: @This(), path: []const u8) bool {
+            return std.mem.endsWith(u8, path, "emcc") and
+                std.mem.indexOf(u8, path, "upstream") != null;
+        }
+    };
+    const root = "/home/u/.labelle/emsdk/4.0.0";
+    switch (emToolPath(testing.allocator, root, "emcc", Fs{})) {
+        .managed => |p| {
+            defer testing.allocator.free(p);
+            const expected = try std.fs.path.join(
+                testing.allocator,
+                &.{ root, "upstream", "emscripten", "emcc" },
+            );
+            defer testing.allocator.free(expected);
+            try testing.expectEqualStrings(expected, p);
+        },
+        .dep => return error.TestExpectedManaged,
+    }
+}
+
+test "emToolPath: EMSDK set but tool missing on disk → falls back to dep" {
+    // The override is opt-in AND verified: a stale/incomplete EMSDK must not
+    // shadow the working dependency.
+    const Fs = struct {
+        fn exists(_: @This(), _: []const u8) bool {
+            return false;
+        }
+    };
+    switch (emToolPath(testing.allocator, "/nonexistent/emsdk", "emcc", Fs{})) {
+        .dep => {}, // helper frees the constructed path internally
+        .managed => |p| {
+            testing.allocator.free(p);
+            return error.TestUnexpectedManaged;
+        },
+    }
 }
 
 test "selectGreatestValidNdk: a stray dir doesn't shadow a valid older NDK" {
