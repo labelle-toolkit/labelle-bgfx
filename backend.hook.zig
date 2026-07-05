@@ -327,11 +327,17 @@ pub const wasm_gl_get_proc_address_arg = "-sGL_ENABLE_GET_PROC_ADDRESS=1";
 /// require a labelle-engine whose `editor_api` ships
 /// `editor_load_animation_def` (engine > 1.70.0). Non-preview builds are
 /// unaffected (the list is only added under `editor_preview`).
+///
+/// Contract v1.3 appends `_editor_reload_prefab` (labelle-studio#24
+/// prefab hot-reload: replace-or-insert the prefab registry entry so
+/// future spawns use the pushed source). Same append-last rule, same ⚠:
+/// editor-preview builds on this labelle-bgfx version require an engine
+/// whose `editor_api` ships `editor_reload_prefab` (engine > 1.71.0).
 pub const wasm_editor_exported_functions_arg =
     "-sEXPORTED_FUNCTIONS=_main,_editor_alloc,_editor_free,_editor_pause,_editor_step," ++
     "_editor_set_scene,_editor_load_scene,_editor_set_entity_position,_editor_pick," ++
     "_editor_scene_digest,_editor_set_camera,_editor_release_camera,_editor_set_state," ++
-    "_editor_load_animation_def";
+    "_editor_load_animation_def,_editor_reload_prefab";
 pub const wasm_editor_exported_runtime_methods_arg =
     "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8";
 
@@ -642,6 +648,8 @@ test "editor-preview exports: every editor_* contract symbol is in the list" {
     // Contract v1.1: `_editor_set_state` joins the v1.0 set (appended last).
     // Contract v1.2: `_editor_load_animation_def` (studio#24 animation
     // hot-reload) joins, appended last again.
+    // Contract v1.3: `_editor_reload_prefab` (studio#24 prefab hot-reload)
+    // joins, appended last again.
     const contract = [_][]const u8{
         "_editor_alloc",        "_editor_free",
         "_editor_pause",        "_editor_step",
@@ -649,7 +657,7 @@ test "editor-preview exports: every editor_* contract symbol is in the list" {
         "_editor_set_entity_position", "_editor_pick",
         "_editor_scene_digest", "_editor_set_camera",
         "_editor_release_camera", "_editor_set_state",
-        "_editor_load_animation_def",
+        "_editor_load_animation_def", "_editor_reload_prefab",
     };
     for (contract) |sym| {
         try testing.expect(std.mem.indexOf(u8, wasm_editor_exported_functions_arg, sym) != null);
