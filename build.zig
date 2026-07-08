@@ -373,7 +373,9 @@ pub fn build(b: *std.Build) void {
         probe.root_module.linkSystemLibrary("gdi32", .{});
         probe.root_module.linkSystemLibrary("user32", .{});
     }
-    b.installArtifact(probe);
+    // NOT installed by default: these probes need Vulkan/Metal + glfw and would
+    // break a plain `zig build` on cross targets (wasm/android). They build +
+    // run only via their dedicated steps below (`headless-probe`/`mirror-probe`).
 
     // ── Headless + mirror validation probe (labelle-bgfx#36 + mirror) ──
     // `zig build mirror-probe` — the productized path end to end, through the
@@ -400,7 +402,8 @@ pub fn build(b: *std.Build) void {
         mprobe.root_module.linkSystemLibrary("gdi32", .{});
         mprobe.root_module.linkSystemLibrary("user32", .{});
     }
-    b.installArtifact(mprobe);
+    // Same as the feasibility probe: build + run only on demand via its step, not
+    // installed on a plain `zig build` (keeps cross targets + GPU-less CI green).
     const mprobe_step = b.step("mirror-probe", "Run the headless + mirror validation probe (#36 + mirror)");
     mprobe_step.dependOn(&b.addRunArtifact(mprobe).step);
 

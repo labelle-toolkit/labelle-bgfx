@@ -479,9 +479,9 @@ pub fn initHeadless(w: i32, h: i32) bool {
         std.log.err("bgfx: initHeadless needs positive dimensions (got {d}x{d})", .{ w, h });
         return false;
     }
-    screen_w = w;
-    screen_h = h;
-    surface_valid = true;
+    // NB: global state (screen_w/h, surface_valid) is committed only AFTER both
+    // bgfx.init and the offscreen framebuffer succeed — so a failed init leaves
+    // the window globals untouched for a caller that falls back to windowed init.
 
     var init: bgfx.Init = undefined;
     bgfx.initCtor(&init);
@@ -520,6 +520,12 @@ pub fn initHeadless(w: i32, h: i32) bool {
         bgfx.shutdown();
         return false;
     }
+
+    // Both init and the framebuffer succeeded — commit the window globals now.
+    screen_w = w;
+    screen_h = h;
+    surface_valid = true;
+
     bgfx.setViewFrameBuffer(0, headless_fb);
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
     bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));

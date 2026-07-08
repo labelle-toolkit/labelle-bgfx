@@ -27,10 +27,12 @@ const W: u16 = 128;
 const H: u16 = 128;
 
 /// Blit `src` into a throwaway readback texture and return its top-left RGBA
-/// bytes. Same recipe as `headless_probe` (bgfx#1285): a BLIT_DST|READ_BACK
-/// texture, `blit`, `readTexture` (returns the frame the CPU copy is ready), then
-/// advance frames until then. Readback byte order is RGBA on the tested backends.
-fn readPixel(src: bgfx.TextureHandle) [4]u8 {
+/// bytes, or `null` if the GPU→CPU copy never became ready. Same recipe as
+/// `headless_probe` (bgfx#1285): a BLIT_DST|READ_BACK texture, `blit`,
+/// `readTexture` (returns the frame the CPU copy is ready), then advance frames
+/// until then. Readback byte order is RGBA on the tested backends. Returning null
+/// on timeout keeps the probe deterministic — we never read unready/racy pixels.
+fn readPixel(src: bgfx.TextureHandle) ?[4]u8 {
     const rb = bgfx.createTexture2D(
         W,
         H,
@@ -41,14 +43,15 @@ fn readPixel(src: bgfx.TextureHandle) [4]u8 {
         null,
         0,
     );
-    defer bgfx.destroyTexture(rb);
+    defer bgfx.destroyTexture(rb); // readPixel returns normally, so this runs
 
     bgfx.blit(0, rb, 0, 0, 0, 0, src, 0, 0, 0, 0, W, H, 1);
     var pixels: [@as(usize, W) * @as(usize, H) * 4]u8 = undefined;
     const ready = bgfx.readTexture(rb, &pixels, 0);
     var f = bgfx.frame(0);
     var guard: u32 = 0;
-    while (f < ready and guard < 16) : (guard += 1) f = bgfx.frame(0);
+    while (f < ready and guard < 64) : (guard += 1) f = bgfx.frame(0);
+    if (f < ready) return null; // never ready — pixels would be uninitialized
     return .{ pixels[0], pixels[1], pixels[2], pixels[3] };
 }
 
@@ -88,14 +91,24 @@ pub fn main() !void {
     _ = bgfx.frame(0);
 
     // 3a) Read the render target back — proves render-to-texture (#36 core).
-    const rt_px = readPixel(rt.color);
+    const rt_px = readPixel(rt.color) orelse {
+        std.debug.print("PROBE_RESULT: READBACK_NOT_READY (render target)\n", .{});
+        gfx.destroyRenderTarget(&rt);
+        window.closeWindow();
+        std.process.exit(5);
+    };
     std.debug.print("PROBE: render-target pixel = {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{ rt_px[0], rt_px[1], rt_px[2], rt_px[3] });
     const rt_ok = isRedish(rt_px);
 
     // 3b) Read the primary headless framebuffer back — proves the mirror
     // composite (red RT drawn over the blue clear ⇒ the pixel is red) AND the
     // headless capture surface itself.
-    const prim_px = readPixel(window.headlessColorTexture());
+    const prim_px = readPixel(window.headlessColorTexture()) orelse {
+        std.debug.print("PROBE_RESULT: READBACK_NOT_READY (primary)\n", .{});
+        gfx.destroyRenderTarget(&rt);
+        window.closeWindow();
+        std.process.exit(5);
+    };
     std.debug.print("PROBE: primary(mirror) pixel = {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{ prim_px[0], prim_px[1], prim_px[2], prim_px[3] });
     const mirror_ok = isRedish(prim_px);
 

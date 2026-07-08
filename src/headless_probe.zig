@@ -68,7 +68,22 @@ pub fn main() !void {
     const ready_frame = bgfx.readTexture(readback, &pixels, 0);
     var f = bgfx.frame(0);
     var guard: u32 = 0;
-    while (f < ready_frame and guard < 16) : (guard += 1) f = bgfx.frame(0);
+    while (f < ready_frame and guard < 64) : (guard += 1) f = bgfx.frame(0);
+
+    // Free the offscreen handles BEFORE shutdown so bgfx doesn't report them as
+    // leaks (#384). `std.process.exit` below skips `defer`, so destroy here. The
+    // framebuffer was created with destroy_texture=false, so `rt` is freed too.
+    bgfx.destroyTexture(readback);
+    bgfx.destroyFrameBuffer(fb);
+    bgfx.destroyTexture(rt);
+
+    if (f < ready_frame) {
+        // The GPU→CPU copy never landed within the guard — `pixels` is unready,
+        // so reading it would be racy. Fail hard rather than report noise.
+        std.debug.print("PROBE_RESULT: READBACK_NOT_READY (waited {d} frames)\n", .{guard});
+        bgfx.shutdown();
+        std.process.exit(4);
+    }
 
     const p = pixels[0..4];
     std.debug.print("PROBE: first pixel bytes = {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{ p[0], p[1], p[2], p[3] });
