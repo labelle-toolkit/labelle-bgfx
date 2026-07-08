@@ -666,6 +666,10 @@ pub fn captureHeadless(path: [:0]const u8) bool {
 /// but the engine state survives for a later restore.
 pub fn teardownSurface() void {
     gfx.shutdownPrograms();
+    // Free + forget any pooled render targets before the context dies, so their
+    // framebuffers don't leak and no stale id survives into a restored context
+    // (Android surface loss; labelle-bgfx#41 review).
+    gfx.resetRenderTargets();
     // Release the headless offscreen framebuffer (if any) before the context
     // goes — bgfx.shutdown would otherwise report it as a leaked handle (#384).
     if (headless_fb.idx != INVALID_HANDLE) {

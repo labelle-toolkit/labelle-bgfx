@@ -47,7 +47,7 @@ pub const RenderTarget = struct {
 };
 
 fn invalidTarget() RenderTarget {
-    return .{ .fb = .{ .idx = INVALID }, .color = .{ .idx = INVALID }, .view = INVALID, .width = 0, .height = 0 };
+    return invalid_rt;
 }
 
 /// bgfx's default cap is 256 views. View 0 is the primary (`programs.PRIMARY_VIEW`);
@@ -186,6 +186,79 @@ pub fn draw(rt: RenderTarget, dest: types.Rectangle, tint: types.Color) void {
         .height = if (flip) -h_f else h_f, // negative height ⇒ flip_y
     };
     texture.drawExternalTexture(rt.color, rt.width, rt.height, source, dest, .{ .x = 0, .y = 0 }, 0, tint);
+}
+
+// ── Opaque u32-handle API (engine / game facing) ───────────────────────
+// The engine and game code only ever see a `u32` id — never the `RenderTarget`
+// struct or any bgfx handle — exactly like a texture handle (`texture_id`). This
+// is what the labelle-gfx/labelle-engine optional-capability seam forwards to.
+//
+// The id IS the target's bgfx view (1..MAX_VIEW). View 0 is the primary, so it
+// can never be a target — which makes `0` a natural INVALID sentinel.
+
+/// Returned by `createId` on failure; never a valid target id.
+pub const INVALID_ID: u32 = 0;
+
+/// id → live target, indexed by the target's view id. Initialised to invalid so
+/// a stale/never-allocated id is rejected by `validId` without reading garbage.
+const invalid_rt: RenderTarget = .{ .fb = .{ .idx = INVALID }, .color = .{ .idx = INVALID }, .view = INVALID, .width = 0, .height = 0 };
+var targets: [MAX_VIEW + 1]RenderTarget = [_]RenderTarget{invalid_rt} ** (MAX_VIEW + 1);
+
+fn validId(id: u32) bool {
+    return id >= 1 and id <= MAX_VIEW and targets[id].isValid() and targets[id].view == id;
+}
+
+/// Create an offscreen target `w`×`h`, returning an opaque id, or `INVALID_ID`
+/// on failure (view budget exhausted / bad size / framebuffer failure — each
+/// logged by `create`). The engine hands this id straight back to `beginId` /
+/// `drawId` / `destroyId`.
+pub fn createId(w: u16, h: u16) u32 {
+    const rt = create(w, h);
+    if (!rt.isValid()) return INVALID_ID;
+    targets[rt.view] = rt;
+    return rt.view;
+}
+
+/// Point subsequent draws at target `id` (no-op on an unknown id). Balance with
+/// `end` — the same `end` the struct API uses, since the active-view stack is
+/// shared.
+pub fn beginId(id: u32) void {
+    if (!validId(id)) return;
+    begin(targets[id]);
+}
+
+/// Composite finished target `id` into the current view at `dest` (the mirror).
+pub fn drawId(id: u32, dest: types.Rectangle, tint: types.Color) void {
+    if (!validId(id)) return;
+    draw(targets[id], dest, tint);
+}
+
+/// Free target `id` and invalidate it (no-op on an unknown id). The id (its view)
+/// recycles for a future `createId`.
+pub fn destroyId(id: u32) void {
+    if (!validId(id)) return;
+    destroy(&targets[id]);
+}
+
+/// Free + forget EVERY pooled render target. Called from the window teardown
+/// path (`window.teardownSurface`) BEFORE `bgfx.shutdown`, on both clean shutdown
+/// and Android surface loss (`APP_CMD_TERM_WINDOW`, where engine state survives a
+/// context teardown). Two jobs:
+///   1. destroy the framebuffers while the context is still alive, so bgfx
+///      doesn't report them as leaks (#384); and
+///   2. invalidate the pool + view occupancy, so no stale id survives as
+///      `validId` into a RESTORED context — otherwise a resumed game could
+///      `beginRenderTarget`/`drawRenderTarget` with handles from the dead context.
+pub fn reset() void {
+    var id: u16 = 1;
+    while (id <= MAX_VIEW) : (id += 1) {
+        if (view_in_use[id] and targets[id].fb.idx != INVALID) {
+            bgfx.setViewFrameBuffer(id, .{ .idx = INVALID });
+            bgfx.destroyFrameBuffer(targets[id].fb);
+        }
+        view_in_use[id] = false;
+        targets[id] = invalid_rt;
+    }
 }
 
 /// Make bgfx draw all render-target views (ids 1..next_view) BEFORE the primary
