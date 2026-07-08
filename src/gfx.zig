@@ -187,6 +187,9 @@ pub const beginRenderTarget = render_target.beginId; // (id: u32)
 pub const endRenderTarget = render_target.end; // ()
 pub const drawRenderTarget = render_target.drawId; // (id: u32, dest, tint)
 pub const destroyRenderTarget = render_target.destroyId; // (id: u32)
+// Free + forget all pooled targets before a context teardown (window close /
+// Android surface loss) — called by window.teardownSurface. Not for game code.
+pub const resetRenderTargets = render_target.reset;
 
 // ── In-engine video (#549 Path A) ──────────────────────────────────────
 // VideoPlayer wires a decoder → dynamic texture → drawTexturePro. Generic over

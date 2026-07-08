@@ -47,7 +47,7 @@ pub const RenderTarget = struct {
 };
 
 fn invalidTarget() RenderTarget {
-    return .{ .fb = .{ .idx = INVALID }, .color = .{ .idx = INVALID }, .view = INVALID, .width = 0, .height = 0 };
+    return invalid_rt;
 }
 
 /// bgfx's default cap is 256 views. View 0 is the primary (`programs.PRIMARY_VIEW`);
@@ -238,6 +238,27 @@ pub fn drawId(id: u32, dest: types.Rectangle, tint: types.Color) void {
 pub fn destroyId(id: u32) void {
     if (!validId(id)) return;
     destroy(&targets[id]);
+}
+
+/// Free + forget EVERY pooled render target. Called from the window teardown
+/// path (`window.teardownSurface`) BEFORE `bgfx.shutdown`, on both clean shutdown
+/// and Android surface loss (`APP_CMD_TERM_WINDOW`, where engine state survives a
+/// context teardown). Two jobs:
+///   1. destroy the framebuffers while the context is still alive, so bgfx
+///      doesn't report them as leaks (#384); and
+///   2. invalidate the pool + view occupancy, so no stale id survives as
+///      `validId` into a RESTORED context — otherwise a resumed game could
+///      `beginRenderTarget`/`drawRenderTarget` with handles from the dead context.
+pub fn reset() void {
+    var id: u16 = 1;
+    while (id <= MAX_VIEW) : (id += 1) {
+        if (view_in_use[id] and targets[id].fb.idx != INVALID) {
+            bgfx.setViewFrameBuffer(id, .{ .idx = INVALID });
+            bgfx.destroyFrameBuffer(targets[id].fb);
+        }
+        view_in_use[id] = false;
+        targets[id] = invalid_rt;
+    }
 }
 
 /// Make bgfx draw all render-target views (ids 1..next_view) BEFORE the primary
