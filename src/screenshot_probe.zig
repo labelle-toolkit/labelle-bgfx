@@ -114,7 +114,7 @@ pub fn main() !void {
     var content_ok = true;
     if (datatype == 2) {
         const bytespp: usize = bpp / 8;
-        const px_off = 18 + (@as(usize, W) * @as(usize, H) / 2 + W / 2) * bytespp;
+        const px_off = 18 + (@as(usize, W) * @as(usize, H) / 2 + @as(usize, W) / 2) * bytespp;
         if (px_off + bytespp <= buf.len) {
             const p = buf[px_off..][0..bytespp];
             var hi: u8 = 0;

@@ -565,10 +565,22 @@ pub fn captureHeadless(path: [:0]const u8) bool {
     const src = bgfx.getTexture(headless_fb, 0);
     const rb = bgfx.createTexture2D(w, h, false, 1, .RGBA8, bgfx.TextureFlags_BlitDst | bgfx.TextureFlags_ReadBack, null, 0);
     if (rb.idx == INVALID_HANDLE) return false;
-    defer bgfx.destroyTexture(rb);
 
-    const px = std.heap.page_allocator.alloc(u8, @as(usize, w) * @as(usize, h) * 4) catch return false;
-    defer std.heap.page_allocator.free(px);
+    const px = std.heap.page_allocator.alloc(u8, @as(usize, w) * @as(usize, h) * 4) catch {
+        bgfx.destroyTexture(rb);
+        return false;
+    };
+
+    // Reclaim `px` (the readback DESTINATION) and `rb` (the SOURCE) only once the
+    // GPU→CPU copy has completed. If `readTexture` times out, bgfx still holds
+    // both for a pending async copy — freeing/destroying them would let a late
+    // GPU write hit freed memory (use-after-free). A timeout means a severe GPU
+    // stall, so leaking these two on that path is the safe trade.
+    var readback_done = false;
+    defer if (readback_done) {
+        std.heap.page_allocator.free(px);
+        bgfx.destroyTexture(rb);
+    };
 
     bgfx.blit(0, rb, 0, 0, 0, 0, src, 0, 0, 0, 0, w, h, 1);
     const ready = bgfx.readTexture(rb, px.ptr, 0);
@@ -576,9 +588,10 @@ pub fn captureHeadless(path: [:0]const u8) bool {
     var guard: u32 = 0;
     while (f < ready and guard < 64) : (guard += 1) f = bgfx.frame(0);
     if (f < ready) {
-        std.log.err("bgfx: headless capture readback never became ready", .{});
+        std.log.err("bgfx: headless capture readback never became ready (leaking buffers to avoid a use-after-free)", .{});
         return false;
     }
+    readback_done = true;
 
     const file = std.c.fopen(path.ptr, "wb") orelse {
         std.log.err("bgfx: headless capture could not open {s} for writing", .{path});

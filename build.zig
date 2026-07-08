@@ -408,10 +408,10 @@ pub fn build(b: *std.Build) void {
     mprobe_step.dependOn(&b.addRunArtifact(mprobe).step);
 
     // ── Headless screenshot-to-file probe (labelle-bgfx#36) ─────────
-    // `zig build screenshot-probe` — drives window.takeScreenshot headlessly
-    // (requestScreenShot on the offscreen framebuffer → bgfx default callback →
-    // .tga on disk), then reads the .tga back and validates it. Proves the
-    // capture-to-file path the readback probes don't cover. On demand only.
+    // `zig build screenshot-probe` — drives window.captureHeadless headlessly
+    // (blit + readTexture on the offscreen framebuffer → write a TGA), then reads
+    // the .tga back and validates its header + a pixel. Proves the capture-to-file
+    // path the readback probes don't cover. On demand only.
     const sprobe = b.addExecutable(.{
         .name = "screenshot_probe",
         .root_module = b.createModule(.{
