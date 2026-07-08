@@ -116,8 +116,32 @@ pub fn isValidProgram(prog: bgfx.ProgramHandle) bool {
     return isValidHandle(prog.idx);
 }
 
-/// View ID used for 2D rendering.
-pub const VIEW_ID: u16 = 0;
+/// The primary bgfx view — the backbuffer on a windowed run, or the offscreen
+/// capture framebuffer under `window.initHeadless` (labelle-bgfx#36). It is
+/// always drawn LAST (see `render_target.sequenceViews`) so any render-target
+/// passes that feed it — e.g. a transport mirror sampling an offscreen texture —
+/// are already resolved by the time the screen is composited.
+pub const PRIMARY_VIEW: u16 = 0;
+
+/// The bgfx view every `submit*` helper below renders into. Defaults to
+/// `PRIMARY_VIEW`; `render_target.begin`/`end` retarget it at an offscreen
+/// framebuffer's view, so the *same* draw primitives (rects, sprites, text,
+/// meshes) fill a texture instead of the screen — the shared basis of both the
+/// headless offscreen capture (#36) and the mirror.
+var active_view: u16 = PRIMARY_VIEW;
+
+/// The view `submit*` currently targets. `render_target` reads this to save +
+/// restore the previous target around a (possibly nested) offscreen pass.
+pub fn activeView() u16 {
+    return active_view;
+}
+
+/// Point every subsequent draw at `id` — a render-target's view, or
+/// `PRIMARY_VIEW` to return to the screen. `render_target` owns the begin/end
+/// bracketing; callers should not poke this directly.
+pub fn setActiveView(id: u16) void {
+    active_view = id;
+}
 
 /// Initialize embedded shaders, uniforms, and the 1x1 white fallback texture.
 /// Called lazily from submit functions. Detects the renderer type and selects
@@ -167,7 +191,7 @@ fn initShaders() void {
         0.0, 0.0, 1.0, 0.0,
         0.0, 0.0, 0.0, 1.0,
     };
-    bgfx.setViewTransform(VIEW_ID, &identity, &identity);
+    bgfx.setViewTransform(active_view, &identity, &identity);
 
     // Create 1x1 white RGBA8 texture for flat-color rendering
     const white_pixel = [4]u8{ 255, 255, 255, 255 };
@@ -353,7 +377,7 @@ pub fn submitFlatTriangles(vertices: []const PosTexColorVertex) void {
         0.0, 0.0, 1.0, 0.0,
         0.0, 0.0, 0.0, 1.0,
     };
-    bgfx.setViewTransform(VIEW_ID, &identity, &identity);
+    bgfx.setViewTransform(active_view, &identity, &identity);
 
     const num_vertices: usize = vertices.len;
     const num: u32 = @intCast(num_vertices);
@@ -368,7 +392,7 @@ pub fn submitFlatTriangles(vertices: []const PosTexColorVertex) void {
     // Bind 1x1 white texture so the shader computes: white * vertex_color = vertex_color
     bgfx.setTexture(0, s_tex_uniform, white_texture, 0);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
-    bgfx.submit(VIEW_ID, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+    bgfx.submit(active_view, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
 }
 
 pub fn submitTexturedTriangles(vertices: []const PosTexColorVertex, texture_handle: bgfx.TextureHandle) void {
@@ -384,7 +408,7 @@ pub fn submitTexturedTriangles(vertices: []const PosTexColorVertex, texture_hand
         0.0, 0.0, 1.0, 0.0,
         0.0, 0.0, 0.0, 1.0,
     };
-    bgfx.setViewTransform(VIEW_ID, &identity, &identity);
+    bgfx.setViewTransform(active_view, &identity, &identity);
 
     const num_vertices: usize = vertices.len;
     const num: u32 = @intCast(num_vertices);
@@ -398,7 +422,7 @@ pub fn submitTexturedTriangles(vertices: []const PosTexColorVertex, texture_hand
     bgfx.setTransientVertexBuffer(0, &tvb, 0, num);
     bgfx.setTexture(0, s_tex_uniform, texture_handle, 0);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
-    bgfx.submit(VIEW_ID, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+    bgfx.submit(active_view, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
 }
 
 /// Submit an INDEXED textured triangle mesh through the sprite program — the
@@ -427,7 +451,7 @@ pub fn submitMesh(
         0.0, 0.0, 1.0, 0.0,
         0.0, 0.0, 0.0, 1.0,
     };
-    bgfx.setViewTransform(VIEW_ID, &identity, &identity);
+    bgfx.setViewTransform(active_view, &identity, &identity);
 
     const num_v: u32 = @intCast(vertices.len);
     const num_i: u32 = @intCast(indices.len);
@@ -451,7 +475,7 @@ pub fn submitMesh(
     bgfx.setTransientIndexBuffer(&tib, 0, num_i);
     bgfx.setTexture(0, s_tex_uniform, texture_handle, 0);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | blend_state, 0);
-    bgfx.submit(VIEW_ID, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+    bgfx.submit(active_view, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
 }
 
 /// Submit a textured quad converted from three YUV plane textures via the
@@ -474,7 +498,7 @@ pub fn submitYuvTriangles(
         0.0, 0.0, 1.0, 0.0,
         0.0, 0.0, 0.0, 1.0,
     };
-    bgfx.setViewTransform(VIEW_ID, &identity, &identity);
+    bgfx.setViewTransform(active_view, &identity, &identity);
 
     const num: u32 = @intCast(vertices.len);
     var tvb: bgfx.TransientVertexBuffer = undefined;
@@ -487,5 +511,5 @@ pub fn submitYuvTriangles(
     bgfx.setTexture(1, s_texU_uniform, u_handle, 0);
     bgfx.setTexture(2, s_texV_uniform, v_handle, 0);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
-    bgfx.submit(VIEW_ID, yuv_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+    bgfx.submit(active_view, yuv_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
 }

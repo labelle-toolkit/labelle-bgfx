@@ -374,6 +374,36 @@ pub fn build(b: *std.Build) void {
         probe.root_module.linkSystemLibrary("user32", .{});
     }
     b.installArtifact(probe);
+
+    // ── Headless + mirror validation probe (labelle-bgfx#36 + mirror) ──
+    // `zig build mirror-probe` — the productized path end to end, through the
+    // real `gfx`/`window` modules: `initHeadless`, render into a RenderTarget,
+    // composite it back with `drawRenderTarget` (the mirror), and read both the
+    // target and the primary framebuffer back to assert the colors landed. No
+    // window/display server, so it runs on a bare Vulkan/Metal CI box.
+    const mprobe = b.addExecutable(.{
+        .name = "mirror_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mirror_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    mprobe.root_module.addImport("zbgfx", zbgfx_mod);
+    mprobe.root_module.addImport("gfx", gfx_mod);
+    mprobe.root_module.addImport("window", window_mod);
+    mprobe.root_module.linkLibrary(bgfx_artifact);
+    // The window module pulls input → zglfw (desktop), so link glfw too.
+    if (glfw_artifact) |a| mprobe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        mprobe.root_module.linkSystemLibrary("gdi32", .{});
+        mprobe.root_module.linkSystemLibrary("user32", .{});
+    }
+    b.installArtifact(mprobe);
+    const mprobe_step = b.step("mirror-probe", "Run the headless + mirror validation probe (#36 + mirror)");
+    mprobe_step.dependOn(&b.addRunArtifact(mprobe).step);
+
     const probe_step = b.step("headless-probe", "Run the headless bgfx feasibility probe (#36)");
     probe_step.dependOn(&b.addRunArtifact(probe).step);
 
