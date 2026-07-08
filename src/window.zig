@@ -609,7 +609,10 @@ pub fn captureHeadless(path: [:0]const u8) bool {
     hdr[15] = @truncate(h >> 8);
     hdr[16] = 32;
     hdr[17] = 0x28;
-    if (fwrite(&hdr, 1, hdr.len, file) != hdr.len) return false;
+    if (fwrite(&hdr, 1, hdr.len, file) != hdr.len) {
+        std.log.err("bgfx: headless capture failed writing the TGA header to {s}", .{path});
+        return false;
+    }
 
     // Readback is RGBA; TGA stores BGRA — swap R/B in place before writing.
     var i: usize = 0;
@@ -618,7 +621,10 @@ pub fn captureHeadless(path: [:0]const u8) bool {
         px[i] = px[i + 2];
         px[i + 2] = r;
     }
-    if (fwrite(px.ptr, 1, px.len, file) != px.len) return false;
+    if (fwrite(px.ptr, 1, px.len, file) != px.len) {
+        std.log.err("bgfx: headless capture failed writing {d} pixel bytes to {s}", .{ px.len, path });
+        return false;
+    }
     return true;
 }
 
