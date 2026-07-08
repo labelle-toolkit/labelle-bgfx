@@ -541,6 +541,74 @@ pub fn headlessColorTexture() bgfx.TextureHandle {
     return bgfx.getTexture(headless_fb, 0);
 }
 
+extern "c" fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *std.c.FILE) usize;
+
+/// Capture the headless offscreen framebuffer (#36) to an uncompressed 32-bit
+/// TGA at exactly `path`. Returns false if not headless, the GPU→CPU readback
+/// never lands, or the file can't be written.
+///
+/// This is the headless counterpart to `takeScreenshot`: bgfx's
+/// `requestScreenShot` only captures WINDOW/backbuffer framebuffers, so the
+/// offscreen FB is read back with the blit + `readTexture` path (the one the
+/// mirror/headless probes prove) and the file is written here. Advances a few
+/// frames of its own to let the readback complete, so call it at a frame
+/// boundary — typically once at the end of a headless run.
+///
+/// Only the Vulkan/Metal renderers `initHeadless` forces are top-left origin, so
+/// the TGA is written top-down (descriptor 0x28) and comes out upright.
+pub fn captureHeadless(path: [:0]const u8) bool {
+    if (headless_fb.idx == INVALID_HANDLE) return false;
+    if (screen_w <= 0 or screen_h <= 0) return false;
+    const w: u16 = @intCast(screen_w);
+    const h: u16 = @intCast(screen_h);
+
+    const src = bgfx.getTexture(headless_fb, 0);
+    const rb = bgfx.createTexture2D(w, h, false, 1, .RGBA8, bgfx.TextureFlags_BlitDst | bgfx.TextureFlags_ReadBack, null, 0);
+    if (rb.idx == INVALID_HANDLE) return false;
+    defer bgfx.destroyTexture(rb);
+
+    const px = std.heap.page_allocator.alloc(u8, @as(usize, w) * @as(usize, h) * 4) catch return false;
+    defer std.heap.page_allocator.free(px);
+
+    bgfx.blit(0, rb, 0, 0, 0, 0, src, 0, 0, 0, 0, w, h, 1);
+    const ready = bgfx.readTexture(rb, px.ptr, 0);
+    var f = bgfx.frame(0);
+    var guard: u32 = 0;
+    while (f < ready and guard < 64) : (guard += 1) f = bgfx.frame(0);
+    if (f < ready) {
+        std.log.err("bgfx: headless capture readback never became ready", .{});
+        return false;
+    }
+
+    const file = std.c.fopen(path.ptr, "wb") orelse {
+        std.log.err("bgfx: headless capture could not open {s} for writing", .{path});
+        return false;
+    };
+    defer _ = std.c.fclose(file);
+
+    // 18-byte TGA header: uncompressed true-color (2), matching dims, 32bpp,
+    // descriptor 0x28 = top-down origin + 8 alpha bits.
+    var hdr = [_]u8{0} ** 18;
+    hdr[2] = 2;
+    hdr[12] = @truncate(w);
+    hdr[13] = @truncate(w >> 8);
+    hdr[14] = @truncate(h);
+    hdr[15] = @truncate(h >> 8);
+    hdr[16] = 32;
+    hdr[17] = 0x28;
+    if (fwrite(&hdr, 1, hdr.len, file) != hdr.len) return false;
+
+    // Readback is RGBA; TGA stores BGRA — swap R/B in place before writing.
+    var i: usize = 0;
+    while (i < px.len) : (i += 4) {
+        const r = px[i];
+        px[i] = px[i + 2];
+        px[i + 2] = r;
+    }
+    if (fwrite(px.ptr, 1, px.len, file) != px.len) return false;
+    return true;
+}
+
 /// Tear down the gfx-level bgfx resources, then the bgfx context itself.
 ///
 /// Ordering is LOAD-BEARING: `gfx.shutdownPrograms()` destroys the
@@ -895,15 +963,15 @@ pub fn endFrame() void {
     // just submitted. Requesting after `bgfx.frame()` (a separate empty
     // frame) would capture a cleared backbuffer with no draws.
     if (has_pending_screenshot) {
-        // Windowed: capture the backbuffer (INVALID_HANDLE). Headless (#36):
-        // capture the offscreen framebuffer the primary view rendered into —
-        // there is no backbuffer to read. Either way bgfx's built-in default
-        // callback writes the pixels to `<path>.tga` on this frame's swap.
-        const target_fb = if (headless_fb.idx != INVALID_HANDLE)
-            headless_fb
-        else
-            bgfx.FrameBufferHandle{ .idx = INVALID_HANDLE };
-        bgfx.requestScreenShot(target_fb, &pending_screenshot_buf);
+        // bgfx's requestScreenShot only works on a WINDOW/backbuffer framebuffer
+        // ("Frame buffer handle must be created with OS' target native window
+        // handle"), so this async path is the windowed one — capture the
+        // backbuffer via the default callback → `<path>.tga`. Headless capture
+        // does NOT go through here: the offscreen framebuffer isn't a window FB,
+        // so requestScreenShot silently no-ops on it. Headless callers use
+        // `captureHeadless`, which reads the offscreen FB back and writes it.
+        const invalid_fb = bgfx.FrameBufferHandle{ .idx = INVALID_HANDLE };
+        bgfx.requestScreenShot(invalid_fb, &pending_screenshot_buf);
         has_pending_screenshot = false;
     }
     _ = bgfx.frame(0);
