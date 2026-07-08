@@ -188,6 +188,58 @@ pub fn draw(rt: RenderTarget, dest: types.Rectangle, tint: types.Color) void {
     texture.drawExternalTexture(rt.color, rt.width, rt.height, source, dest, .{ .x = 0, .y = 0 }, 0, tint);
 }
 
+// ── Opaque u32-handle API (engine / game facing) ───────────────────────
+// The engine and game code only ever see a `u32` id — never the `RenderTarget`
+// struct or any bgfx handle — exactly like a texture handle (`texture_id`). This
+// is what the labelle-gfx/labelle-engine optional-capability seam forwards to.
+//
+// The id IS the target's bgfx view (1..MAX_VIEW). View 0 is the primary, so it
+// can never be a target — which makes `0` a natural INVALID sentinel.
+
+/// Returned by `createId` on failure; never a valid target id.
+pub const INVALID_ID: u32 = 0;
+
+/// id → live target, indexed by the target's view id. Initialised to invalid so
+/// a stale/never-allocated id is rejected by `validId` without reading garbage.
+const invalid_rt: RenderTarget = .{ .fb = .{ .idx = INVALID }, .color = .{ .idx = INVALID }, .view = INVALID, .width = 0, .height = 0 };
+var targets: [MAX_VIEW + 1]RenderTarget = [_]RenderTarget{invalid_rt} ** (MAX_VIEW + 1);
+
+fn validId(id: u32) bool {
+    return id >= 1 and id <= MAX_VIEW and targets[id].isValid() and targets[id].view == id;
+}
+
+/// Create an offscreen target `w`×`h`, returning an opaque id, or `INVALID_ID`
+/// on failure (view budget exhausted / bad size / framebuffer failure — each
+/// logged by `create`). The engine hands this id straight back to `beginId` /
+/// `drawId` / `destroyId`.
+pub fn createId(w: u16, h: u16) u32 {
+    const rt = create(w, h);
+    if (!rt.isValid()) return INVALID_ID;
+    targets[rt.view] = rt;
+    return rt.view;
+}
+
+/// Point subsequent draws at target `id` (no-op on an unknown id). Balance with
+/// `end` — the same `end` the struct API uses, since the active-view stack is
+/// shared.
+pub fn beginId(id: u32) void {
+    if (!validId(id)) return;
+    begin(targets[id]);
+}
+
+/// Composite finished target `id` into the current view at `dest` (the mirror).
+pub fn drawId(id: u32, dest: types.Rectangle, tint: types.Color) void {
+    if (!validId(id)) return;
+    draw(targets[id], dest, tint);
+}
+
+/// Free target `id` and invalidate it (no-op on an unknown id). The id (its view)
+/// recycles for a future `createId`.
+pub fn destroyId(id: u32) void {
+    if (!validId(id)) return;
+    destroy(&targets[id]);
+}
+
 /// Make bgfx draw all render-target views (ids 1..next_view) BEFORE the primary
 /// view, regardless of bgfx's default ascending-id order. Without this the
 /// primary (view 0) composites first and a mirror samples last frame's target.

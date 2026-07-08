@@ -71,10 +71,12 @@ pub fn main() !void {
     gfx.setScreenSize(W, H);
     gfx.setDesignSize(W, H);
 
-    // 1) Render a RED rect into an offscreen render target.
-    var rt = gfx.createRenderTarget(W, H);
-    if (!rt.isValid()) {
+    // 1) Render a RED rect into an offscreen render target — an opaque u32 id,
+    // the same handle the engine/game contract uses.
+    const rt = gfx.createRenderTarget(W, H);
+    if (rt == gfx.INVALID_RENDER_TARGET) {
         std.debug.print("PROBE_RESULT: RT_CREATE_FAILED\n", .{});
+        window.closeWindow();
         std.process.exit(3);
     }
     gfx.beginRenderTarget(rt);
@@ -90,32 +92,23 @@ pub fn main() !void {
     _ = bgfx.frame(0);
     _ = bgfx.frame(0);
 
-    // 3a) Read the render target back — proves render-to-texture (#36 core).
-    const rt_px = readPixel(rt.color) orelse {
-        std.debug.print("PROBE_RESULT: READBACK_NOT_READY (render target)\n", .{});
-        gfx.destroyRenderTarget(&rt);
-        window.closeWindow();
-        std.process.exit(5);
-    };
-    std.debug.print("PROBE: render-target pixel = {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{ rt_px[0], rt_px[1], rt_px[2], rt_px[3] });
-    const rt_ok = isRedish(rt_px);
-
-    // 3b) Read the primary headless framebuffer back — proves the mirror
-    // composite (red RT drawn over the blue clear ⇒ the pixel is red) AND the
-    // headless capture surface itself.
+    // Read the primary headless framebuffer back. It was cleared BLUE and the
+    // only thing drawn onto it is the RED target via drawRenderTarget, so a red
+    // pixel proves the whole chain end-to-end through the opaque-id API: the
+    // target rendered red (else nothing to show), the mirror composited it, and
+    // the headless surface captured it.
     const prim_px = readPixel(window.headlessColorTexture()) orelse {
         std.debug.print("PROBE_RESULT: READBACK_NOT_READY (primary)\n", .{});
-        gfx.destroyRenderTarget(&rt);
+        gfx.destroyRenderTarget(rt);
         window.closeWindow();
         std.process.exit(5);
     };
     std.debug.print("PROBE: primary(mirror) pixel = {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{ prim_px[0], prim_px[1], prim_px[2], prim_px[3] });
-    const mirror_ok = isRedish(prim_px);
+    const ok = isRedish(prim_px);
 
-    gfx.destroyRenderTarget(&rt);
+    gfx.destroyRenderTarget(rt);
     window.closeWindow();
 
-    const ok = rt_ok and mirror_ok;
     std.debug.print("PROBE_RESULT: {s}\n", .{if (ok) "HEADLESS_MIRROR_OK" else "MIRROR_MISMATCH"});
     std.process.exit(if (ok) 0 else 4);
 }

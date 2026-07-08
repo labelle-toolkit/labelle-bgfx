@@ -170,17 +170,23 @@ pub const compressedDims = texture.compressedDims;
 // ── Offscreen render targets (labelle-bgfx#36 + transport mirror) ──────
 // Render the scene into a texture instead of the screen. Two features build on
 // this: the headless offscreen capture (#36, via `window.initHeadless`) and the
-// transport mirror. `RenderTarget` wraps an offscreen framebuffer;
-// `beginRenderTarget`/`endRenderTarget` retarget every draw primitive at it
-// (the SAME rect/sprite/text calls fill a texture), and `drawRenderTarget`
-// composites a finished target back into the current view — the mirror.
+// transport mirror. `beginRenderTarget`/`endRenderTarget` retarget every draw
+// primitive at a target (the SAME rect/sprite/text calls fill a texture), and
+// `drawRenderTarget` composites a finished target back into the current view —
+// the mirror.
+//
+// The public handle is an opaque `u32` id — like a texture handle — never the
+// backend struct, so the labelle-gfx/labelle-engine optional-capability seam can
+// forward it across the module boundary. `createRenderTarget` returns
+// `INVALID_RENDER_TARGET` (0) on failure; every op no-ops on an unknown id.
 const render_target = @import("gfx/render_target.zig");
-pub const RenderTarget = render_target.RenderTarget;
-pub const createRenderTarget = render_target.create;
-pub const destroyRenderTarget = render_target.destroy;
-pub const beginRenderTarget = render_target.begin;
-pub const endRenderTarget = render_target.end;
-pub const drawRenderTarget = render_target.draw;
+pub const RenderTargetId = u32;
+pub const INVALID_RENDER_TARGET = render_target.INVALID_ID;
+pub const createRenderTarget = render_target.createId; // (w, h: u16) -> u32
+pub const beginRenderTarget = render_target.beginId; // (id: u32)
+pub const endRenderTarget = render_target.end; // ()
+pub const drawRenderTarget = render_target.drawId; // (id: u32, dest, tint)
+pub const destroyRenderTarget = render_target.destroyId; // (id: u32)
 
 // ── In-engine video (#549 Path A) ──────────────────────────────────────
 // VideoPlayer wires a decoder → dynamic texture → drawTexturePro. Generic over
