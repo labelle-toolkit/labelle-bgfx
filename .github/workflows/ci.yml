@@ -127,3 +127,70 @@ jobs:
           file "$so" | grep -q 'ELF 64-bit.*ARM aarch64' || { echo "FAIL: not an aarch64 ELF"; exit 1; }
           nm -D "$so" | grep -q 'android_main' || { echo "FAIL: android_main not exported"; exit 1; }
           nm -D "$so" | grep -q 'ANativeActivity_onCreate' || { echo "FAIL: ANativeActivity_onCreate not exported"; exit 1; }
+
+  # Prove the surfaceless render + capture path (labelle-bgfx#36) works with NO
+  # display server and NO real GPU — the exact CI scenario `labelle run
+  # --headless --screenshot` targets. Runs the three on-demand probes on a bare
+  # Ubuntu runner using Mesa **lavapipe** (a software Vulkan device) with DISPLAY
+  # unset, and asserts each reports OK. `initHeadless` forces Vulkan, which
+  # lavapipe provides headless (no VK_KHR_surface / swapchain needed).
+  headless-linux:
+    name: surfaceless probes (display-less, lavapipe)
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      # Build deps: bgfx compiles all backends (its GL/X11 code links even when we
+      # force Vulkan) and zglfw links X11; input links SDL2. Runtime: the Vulkan
+      # loader + the lavapipe software ICD (mesa-vulkan-drivers). vulkan-tools is
+      # just for the diagnostic below.
+      - name: Install build + Vulkan (lavapipe) deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libsdl2-dev \
+            libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev \
+            libvulkan-dev libvulkan1 mesa-vulkan-drivers vulkan-tools
+      - name: Cache Zig artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: bgfx-headless-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            bgfx-headless-${{ runner.os }}-
+      - name: Vulkan device summary (lavapipe expected, no display)
+        env:
+          DISPLAY: ""
+        run: vulkaninfo --summary 2>/dev/null | grep -iE 'deviceName|driverName|apiVersion' || true
+      - name: Run surfaceless probes with NO display server
+        env:
+          # Prove it's truly display-less: no X/Wayland available to fall back on.
+          DISPLAY: ""
+          WAYLAND_DISPLAY: ""
+        run: |
+          set -uo pipefail
+          fail=0
+          for step in headless-probe mirror-probe screenshot-probe; do
+            echo "::group::$step"
+            # No `set -e`, so a non-zero build/run doesn't abort the loop — but
+            # capture the exit code and FOLD it into `fail` (a probe that printed
+            # OK then crashed must still fail the job), alongside the OK-marker
+            # check (which catches a build that produced no output at all).
+            out=$(zig build "$step" 2>&1); rc=$?
+            echo "$out"
+            if [ "$rc" -ne 0 ]; then echo "FAIL: $step exited non-zero ($rc)"; fail=1; fi
+            echo "$out" | grep -qE 'HEADLESS_OFFSCREEN_READBACK_OK|HEADLESS_MIRROR_OK|SCREENSHOT_TGA_OK' \
+              || { echo "FAIL: $step did not report OK"; fail=1; }
+            echo "::endgroup::"
+          done
+          exit $fail
