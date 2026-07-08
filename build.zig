@@ -407,6 +407,31 @@ pub fn build(b: *std.Build) void {
     const mprobe_step = b.step("mirror-probe", "Run the headless + mirror validation probe (#36 + mirror)");
     mprobe_step.dependOn(&b.addRunArtifact(mprobe).step);
 
+    // ── Headless screenshot-to-file probe (labelle-bgfx#36) ─────────
+    // `zig build screenshot-probe` — drives window.captureHeadless headlessly
+    // (blit + readTexture on the offscreen framebuffer → write a TGA), then reads
+    // the .tga back and validates its header + a pixel. Proves the capture-to-file
+    // path the readback probes don't cover. On demand only.
+    const sprobe = b.addExecutable(.{
+        .name = "screenshot_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/screenshot_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    sprobe.root_module.addImport("zbgfx", zbgfx_mod);
+    sprobe.root_module.addImport("window", window_mod);
+    sprobe.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| sprobe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        sprobe.root_module.linkSystemLibrary("gdi32", .{});
+        sprobe.root_module.linkSystemLibrary("user32", .{});
+    }
+    const sprobe_step = b.step("screenshot-probe", "Run the headless screenshot-to-file validation probe (#36)");
+    sprobe_step.dependOn(&b.addRunArtifact(sprobe).step);
+
     const probe_step = b.step("headless-probe", "Run the headless bgfx feasibility probe (#36)");
     probe_step.dependOn(&b.addRunArtifact(probe).step);
 
