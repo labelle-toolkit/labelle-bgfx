@@ -350,6 +350,33 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(bgfx_artifact);
     if (glfw_artifact) |a| b.installArtifact(a);
 
+    // ── Headless feasibility probe (labelle-bgfx#36, option B) ──────
+    // `zig build headless-probe` — inits bgfx with nwh=null (Vulkan), renders
+    // into an offscreen framebuffer, and reads a pixel back with NO window.
+    // Proves whether true surfaceless capture is viable on this backend before
+    // building the real offscreen/headless path.
+    const probe = b.addExecutable(.{
+        .name = "headless_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/headless_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    probe.root_module.addImport("zbgfx", zbgfx_mod);
+    probe.root_module.linkLibrary(bgfx_artifact);
+    // bgfx compiles ALL backends; its GL/WGL code pulls gdi32 (pixel-format +
+    // SwapBuffers) even when we force Vulkan. A real game's generated build
+    // links these; the probe must too.
+    if (target.result.os.tag == .windows) {
+        probe.root_module.linkSystemLibrary("gdi32", .{});
+        probe.root_module.linkSystemLibrary("user32", .{});
+    }
+    b.installArtifact(probe);
+    const probe_step = b.step("headless-probe", "Run the headless bgfx feasibility probe (#36)");
+    probe_step.dependOn(&b.addRunArtifact(probe).step);
+
     // ── Unit tests for the platform-dispatch helper ─────────────────
     // Always build + run on the host — platform.zig is pure Zig with
     // no native deps, and pinning to the host keeps the tests
