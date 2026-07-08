@@ -87,6 +87,13 @@ var current_reset: u32 = RESET_VSYNC;
 var window_hidden: bool = false;
 var clear_color: u32 = 0x1e1e2eff; // dark background RGBA
 
+/// Under `initHeadless` (labelle-bgfx#36) the primary view renders into this
+/// offscreen framebuffer instead of a swapchain backbuffer — there is none, as
+/// there is no window. Its color attachment is what the capture path
+/// (`takeScreenshot` → `endFrame`) reads back. INVALID on every windowed run, so
+/// its `.idx != INVALID` doubles as the "truly surfaceless" flag.
+var headless_fb: bgfx.FrameBufferHandle = .{ .idx = std.math.maxInt(u16) };
+
 /// Whether the GPU surface is currently LIVE (labelle-core #53 window-contract
 /// surface-loss hooks, epic #386 Phase 4). Starts true (a fresh init means a
 /// live surface) and is flipped by `surfaceLost`/`surfaceRestored`. Guards
@@ -438,6 +445,102 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     input.setWindow(win);
 }
 
+/// Renderer for a TRUE surfaceless init: Vulkan (Windows/Linux) or Metal
+/// (macOS/iOS) — the only bgfx desktop backends that init with no surface.
+/// OpenGL has no surfaceless path, so — unlike the windowed `desktopRendererType`
+/// — there is NO GL fallback here: without a Vulkan/Metal device, `initHeadless`
+/// fails rather than degrading.
+fn headlessRendererType() bgfx.RendererType {
+    return switch (builtin.target.os.tag) {
+        .macos, .ios, .watchos, .tvos => .Metal,
+        else => .Vulkan,
+    };
+}
+
+/// TRUE headless init (labelle-bgfx#36): bring bgfx up with NO window and no
+/// display server — `nwh = null`, resolution 0×0 (bgfx requires 0×0 when there
+/// is no backbuffer) — and render the primary view into an offscreen `w`×`h`
+/// RGBA framebuffer. Returns `false` if no Vulkan/Metal device is available.
+///
+/// This differs from the existing `--headless` knob (`setConfigFlags` +
+/// `initWindow`), which creates an INVISIBLE GLFW window and so still needs a
+/// display server. `initHeadless` needs neither, so it renders + captures on a
+/// bare CI box (no Xvfb). Feasibility proven by `src/headless_probe.zig`.
+///
+/// Drive it with a tick-counted loop (there is no window close event —
+/// `shouldQuit` returns false while headless) and read the result back with
+/// `takeScreenshot`, which targets this framebuffer instead of a backbuffer.
+pub fn initHeadless(w: i32, h: i32) bool {
+    // Guard before the `@intCast(w/h)` below: a non-positive size is invalid for
+    // a framebuffer and would panic the cast to u16 (safe builds) rather than
+    // fail gracefully. bgfx also caps textures at 16384, but createFrameBuffer
+    // rejects an over-size request itself; the floor is the one that panics.
+    if (w <= 0 or h <= 0) {
+        std.log.err("bgfx: initHeadless needs positive dimensions (got {d}x{d})", .{ w, h });
+        return false;
+    }
+    // NB: global state (screen_w/h, surface_valid) is committed only AFTER both
+    // bgfx.init and the offscreen framebuffer succeed — so a failed init leaves
+    // the window globals untouched for a caller that falls back to windowed init.
+
+    var init: bgfx.Init = undefined;
+    bgfx.initCtor(&init);
+    init.type = headlessRendererType();
+    // No backbuffer/swapchain exists, so the resolution MUST be 0×0 (bgfx:
+    // "resolution of non-existing backbuffer can't be larger than 0x0!"). The
+    // real render size lives on the offscreen framebuffer created below.
+    init.resolution.width = 0;
+    init.resolution.height = 0;
+    init.resolution.reset = bgfx.ResetFlags_None;
+    init.platformData.ndt = null;
+    init.platformData.nwh = null; // ← surfaceless
+    init.platformData.context = null;
+    init.platformData.queue = null;
+    init.platformData.backBuffer = null;
+    init.platformData.backBufferDS = null;
+    init.platformData.type = .Default;
+
+    if (!bgfx.init(&init)) {
+        std.log.err("bgfx: headless init failed (no {s} device available?)", .{@tagName(init.type)});
+        return false;
+    }
+
+    // The primary view has no swapchain to present to — bind it to an offscreen
+    // RGBA framebuffer instead. Clamp-sampled so the capture path reads a clean
+    // image. `getViewClear`/rect are set here exactly as the windowed paths do.
+    const flags: u64 = bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp;
+    headless_fb = bgfx.createFrameBuffer(@intCast(w), @intCast(h), .RGBA8, flags);
+    // `bgfx.init` succeeding only proves the surfaceless DEVICE came up — the
+    // offscreen framebuffer can still fail (driver/VRAM limits). Guard it: every
+    // "is headless active" check keys off `headless_fb.idx != INVALID`, so
+    // returning true here would bind view 0 to an invalid FB and silently capture
+    // garbage. Tear the context down (don't leak it) and fail honestly.
+    if (headless_fb.idx == std.math.maxInt(u16)) {
+        std.log.err("bgfx: headless offscreen framebuffer creation failed ({d}x{d})", .{ w, h });
+        bgfx.shutdown();
+        return false;
+    }
+
+    // Both init and the framebuffer succeeded — commit the window globals now.
+    screen_w = w;
+    screen_h = h;
+    surface_valid = true;
+
+    bgfx.setViewFrameBuffer(0, headless_fb);
+    bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
+    bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));
+    return true;
+}
+
+/// The color attachment of the headless offscreen framebuffer (#36) — for a
+/// capture harness that reads pixels back directly (blit + `readTexture`) rather
+/// than through the async `takeScreenshot`/`.tga` path. Returns an INVALID
+/// handle when not running headless.
+pub fn headlessColorTexture() bgfx.TextureHandle {
+    if (headless_fb.idx == std.math.maxInt(u16)) return .{ .idx = std.math.maxInt(u16) };
+    return bgfx.getTexture(headless_fb, 0);
+}
+
 /// Tear down the gfx-level bgfx resources, then the bgfx context itself.
 ///
 /// Ordering is LOAD-BEARING: `gfx.shutdownPrograms()` destroys the
@@ -459,6 +562,12 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
 /// but the engine state survives for a later restore.
 pub fn teardownSurface() void {
     gfx.shutdownPrograms();
+    // Release the headless offscreen framebuffer (if any) before the context
+    // goes — bgfx.shutdown would otherwise report it as a leaked handle (#384).
+    if (headless_fb.idx != INVALID_HANDLE) {
+        bgfx.destroyFrameBuffer(headless_fb);
+        headless_fb = .{ .idx = INVALID_HANDLE };
+    }
     bgfx.shutdown();
 }
 
@@ -498,6 +607,9 @@ pub fn shouldQuit() bool {
         // handle is still null) would exit the main loop immediately.
         return false;
     }
+    // Surfaceless (#36): no window means no close event — the run is bounded by
+    // a tick count (the capture harness), so never self-terminate here.
+    if (headless_fb.idx != INVALID_HANDLE) return false;
     if (glfw_window) |win| return win.shouldClose();
     return true;
 }
@@ -783,8 +895,15 @@ pub fn endFrame() void {
     // just submitted. Requesting after `bgfx.frame()` (a separate empty
     // frame) would capture a cleared backbuffer with no draws.
     if (has_pending_screenshot) {
-        const invalid_fb = bgfx.FrameBufferHandle{ .idx = INVALID_HANDLE };
-        bgfx.requestScreenShot(invalid_fb, &pending_screenshot_buf);
+        // Windowed: capture the backbuffer (INVALID_HANDLE). Headless (#36):
+        // capture the offscreen framebuffer the primary view rendered into —
+        // there is no backbuffer to read. Either way bgfx's built-in default
+        // callback writes the pixels to `<path>.tga` on this frame's swap.
+        const target_fb = if (headless_fb.idx != INVALID_HANDLE)
+            headless_fb
+        else
+            bgfx.FrameBufferHandle{ .idx = INVALID_HANDLE };
+        bgfx.requestScreenShot(target_fb, &pending_screenshot_buf);
         has_pending_screenshot = false;
     }
     _ = bgfx.frame(0);

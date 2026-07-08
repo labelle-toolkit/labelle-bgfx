@@ -350,6 +350,66 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(bgfx_artifact);
     if (glfw_artifact) |a| b.installArtifact(a);
 
+    // ── Headless feasibility probe (labelle-bgfx#36, option B) ──────
+    // `zig build headless-probe` — inits bgfx with nwh=null (Vulkan), renders
+    // into an offscreen framebuffer, and reads a pixel back with NO window.
+    // Proves whether true surfaceless capture is viable on this backend before
+    // building the real offscreen/headless path.
+    const probe = b.addExecutable(.{
+        .name = "headless_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/headless_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    probe.root_module.addImport("zbgfx", zbgfx_mod);
+    probe.root_module.linkLibrary(bgfx_artifact);
+    // bgfx compiles ALL backends; its GL/WGL code pulls gdi32 (pixel-format +
+    // SwapBuffers) even when we force Vulkan. A real game's generated build
+    // links these; the probe must too.
+    if (target.result.os.tag == .windows) {
+        probe.root_module.linkSystemLibrary("gdi32", .{});
+        probe.root_module.linkSystemLibrary("user32", .{});
+    }
+    // NOT installed by default: these probes need Vulkan/Metal + glfw and would
+    // break a plain `zig build` on cross targets (wasm/android). They build +
+    // run only via their dedicated steps below (`headless-probe`/`mirror-probe`).
+
+    // ── Headless + mirror validation probe (labelle-bgfx#36 + mirror) ──
+    // `zig build mirror-probe` — the productized path end to end, through the
+    // real `gfx`/`window` modules: `initHeadless`, render into a RenderTarget,
+    // composite it back with `drawRenderTarget` (the mirror), and read both the
+    // target and the primary framebuffer back to assert the colors landed. No
+    // window/display server, so it runs on a bare Vulkan/Metal CI box.
+    const mprobe = b.addExecutable(.{
+        .name = "mirror_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mirror_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    mprobe.root_module.addImport("zbgfx", zbgfx_mod);
+    mprobe.root_module.addImport("gfx", gfx_mod);
+    mprobe.root_module.addImport("window", window_mod);
+    mprobe.root_module.linkLibrary(bgfx_artifact);
+    // The window module pulls input → zglfw (desktop), so link glfw too.
+    if (glfw_artifact) |a| mprobe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        mprobe.root_module.linkSystemLibrary("gdi32", .{});
+        mprobe.root_module.linkSystemLibrary("user32", .{});
+    }
+    // Same as the feasibility probe: build + run only on demand via its step, not
+    // installed on a plain `zig build` (keeps cross targets + GPU-less CI green).
+    const mprobe_step = b.step("mirror-probe", "Run the headless + mirror validation probe (#36 + mirror)");
+    mprobe_step.dependOn(&b.addRunArtifact(mprobe).step);
+
+    const probe_step = b.step("headless-probe", "Run the headless bgfx feasibility probe (#36)");
+    probe_step.dependOn(&b.addRunArtifact(probe).step);
+
     // ── Unit tests for the platform-dispatch helper ─────────────────
     // Always build + run on the host — platform.zig is pure Zig with
     // no native deps, and pinning to the host keeps the tests

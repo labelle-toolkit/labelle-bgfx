@@ -455,6 +455,29 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
     programs.submitTexturedTriangles(&vertices, handle);
 }
 
+/// Draw an externally-owned bgfx texture — one NOT in this module's pool —
+/// through the sprite pipeline, reusing the exact `drawTexturePro` quad math
+/// (camera transform, rotation, source-rect flip via negative dims, tint). This
+/// is how `render_target` composites an offscreen pass (a transport mirror) into
+/// the current view: the caller owns the handle's lifetime (it belongs to a
+/// framebuffer), so — unlike `drawTexturePro` — nothing here touches the pool or
+/// frees the handle. `tex_w/tex_h` are the source texture's dimensions (used to
+/// normalise `source` into UVs).
+pub fn drawExternalTexture(
+    handle: bgfx.TextureHandle,
+    tex_w: u32,
+    tex_h: u32,
+    source: Rectangle,
+    dest: Rectangle,
+    origin: Vector2,
+    rotation: f32,
+    tint: Color,
+) void {
+    if (handle.idx == std.math.maxInt(u16)) return;
+    const vertices = buildQuadVertices(tex_w, tex_h, source, dest, origin, rotation, tint.toAbgr());
+    programs.submitTexturedTriangles(&vertices, handle);
+}
+
 // ── YUV plane textures (GPU-side video colour conversion) ──────────────────
 // perf/gpu-yuv-video: the in-engine video path uploads raw Y/U/V planes to
 // three single-channel R8 textures (Y full-res, U/V half-res) and converts

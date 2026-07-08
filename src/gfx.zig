@@ -167,6 +167,21 @@ pub const uploadCompressed = texture.uploadCompressed;
 // synchronous seam — it reads dims here to set DecodedImage before upload.
 pub const compressedDims = texture.compressedDims;
 
+// ── Offscreen render targets (labelle-bgfx#36 + transport mirror) ──────
+// Render the scene into a texture instead of the screen. Two features build on
+// this: the headless offscreen capture (#36, via `window.initHeadless`) and the
+// transport mirror. `RenderTarget` wraps an offscreen framebuffer;
+// `beginRenderTarget`/`endRenderTarget` retarget every draw primitive at it
+// (the SAME rect/sprite/text calls fill a texture), and `drawRenderTarget`
+// composites a finished target back into the current view — the mirror.
+const render_target = @import("gfx/render_target.zig");
+pub const RenderTarget = render_target.RenderTarget;
+pub const createRenderTarget = render_target.create;
+pub const destroyRenderTarget = render_target.destroy;
+pub const beginRenderTarget = render_target.begin;
+pub const endRenderTarget = render_target.end;
+pub const drawRenderTarget = render_target.draw;
+
 // ── In-engine video (#549 Path A) ──────────────────────────────────────
 // VideoPlayer wires a decoder → dynamic texture → drawTexturePro. Generic over
 // the decoder so the same player drives ffmpeg (desktop) or AMediaCodec
