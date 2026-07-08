@@ -182,8 +182,13 @@ jobs:
           fail=0
           for step in headless-probe mirror-probe screenshot-probe; do
             echo "::group::$step"
-            if out=$(zig build "$step" 2>&1); then :; else echo "  (build/run exit non-zero)"; fi
+            # No `set -e`, so a non-zero build/run doesn't abort the loop — but
+            # capture the exit code and FOLD it into `fail` (a probe that printed
+            # OK then crashed must still fail the job), alongside the OK-marker
+            # check (which catches a build that produced no output at all).
+            out=$(zig build "$step" 2>&1); rc=$?
             echo "$out"
+            if [ "$rc" -ne 0 ]; then echo "FAIL: $step exited non-zero ($rc)"; fail=1; fi
             echo "$out" | grep -qE 'HEADLESS_OFFSCREEN_READBACK_OK|HEADLESS_MIRROR_OK|SCREENSHOT_TGA_OK' \
               || { echo "FAIL: $step did not report OK"; fail=1; }
             echo "::endgroup::"
