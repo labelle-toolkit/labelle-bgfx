@@ -966,7 +966,7 @@ pub fn beginFrame() void {
     // `glfw.pollEvents()` would run against an uninitialized GLFW. A surfaceless
     // run has no input anyway. `headless_fb` set ⇔ surfaceless. Windowed / the
     // invisible-window `--headless` path (which DOES init GLFW) still poll.
-    if (headless_fb.idx == INVALID_HANDLE) {
+    if (!isSurfaceless()) {
         const input = @import("input");
         input.newFrame();
     }

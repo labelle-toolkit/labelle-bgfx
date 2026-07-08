@@ -139,31 +139,36 @@ const BackendGfxType = @import("backend_gfx");
         // teardown leak would then panic under the debug allocator. `--ticks` /
         // `--timeout` end the run; the file is already on disk. One-shot is
         // preserved via `screenshot_req = null` below.
-        var capture_this_frame = false;
+        // `capture_path` is non-null only on the frame the delay elapses — it
+        // carries the path safely into both branches without force-unwrapping.
+        var capture_path: ?[:0]const u8 = null;
         if (screenshot_req) |req| {
             const now_ns: i128 = engine.nowNs();
             const elapsed_sec: f32 = @as(f32, @floatFromInt(now_ns - loop_start_ns)) / 1_000_000_000.0;
-            capture_this_frame = elapsed_sec >= req.after_sec;
+            if (elapsed_sec >= req.after_sec) capture_path = req.path;
         }
         if (comptime @hasDecl(window, "takeScreenshot")) {
-            if (capture_this_frame and !headless_surfaceless) {
-                window.takeScreenshot(screenshot_req.?.path);
+            if (capture_path) |path| if (!headless_surfaceless) {
+                window.takeScreenshot(path);
                 // Give the async bgfx capture its flush frames before a pending
                 // `--ticks` exit can `break` (see below).
                 screenshot_flush_left = screenshot_flush_frames;
-            }
+            };
         }
 
         window.endFrame();
 
         // Surfaceless capture, past the swap (see rationale above). Gated so the
         // template stays compatible with bgfx backends predating `captureHeadless`.
+        // captureHeadless logs its own failure (readback timeout / write error)
+        // via std.log.err, so a failed capture is visible in the run's stderr —
+        // we discard the bool rather than double-log, and don't retry (one-shot).
         if (comptime @hasDecl(window, "captureHeadless")) {
-            if (capture_this_frame and headless_surfaceless) {
-                _ = window.captureHeadless(screenshot_req.?.path);
-            }
+            if (capture_path) |path| if (headless_surfaceless) {
+                _ = window.captureHeadless(path);
+            };
         }
-        if (capture_this_frame) screenshot_req = null; // one-shot, either path
+        if (capture_path != null) screenshot_req = null; // one-shot, either path
 
         // `--ticks=N`: exit cleanly after N rendered frames so CI / agent
         // flows that just want "run for a bit then quit" don't have to rely
