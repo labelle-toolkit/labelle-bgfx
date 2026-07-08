@@ -510,6 +510,16 @@ pub fn initHeadless(w: i32, h: i32) bool {
     // image. `getViewClear`/rect are set here exactly as the windowed paths do.
     const flags: u64 = bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp;
     headless_fb = bgfx.createFrameBuffer(@intCast(w), @intCast(h), .RGBA8, flags);
+    // `bgfx.init` succeeding only proves the surfaceless DEVICE came up — the
+    // offscreen framebuffer can still fail (driver/VRAM limits). Guard it: every
+    // "is headless active" check keys off `headless_fb.idx != INVALID`, so
+    // returning true here would bind view 0 to an invalid FB and silently capture
+    // garbage. Tear the context down (don't leak it) and fail honestly.
+    if (headless_fb.idx == std.math.maxInt(u16)) {
+        std.log.err("bgfx: headless offscreen framebuffer creation failed ({d}x{d})", .{ w, h });
+        bgfx.shutdown();
+        return false;
+    }
     bgfx.setViewFrameBuffer(0, headless_fb);
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
     bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));

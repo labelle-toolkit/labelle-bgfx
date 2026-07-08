@@ -74,14 +74,25 @@ fn allocView() ?u16 {
 /// The color attachment is created sampleable (implicit `BGFX_TEXTURE_RT`) and
 /// clamped, so it composites back cleanly with `draw` (no edge wrap on a mirror).
 pub fn create(w: u16, h: u16) RenderTarget {
-    if (w == 0 or h == 0) return invalidTarget();
-    const view = allocView() orelse return invalidTarget();
+    if (w == 0 or h == 0) {
+        std.log.warn("bgfx: render target needs positive dimensions (got {d}x{d})", .{ w, h });
+        return invalidTarget();
+    }
+    const view = allocView() orelse {
+        std.log.warn("bgfx: render-target view budget exhausted (>{d} live) — offscreen/mirror create failed", .{MAX_VIEW});
+        return invalidTarget();
+    };
 
     // `createFrameBuffer` implies BGFX_TEXTURE_RT; add clamp so sampling a
     // mirror's edge doesn't wrap. Filtering stays at bgfx's default (bilinear).
     const flags: u64 = bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp;
     const fb = bgfx.createFrameBuffer(w, h, .RGBA8, flags);
-    if (fb.idx == INVALID) return invalidTarget(); // leave the view free — no leak
+    if (fb.idx == INVALID) {
+        // Leave the view free (no leak) and say why — a mirror silently going
+        // blank is otherwise painful to diagnose.
+        std.log.warn("bgfx: render-target framebuffer creation failed ({d}x{d})", .{ w, h });
+        return invalidTarget();
+    }
 
     view_in_use[view] = true;
 
