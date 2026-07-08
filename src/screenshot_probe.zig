@@ -22,6 +22,7 @@ const window = @import("window");
 
 const W: u16 = 96;
 const H: u16 = 96;
+const BASE: [:0]const u8 = "headless_screenshot_probe"; // captureHeadless appends ".tga"
 const TGA_PATH: [:0]const u8 = "headless_screenshot_probe.tga";
 
 // libc file IO — Zig 0.16 dropped `std.fs.cwd()` (needs an `Io`), and the gfx/
@@ -65,16 +66,19 @@ pub fn main() !void {
     }
     std.debug.print("PROBE: headless init OK — renderer={s}\n", .{@tagName(bgfx.getRendererType())});
 
-    // Clear the offscreen primary view to a known saturated RED, then render one
-    // frame so the framebuffer actually holds it before we capture.
+    // Render a known saturated RED frame through the REAL begin/end path — this
+    // also exercises the headless-safe beginFrame (it must skip input polling
+    // since GLFW was never initialized surfaceless). A couple frames so the clear
+    // is present before capture.
     window.clearBackground(255, 0, 0, 255);
-    bgfx.touch(0);
-    _ = bgfx.frame(0);
+    window.beginFrame();
+    window.endFrame();
+    window.beginFrame();
+    window.endFrame();
 
-    // Capture the offscreen framebuffer to disk (readback + TGA write). This is
-    // synchronous — it advances its own frames for the readback and writes
-    // exactly TGA_PATH — so no polling is needed.
-    if (!window.captureHeadless(TGA_PATH)) {
+    // Capture the offscreen framebuffer to disk (readback + TGA write; appends
+    // ".tga" → TGA_PATH). Synchronous — advances its own frames for the readback.
+    if (!window.captureHeadless(BASE)) {
         std.debug.print("PROBE_RESULT: SCREENSHOT_FILE_MISSING (captureHeadless failed)\n", .{});
         window.closeWindow();
         std.process.exit(5);

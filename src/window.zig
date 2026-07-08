@@ -543,9 +543,19 @@ pub fn headlessColorTexture() bgfx.TextureHandle {
 
 extern "c" fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *std.c.FILE) usize;
 
+/// True when running under `initHeadless` (#36) — a surfaceless run with no
+/// window, rendering into an offscreen framebuffer. The generated loop uses this
+/// to choose the headless capture path (`captureHeadless`) over `takeScreenshot`.
+pub fn isSurfaceless() bool {
+    return headless_fb.idx != INVALID_HANDLE;
+}
+
 /// Capture the headless offscreen framebuffer (#36) to an uncompressed 32-bit
-/// TGA at exactly `path`. Returns false if not headless, the GPU→CPU readback
-/// never lands, or the file can't be written.
+/// TGA. Like bgfx's windowed `takeScreenshot` (which lets bgfx append the
+/// extension), a `.tga` suffix is appended to `path`, so the same `--screenshot`
+/// value yields the same filename windowed or headless. Returns false if not
+/// headless, the GPU→CPU readback never lands, the path is too long, or the file
+/// can't be written.
 ///
 /// This is the headless counterpart to `takeScreenshot`: bgfx's
 /// `requestScreenShot` only captures WINDOW/backbuffer framebuffers, so the
@@ -593,8 +603,15 @@ pub fn captureHeadless(path: [:0]const u8) bool {
     }
     readback_done = true;
 
-    const file = std.c.fopen(path.ptr, "wb") orelse {
-        std.log.err("bgfx: headless capture could not open {s} for writing", .{path});
+    // Append ".tga" to match bgfx's windowed `takeScreenshot` extension handling.
+    var path_buf: [1024:0]u8 = undefined;
+    const out_path = std.fmt.bufPrintZ(&path_buf, "{s}.tga", .{path}) catch {
+        std.log.err("bgfx: headless capture path too long: {s}", .{path});
+        return false;
+    };
+
+    const file = std.c.fopen(out_path.ptr, "wb") orelse {
+        std.log.err("bgfx: headless capture could not open {s} for writing", .{out_path});
         return false;
     };
     defer _ = std.c.fclose(file);
@@ -610,7 +627,7 @@ pub fn captureHeadless(path: [:0]const u8) bool {
     hdr[16] = 32;
     hdr[17] = 0x28;
     if (fwrite(&hdr, 1, hdr.len, file) != hdr.len) {
-        std.log.err("bgfx: headless capture failed writing the TGA header to {s}", .{path});
+        std.log.err("bgfx: headless capture failed writing the TGA header to {s}", .{out_path});
         return false;
     }
 
@@ -622,7 +639,7 @@ pub fn captureHeadless(path: [:0]const u8) bool {
         px[i + 2] = r;
     }
     if (fwrite(px.ptr, 1, px.len, file) != px.len) {
-        std.log.err("bgfx: headless capture failed writing {d} pixel bytes to {s}", .{ px.len, path });
+        std.log.err("bgfx: headless capture failed writing {d} pixel bytes to {s}", .{ px.len, out_path });
         return false;
     }
     return true;
@@ -944,8 +961,15 @@ pub fn surfaceRestored() void {
 }
 
 pub fn beginFrame() void {
-    const input = @import("input");
-    input.newFrame();
+    // Skip input polling in TRUE-headless mode (`initHeadless`, #36): there is no
+    // GLFW window and GLFW was never initialized, so `input.newFrame()`'s
+    // `glfw.pollEvents()` would run against an uninitialized GLFW. A surfaceless
+    // run has no input anyway. `headless_fb` set ⇔ surfaceless. Windowed / the
+    // invisible-window `--headless` path (which DOES init GLFW) still poll.
+    if (headless_fb.idx == INVALID_HANDLE) {
+        const input = @import("input");
+        input.newFrame();
+    }
     // Reconcile the swapchain with the current physical framebuffer size
     // (DPI move, resize, fullscreen toggle) before sizing the viewport. This
     // runs every frame uniformly so HiDPI changes are picked up without a

@@ -10,17 +10,28 @@ const BackendGfxType = @import("backend_gfx");
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // `labelle run --headless` (and `--uncapped`/`--ticks`, which imply it)
-    // run the window unmapped so no window pops up in CI. bgfx still needs a
-    // real native surface (it can't render or read the backbuffer back for
-    // `--screenshot` otherwise), so this is an invisible window, not a truly
-    // windowless run. `setConfigFlags` must precede `initWindow` — the GLFW
-    // visibility hint is applied at window creation. Gated on the backend
-    // exposing the helper so older bgfx backends still build.
-    if (comptime @hasDecl(window, "isHeadless") and @hasDecl(window, "setConfigFlags")) {
-        if (window.isHeadless()) window.setConfigFlags(.{ .window_hidden = true });
+    // `labelle run --headless` (and `--uncapped`/`--ticks`, which imply it):
+    // first try a TRULY surfaceless bgfx (labelle-bgfx#36) — NO window and no
+    // display server, rendering into an offscreen framebuffer — so `--headless`
+    // works on a bare CI box with no X/Wayland. It needs a Vulkan/Metal device;
+    // if that's absent (e.g. a GL-only Linux box) `initHeadless` returns false
+    // and we fall back to the invisible-window path below (an unmapped GLFW
+    // window, which still needs a display server). Gated so older bgfx backends
+    // without `initHeadless` still build (they take the fallback).
+    var headless_surfaceless = false;
+    if (comptime @hasDecl(window, "isHeadless") and @hasDecl(window, "initHeadless")) {
+        if (window.isHeadless()) headless_surfaceless = window.initHeadless(screen_w, screen_h);
     }
-{{hidden_setup}}    window.initWindow(screen_w, screen_h, screen_title);
+    if (!headless_surfaceless) {
+        // Windowed run, or `--headless` without surfaceless support: create the
+        // window (unmapped when the project config or `--headless` asks to hide
+        // it). `setConfigFlags` must precede `initWindow` — the GLFW visibility
+        // hint is applied at window creation.
+        if (comptime @hasDecl(window, "isHeadless") and @hasDecl(window, "setConfigFlags")) {
+            if (window.isHeadless()) window.setConfigFlags(.{ .window_hidden = true });
+        }
+{{hidden_setup}}        window.initWindow(screen_w, screen_h, screen_title);
+    }
     defer window.closeWindow();
     window.setTargetFPS(target_fps);
 
@@ -113,37 +124,46 @@ const BackendGfxType = @import("backend_gfx");
         g.renderGizmos();
 {{gui_draw_code}}        window.drawText(screen_title, 10, 10, 20, 80, 80, 80, 255);
 
-        // Queue the screenshot exactly once, after the configured delay,
-        // BEFORE `endFrame` so the capture lands on THIS frame's content
-        // (scene + GUI overlay just submitted). bgfx's `takeScreenshot`
-        // only stashes the path; `endFrame` issues the bgfx capture
-        // request right before the frame swap and pumps the extra frames
-        // the multi-threaded render path needs to flush the async capture
-        // to disk. Gated on the backend exposing the API so the template
-        // stays compatible with older bgfx backends.
-        //
-        // We intentionally do NOT break out of the loop after the capture:
-        // unlike raylib's synchronous `TakeScreenshot`, bgfx's clean exit
-        // would run `gpa.deinit()`, and any pre-existing teardown leak in
-        // the engine/plugins surfaces as a panic under the game's debug
-        // allocator. Letting `--timeout` SIGTERM the process avoids that
-        // path; the `.tga` is already on disk by the time the timeout
-        // fires. (One-shot is preserved via `screenshot_req = null`.)
+        // Screenshot (labelle-cli#227). Decide once whether THIS frame is the
+        // capture frame (the configured delay has elapsed), then capture on the
+        // correct side of the `endFrame` swap for the run mode:
+        //   - windowed / invisible-window: bgfx's `takeScreenshot` is ASYNC — its
+        //     `requestScreenShot` must be queued BEFORE the swap so it captures
+        //     this frame's content; `endFrame` issues it and pumps the extra
+        //     frames the multi-threaded render path needs to flush the `.tga`.
+        //   - surfaceless (#36): `captureHeadless` reads the offscreen framebuffer
+        //     back AFTER it's been rendered (past `endFrame`), synchronously —
+        //     `requestScreenShot` doesn't work on an offscreen FB. No flush frames.
+        // We do NOT break out of the loop right after the capture: bgfx's clean
+        // exit would run `gpa.deinit()`, and any pre-existing engine/plugin
+        // teardown leak would then panic under the debug allocator. `--ticks` /
+        // `--timeout` end the run; the file is already on disk. One-shot is
+        // preserved via `screenshot_req = null` below.
+        var capture_this_frame = false;
+        if (screenshot_req) |req| {
+            const now_ns: i128 = engine.nowNs();
+            const elapsed_sec: f32 = @as(f32, @floatFromInt(now_ns - loop_start_ns)) / 1_000_000_000.0;
+            capture_this_frame = elapsed_sec >= req.after_sec;
+        }
         if (comptime @hasDecl(window, "takeScreenshot")) {
-            if (screenshot_req) |req| {
-                const now_ns: i128 = engine.nowNs();
-                const elapsed_sec: f32 = @as(f32, @floatFromInt(now_ns - loop_start_ns)) / 1_000_000_000.0;
-                if (elapsed_sec >= req.after_sec) {
-                    window.takeScreenshot(req.path);
-                    screenshot_req = null;
-                    // Give the async bgfx capture its flush frames before a
-                    // pending `--ticks` exit can `break` (see decl above).
-                    screenshot_flush_left = screenshot_flush_frames;
-                }
+            if (capture_this_frame and !headless_surfaceless) {
+                window.takeScreenshot(screenshot_req.?.path);
+                // Give the async bgfx capture its flush frames before a pending
+                // `--ticks` exit can `break` (see below).
+                screenshot_flush_left = screenshot_flush_frames;
             }
         }
 
         window.endFrame();
+
+        // Surfaceless capture, past the swap (see rationale above). Gated so the
+        // template stays compatible with bgfx backends predating `captureHeadless`.
+        if (comptime @hasDecl(window, "captureHeadless")) {
+            if (capture_this_frame and headless_surfaceless) {
+                _ = window.captureHeadless(screenshot_req.?.path);
+            }
+        }
+        if (capture_this_frame) screenshot_req = null; // one-shot, either path
 
         // `--ticks=N`: exit cleanly after N rendered frames so CI / agent
         // flows that just want "run for a bit then quit" don't have to rely
