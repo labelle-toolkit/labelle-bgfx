@@ -471,6 +471,14 @@ fn headlessRendererType() bgfx.RendererType {
 /// `shouldQuit` returns false while headless) and read the result back with
 /// `takeScreenshot`, which targets this framebuffer instead of a backbuffer.
 pub fn initHeadless(w: i32, h: i32) bool {
+    // Guard before the `@intCast(w/h)` below: a non-positive size is invalid for
+    // a framebuffer and would panic the cast to u16 (safe builds) rather than
+    // fail gracefully. bgfx also caps textures at 16384, but createFrameBuffer
+    // rejects an over-size request itself; the floor is the one that panics.
+    if (w <= 0 or h <= 0) {
+        std.log.err("bgfx: initHeadless needs positive dimensions (got {d}x{d})", .{ w, h });
+        return false;
+    }
     screen_w = w;
     screen_h = h;
     surface_valid = true;
