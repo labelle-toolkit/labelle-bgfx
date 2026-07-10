@@ -63,6 +63,31 @@ const BackendGfxType = @import("backend_gfx");
 
     g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
 
+    // Script Runtime Contract bind (labelle-engine#749 / labelle-assembler#593):
+    // hand the game to the engine's script_contract once, right after Game.init
+    // and BEFORE the assembler's setup code below runs the scripting plugin's
+    // setup (which boots the VM against the exported C surface). Gated on BOTH
+    // the engine exposing the contract and the assembler having enabled
+    // scripting for this project (the generated `scripting_enabled` flag) —
+    // the same double-@hasDecl convention as the fullscreen/vsync drains in
+    // the loop below, so older engines and script-less projects build
+    // unchanged (the call folds away and no labelle_* symbols are emitted).
+    // The per-frame twin, `script_contract.drainEvents`, rides the
+    // assembler's {{tick_code}} splice — between the plugin ticks and
+    // g.dispatchEvents(), an ordering only the assembler can guarantee.
+    if (comptime @hasDecl(engine, "script_contract") and @hasDecl(@This(), "scripting_enabled")) {
+        engine.script_contract.bind(&g);
+        // Paired teardown BEFORE g.deinit(): the contract owns
+        // subscription/inbox/emit-arena state through g.allocator and
+        // must release it (and drop the game pointer) while the game
+        // is still alive — otherwise the debug allocator reports the
+        // contract's state as leaked and the exports stay bound to a
+        // dying game.
+    }
+    defer if (comptime @hasDecl(engine, "script_contract") and @hasDecl(@This(), "scripting_enabled")) {
+        engine.script_contract.unbind();
+    };
+
 {{preview_setup}}{{setup_code}}
     // Screenshot capture request (labelle-cli#227). Reads
     // `LABELLE_SCREENSHOT_PATH` once on startup; null when the env var is

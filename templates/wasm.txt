@@ -119,5 +119,28 @@ pub fn main() !void {
 
     g.setScreenHeight(@as(f32, @floatFromInt(screen_h)));
 
+    // Script Runtime Contract bind (labelle-engine#749 / labelle-assembler#593):
+    // hand the game to the engine's script_contract once, right after Game.init
+    // and BEFORE the assembler's setup code below runs the scripting plugin's
+    // setup (which boots the VM against the exported C surface). Double
+    // @hasDecl gate — engine exposes the contract AND the assembler generated
+    // the `scripting_enabled` flag — mirroring the desktop template (and the
+    // fullscreen/vsync drain convention), so older engines and script-less
+    // projects build unchanged. The per-frame twin,
+    // `script_contract.drainEvents`, rides the assembler's {{tick_code}}
+    // splice in gameFrame — between the plugin ticks and g.dispatchEvents().
+    if (comptime @hasDecl(engine, "script_contract") and @hasDecl(@This(), "scripting_enabled")) {
+        engine.script_contract.bind(&g);
+        // Paired teardown BEFORE g.deinit(): the contract owns
+        // subscription/inbox/emit-arena state through g.allocator and
+        // must release it (and drop the game pointer) while the game
+        // is still alive — otherwise the debug allocator reports the
+        // contract's state as leaked and the exports stay bound to a
+        // dying game.
+    }
+    defer if (comptime @hasDecl(engine, "script_contract") and @hasDecl(@This(), "scripting_enabled")) {
+        engine.script_contract.unbind();
+    };
+
 {{preview_setup}}{{setup_code}}{{editor_bind}}    emscripten_set_main_loop(&gameFrame, 0, 1); // fps=0 → requestAnimationFrame (labelle-bgfx#14); target_fps still drives the dt clamp
 }
