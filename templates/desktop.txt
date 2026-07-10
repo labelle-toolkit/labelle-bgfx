@@ -73,7 +73,7 @@ const BackendGfxType = @import("backend_gfx");
     // the loop below, so older engines and script-less projects build
     // unchanged (the call folds away and no labelle_* symbols are emitted).
     // The per-frame twin, `script_contract.drainEvents`, rides the
-    // assembler's {{tick_code}} splice — between the plugin ticks and
+    // assembler's tick_code splice — between the plugin ticks and
     // g.dispatchEvents(), an ordering only the assembler can guarantee.
     if (comptime @hasDecl(engine, "script_contract") and @hasDecl(@This(), "scripting_enabled")) {
         engine.script_contract.bind(&g);
