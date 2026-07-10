@@ -77,7 +77,16 @@ const BackendGfxType = @import("backend_gfx");
     // g.dispatchEvents(), an ordering only the assembler can guarantee.
     if (comptime @hasDecl(engine, "script_contract") and @hasDecl(@This(), "scripting_enabled")) {
         engine.script_contract.bind(&g);
+        // Paired teardown BEFORE g.deinit(): the contract owns
+        // subscription/inbox/emit-arena state through g.allocator and
+        // must release it (and drop the game pointer) while the game
+        // is still alive — otherwise the debug allocator reports the
+        // contract's state as leaked and the exports stay bound to a
+        // dying game.
     }
+    defer if (comptime @hasDecl(engine, "script_contract") and @hasDecl(@This(), "scripting_enabled")) {
+        engine.script_contract.unbind();
+    };
 
 {{preview_setup}}{{setup_code}}
     // Screenshot capture request (labelle-cli#227). Reads

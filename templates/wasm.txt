@@ -131,7 +131,16 @@ pub fn main() !void {
     // splice in gameFrame — between the plugin ticks and g.dispatchEvents().
     if (comptime @hasDecl(engine, "script_contract") and @hasDecl(@This(), "scripting_enabled")) {
         engine.script_contract.bind(&g);
+        // Paired teardown BEFORE g.deinit(): the contract owns
+        // subscription/inbox/emit-arena state through g.allocator and
+        // must release it (and drop the game pointer) while the game
+        // is still alive — otherwise the debug allocator reports the
+        // contract's state as leaked and the exports stay bound to a
+        // dying game.
     }
+    defer if (comptime @hasDecl(engine, "script_contract") and @hasDecl(@This(), "scripting_enabled")) {
+        engine.script_contract.unbind();
+    };
 
 {{preview_setup}}{{setup_code}}{{editor_bind}}    emscripten_set_main_loop(&gameFrame, 0, 1); // fps=0 → requestAnimationFrame (labelle-bgfx#14); target_fps still drives the dt clamp
 }
