@@ -127,7 +127,7 @@ pub fn main() !void {
     // the `scripting_enabled` flag — mirroring the desktop template (and the
     // fullscreen/vsync drain convention), so older engines and script-less
     // projects build unchanged. The per-frame twin,
-    // `script_contract.drainEvents`, rides the assembler's {{tick_code}}
+    // `script_contract.drainEvents`, rides the assembler's tick_code
     // splice in gameFrame — between the plugin ticks and g.dispatchEvents().
     if (comptime @hasDecl(engine, "script_contract") and @hasDecl(@This(), "scripting_enabled")) {
         engine.script_contract.bind(&g);
