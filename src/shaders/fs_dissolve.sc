@@ -50,6 +50,10 @@ uniform vec4 u_material_params;
 uniform vec4 u_material_rect;
 
 #define NOISE_SCALE 9.0
+// Half-width (in threshold units) of the burn-edge fade-in at the threshold
+// endpoints. Small + fixed so only thresholds within EDGE_EPS of 0 or 1 have
+// their glow gated (the mid-threshold glow is untouched); see `active` below.
+#define EDGE_EPS 0.03
 
 float dissolveHash(vec2 p)
 {
@@ -93,7 +97,17 @@ void main()
 	// leaving the sprite not-quite-gone. The `(1 - step(1.0, threshold))` factor
 	// forces full clear at threshold == 1.0 while leaving both endpoints correct.
 	float alive = step(0.0, reveal) * (1.0 - step(1.0, threshold)); // 1 = kept, 0 = gone
-	float edge = 1.0 - smoothstep(0.0, band, max(reveal, 0.0)); // 1 at the front
+
+	// Burn-edge glow: `front` is high on surviving texels just past the threshold
+	// (near the dissolve front). It must be ZERO at BOTH endpoints — threshold == 0
+	// (nothing removed yet: dark/low-noise texels must NOT pick up burn colour at
+	// rest) and threshold == 1 (fully gone). The `active` gate is 0 at threshold ∈
+	// {0, 1} and ~1 in between (EDGE_EPS-wide fade-in at each endpoint), so the
+	// mid-threshold glow is unchanged while both endpoints render glow-free.
+	// (`edge_gate`, not `active` — the latter is a reserved word in GLSL/ESSL.)
+	float front = 1.0 - smoothstep(0.0, band, max(reveal, 0.0)); // 1 at the front
+	float edge_gate = smoothstep(0.0, EDGE_EPS, threshold) * smoothstep(0.0, EDGE_EPS, 1.0 - threshold);
+	float edge = front * edge_gate;
 
 	vec3 rgb = mix(texel.rgb, u_material_color.rgb, edge);
 	gl_FragColor = vec4(rgb, texel.a * alive);

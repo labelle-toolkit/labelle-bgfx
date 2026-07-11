@@ -6,9 +6,10 @@
 //! edge glow), and `outline` (an opaque square, an anti-aliased soft disc whose
 //! fractional-alpha boundary exercises the over-operator composite, an ATLAS
 //! sub-rect frame whose opaque red neighbour must NOT bleed into the outline,
-//! and a tint.a=0.5 case whose outline fades with the sprite). An atlas
-//! `dissolve` frame guards the sprite-local noise remap too — FULLY headless
-//! (surfaceless bgfx,
+//! and a tint.a=0.5 case whose outline fades with the sprite WITHOUT tinting its
+//! interior). Atlas + boundary `dissolve` frames guard the sprite-local noise
+//! remap, the fully-clear threshold==1, and the glow-free/solid threshold==0 —
+//! FULLY headless (surfaceless bgfx,
 //! Metal/Vulkan offscreen framebuffer, no window / no display server, the
 //! `initHeadless` path proven by `mirror_probe` / `screenshot_probe`), then
 //! captures the offscreen framebuffer to an uncompressed 32-bit TGA via
@@ -42,7 +43,7 @@ const window = @import("window");
 // variant; `zig build material-golden` compiles the check variant.
 const options = @import("golden_options");
 
-const W: u16 = 648;
+const W: u16 = 720;
 const H: u16 = 96;
 
 const GOLDEN_BASE: [:0]const u8 = "test/golden/material_effects";
@@ -378,7 +379,7 @@ fn renderScene() void {
 
         // Col 9: dissolve at threshold = 1.0 — FULLY dissolved. Every texel must
         // vanish (alpha 0), leaving only the background, even for noise texels of
-        // exactly 1.0. Guards the threshold==1 boundary fix (Finding B).
+        // exactly 1.0. Guards the threshold==1 boundary fix.
         gfx.drawTextureProMaterial(
             burn,
             src48,
@@ -387,6 +388,20 @@ fn renderScene() void {
             0,
             gfx.white,
             .{ .effect = .dissolve, .uniforms = .{ .r = 1.0, .g = 0.5, .b = 0.1, .scalar0 = 1.0, .scalar1 = 6.0 } },
+        );
+
+        // Col 10: dissolve at threshold = 0.0 — FULLY SOLID at rest. Must be
+        // pixel-identical to a plain sprite: no texel dissolved AND no burn-edge
+        // glow anywhere (the edge_gate zeroes the glow at threshold 0). Guards the
+        // threshold==0 edge-glow fix (Bug 2). Same `burn` texture as col 3/9.
+        gfx.drawTextureProMaterial(
+            burn,
+            src48,
+            .{ .x = 660, .y = 24, .width = 48, .height = 48 },
+            origin,
+            0,
+            gfx.white,
+            .{ .effect = .dissolve, .uniforms = .{ .r = 1.0, .g = 0.5, .b = 0.1, .scalar0 = 0.0, .scalar1 = 6.0 } },
         );
 
         window.endFrame();

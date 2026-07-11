@@ -59,12 +59,20 @@ uniform vec4 u_material_rect;
 
 void main()
 {
-	vec4 base = texture2D(s_tex, v_texcoord0) * v_color0;
+	// INTRINSIC sprite texel (NO tint): the silhouette + ring math must key off
+	// the sprite's own alpha, not the tinted alpha — otherwise a faded sprite
+	// (tint.a < 1) has a sub-1 interior alpha and the outline colour leaks UNDER
+	// the opaque body. `v_color0.rgb` still tints the interior COLOUR; the tint
+	// FADE (`v_color0.a`) is applied ONCE to the final composite (see below).
+	vec4 texel = texture2D(s_tex, v_texcoord0);
+	float src_a = texel.a;                       // intrinsic silhouette alpha
+	vec3 sprite_rgb = texel.rgb * v_color0.rgb;  // tinted interior colour
 
 	vec2 px = u_material_texel.xy * u_material_params.x; // thickness in UV
 	float diag = 0.70710678;                             // 1/sqrt(2)
 
-	// Max in-frame neighbour alpha over the 8-tap ring.
+	// Max in-frame neighbour alpha over the 8-tap ring (raw sprite alpha, so the
+	// silhouette is tint-independent).
 	float ring = 0.0;
 	ring = OUTLINE_TAP(v_texcoord0 + vec2( px.x, 0.0));
 	ring = OUTLINE_TAP(v_texcoord0 + vec2(-px.x, 0.0));
@@ -80,20 +88,25 @@ void main()
 	float soft = smoothstep(0.0, 1.0, ring);
 	float coverage = mix(hard, soft, clamp(u_material_params.y, 0.0, 1.0));
 
-	// The outline's effective contribution under the sprite: its own alpha
-	// (colour alpha × coverage) times the fraction the sprite leaves uncovered,
-	// i.e. Ao·(1−As). This ALREADY folds in the over-operator's (1−As) term.
-	// The tint alpha (v_color0.a) scales it too, so fading the sprite out
-	// (tint.a → 0) fades its outline with it (a hidden sprite hides its outline).
-	float outline_a = u_material_color.a * v_color0.a * coverage * (1.0 - base.a);
+	// The outline's effective contribution under the sprite, gated by the sprite's
+	// INTRINSIC silhouette: its own alpha (colour alpha × coverage) times the
+	// fraction the sprite leaves uncovered, i.e. Ao·(1−As) with As = intrinsic
+	// alpha. So an opaque interior (src_a == 1) gets ZERO outline regardless of
+	// tint. This ALREADY folds in the over-operator's (1−As) term.
+	float outline_a = u_material_color.a * coverage * (1.0 - src_a);
 
-	// Sprite OVER outline (straight-alpha result for the STATE_BLEND_ALPHA path).
-	// A-over-B: result_a = As + Ao·(1−As); premultiplied colour = As·Cs +
-	// Ao·(1−As)·Co. Since `outline_a` is ALREADY Ao·(1−As), it is used DIRECTLY
-	// here — multiplying by (1−As) a second time would double-attenuate the
-	// outline on semi-transparent / anti-aliased sprite edges (0 < base.a < 1).
-	float a = base.a + outline_a;
-	vec3 pre = base.rgb * base.a + u_material_color.rgb * outline_a;
-	vec3 rgb = a > 0.0 ? pre / a : vec3(0.0, 0.0, 0.0);
-	gl_FragColor = vec4(rgb, a);
+	// Sprite OVER outline at INTRINSIC alpha (straight-alpha result for the
+	// STATE_BLEND_ALPHA path). A-over-B: comp_a = As + Ao·(1−As); premultiplied
+	// colour = As·Cs + Ao·(1−As)·Co. `outline_a` is ALREADY Ao·(1−As), so it is
+	// used DIRECTLY (multiplying by (1−As) again would double-attenuate the
+	// outline on anti-aliased edges, 0 < src_a < 1).
+	float comp_a = src_a + outline_a;
+	vec3 comp_pre = sprite_rgb * src_a + u_material_color.rgb * outline_a;
+	vec3 comp_rgb = comp_a > 0.0 ? comp_pre / comp_a : vec3(0.0, 0.0, 0.0);
+
+	// Apply the tint FADE ONCE to the whole composite, so the interior stays
+	// sprite-coloured and the outline stays outline-coloured while BOTH fade
+	// together (tint.a → 0 hides sprite AND outline; tint.a == 1 is unchanged).
+	// For a no-outline pixel this reduces exactly to `texel * v_color0`.
+	gl_FragColor = vec4(comp_rgb, comp_a * v_color0.a);
 }
