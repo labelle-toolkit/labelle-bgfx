@@ -262,6 +262,25 @@ pub fn build(b: *std.Build) void {
     input_mod.addImport("labelle-core", core_mod);
     // gfx.zig asserts the render contract (`core.assertBackend`) at comptime.
     gfx_mod.addImport("labelle-core", core_mod);
+
+    // ── labelle-gfx (TEST/GOLDEN-ONLY) — the real backend-agnostic gfx library,
+    // pulled in ONLY to drive its `PostFxDriver` over THIS bgfx backend in the
+    // post-fx integration golden (labelle-gfx#305 P2, the gfx×bgfx integration
+    // proof). No production code depends on it: gfx deps `labelle-core`, bgfx deps
+    // `labelle-core`, and labelle-gfx is BACKEND-AGNOSTIC (deps core, NOT bgfx), so
+    // there is no dependency cycle. We MUST override labelle-gfx's own
+    // `labelle-core` onto bgfx's `core_mod` (both pin v1.26.0, identical hash) so
+    // the diamond unifies at the SOURCE level — otherwise `PostPass`/`RenderTargetId`
+    // from gfx's core instance would not type-check against the bgfx backend's core
+    // instance and `PostFxDriver(gfx_backend)` wouldn't compile. Desktop only (the
+    // golden is a GPU + surfaceless test); skipped on the Android build graph.
+    const gfx_lib_mod: ?*std.Build.Module = if (is_android) null else blk: {
+        const gfx_lib_dep = b.dependency("labelle_gfx", .{ .target = target, .optimize = optimize });
+        const m = gfx_lib_dep.module("labelle-gfx");
+        m.addImport("labelle-core", core_mod); // unify the core diamond onto bgfx's pin
+        break :blk m;
+    };
+
     if (is_android) {
         // The Android seam adapter (`src/android.zig`, surfaced as
         // `input.android`) also uses labelle-core for the `AndroidBackendContext`
@@ -500,6 +519,73 @@ pub fn build(b: *std.Build) void {
     const post_fx_golden_bless_run = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "post_fx_golden", "src/post_fx_golden.zig", true);
     const post_fx_golden_bless_step = b.step("post-fx-golden-bless", "Regenerate the post-fx golden TGA (#305)");
     post_fx_golden_bless_step.dependOn(&post_fx_golden_bless_run.step);
+
+    // ── Post-fx INTEGRATION golden (gfx×bgfx, labelle-gfx#305 P2) ─────────────
+    // Drives the REAL gfx `PostFxDriver` (its two-buffer ping-pong composition —
+    // the exact logic the engine runs) over THIS bgfx backend, surfaceless. This
+    // is the integration proof that the post_fx_golden harness (one target per
+    // pass, bypassing the driver) could not give. Three variants:
+    //   post-fx-integration-golden        — variant 2 (EVEN bloom→crt), the bug
+    //       case; diffed against the reference `post_fx_bloom_crt.tga`.
+    //   post-fx-integration-golden-single — variant 1 (odd, bloom only).
+    //   post-fx-integration-golden-triple — variant 3 (odd, bloom→vignette→crt).
+    // Desktop only (needs labelle-gfx + a GPU); skipped on Android.
+    const IntegrationGolden = struct {
+        fn make(
+            bb: *std.Build,
+            tgt: std.Build.ResolvedTarget,
+            opt: std.builtin.OptimizeMode,
+            zbgfx_m: *std.Build.Module,
+            gfx_m: *std.Build.Module,
+            gfx_lib_m: *std.Build.Module,
+            window_m: *std.Build.Module,
+            bgfx_a: *std.Build.Step.Compile,
+            glfw_a: ?*std.Build.Step.Compile,
+            variant: u8,
+            bless: bool,
+        ) *std.Build.Step.Run {
+            const opts = bb.addOptions();
+            opts.addOption(bool, "bless", bless);
+            opts.addOption(u8, "variant", variant);
+            const exe = bb.addExecutable(.{
+                .name = bb.fmt("post_fx_integration_golden_v{d}{s}", .{ variant, if (bless) "_bless" else "" }),
+                .root_module = bb.createModule(.{
+                    .root_source_file = bb.path("src/post_fx_integration_golden.zig"),
+                    .target = tgt,
+                    .optimize = opt,
+                    .link_libc = true,
+                }),
+            });
+            exe.root_module.addImport("zbgfx", zbgfx_m);
+            exe.root_module.addImport("gfx", gfx_m);
+            exe.root_module.addImport("labelle-gfx", gfx_lib_m);
+            exe.root_module.addImport("window", window_m);
+            exe.root_module.addOptions("golden_options", opts);
+            exe.root_module.linkLibrary(bgfx_a);
+            if (glfw_a) |a| exe.root_module.linkLibrary(a);
+            if (tgt.result.os.tag == .windows) {
+                exe.root_module.linkSystemLibrary("gdi32", .{});
+                exe.root_module.linkSystemLibrary("user32", .{});
+            }
+            return bb.addRunArtifact(exe);
+        }
+    };
+    if (gfx_lib_mod) |gfx_lib_m| {
+        const variants = [_]struct { v: u8, suffix: []const u8, desc: []const u8 }{
+            .{ .v = 2, .suffix = "", .desc = "EVEN bloom→crt (the bug case) vs the reference golden" },
+            .{ .v = 1, .suffix = "-single", .desc = "odd length-1 (bloom only) — no-regression" },
+            .{ .v = 3, .suffix = "-triple", .desc = "odd length-3 (bloom→vignette→crt) — no-regression" },
+        };
+        inline for (variants) |vv| {
+            const check = IntegrationGolden.make(b, target, optimize, zbgfx_mod, gfx_mod, gfx_lib_m, window_mod, bgfx_artifact, glfw_artifact, vv.v, false);
+            const check_step = b.step(b.fmt("post-fx-integration-golden{s}", .{vv.suffix}), b.fmt("Drive the REAL gfx PostFxDriver over bgfx: {s} (#305)", .{vv.desc}));
+            check_step.dependOn(&check.step);
+
+            const bless_run = IntegrationGolden.make(b, target, optimize, zbgfx_mod, gfx_mod, gfx_lib_m, window_mod, bgfx_artifact, glfw_artifact, vv.v, true);
+            const bless_step = b.step(b.fmt("post-fx-integration-golden{s}-bless", .{vv.suffix}), b.fmt("Regenerate the integration golden: {s} (#305)", .{vv.desc}));
+            bless_step.dependOn(&bless_run.step);
+        }
+    }
 
     // ── Unit tests for the platform-dispatch helper ─────────────────
     // Always build + run on the host — platform.zig is pure Zig with

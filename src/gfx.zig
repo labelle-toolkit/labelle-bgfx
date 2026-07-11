@@ -204,6 +204,11 @@ pub const resetRenderTargets = render_target.reset;
 // passes (bloom / vignette / color_grade / crt).
 pub const applyPostPass = render_target.applyPostPass;
 pub const postPassSupported = render_target.postPassSupported;
+// Reset the per-frame transient post-fx view cursor (labelle-gfx#305). Called
+// from `window.beginFrame` at frame start so the transient view band the post-fx
+// passes submit into is reused each frame and never exhausts. Zero-cost (a single
+// store) and a no-op semantically on frames with no post-fx.
+pub const resetPostFxFrame = render_target.resetPostFxFrame;
 // Re-export the post-fx value types so consumers (and the golden harness) can
 // build a `PostPass` without importing labelle-core directly.
 pub const PostPass = core.backend_contract.PostPass;

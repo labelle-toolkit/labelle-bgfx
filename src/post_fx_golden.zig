@@ -7,14 +7,17 @@
 //! / `screenshot_probe`), dumping an uncompressed 32-bit TGA via
 //! `window.captureHeadless`.
 //!
-//! Ping-pong ordering note: bgfx executes each render-target VIEW atomically in
-//! `setViewOrder` order, so a target that is written by a LATER pass than it was
-//! read cannot reuse the same view (the scene draw and the later write would
-//! share one view and the read would see stale/cleared pixels). This harness
-//! therefore allocates a FRESH target per pass output (scene→t0, bloom t0→t1,
-//! crt t1→t2), which keeps every pass's write-view strictly after its read-view —
-//! a correct, contiguous chain that exercises `applyPostPass(src, dst)` exactly as
-//! the gfx driver invokes it, one hop at a time.
+//! Ping-pong ordering note: this harness allocates a FRESH target per pass output
+//! (scene→t0, bloom t0→t1, crt t1→t2), so every pass's write is a distinct target
+//! read only by the NEXT pass — a correct, contiguous chain independent of how
+//! `applyPostPass` sequences its bgfx views. It therefore does NOT exercise the
+//! real gfx `PostFxDriver`'s TWO-buffer ping-pong (which reuses two targets and,
+//! on an even stack, would read a target before an earlier pass wrote it under
+//! bgfx's ascending-view execution). That driver↔bgfx ordering is proven by
+//! `src/post_fx_integration_golden.zig`, which drives the real driver end-to-end;
+//! the fix that makes it correct is the monotonic transient post-fx view band in
+//! `gfx/render_target.zig` (labelle-gfx#305). Keep BOTH: this pins the shaders,
+//! the integration golden pins the driver seam.
 //!
 //! Two modes (baked at build time, like material_golden):
 //!   --bless (material-golden-bless-style step) : write the committed golden.

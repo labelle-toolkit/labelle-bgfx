@@ -51,6 +51,20 @@ jobs:
       # `zig build post-fx-golden-bless` after an intentional shader change.
       - name: Post-fx golden (bloom + crt)
         run: zig build post-fx-golden
+      # Post-fx INTEGRATION golden (gfx×bgfx, labelle-gfx#305 P2): drive the REAL
+      # gfx PostFxDriver (its two-buffer ping-pong composition — the exact logic
+      # the engine runs) over THIS bgfx backend, surfaceless. This is the proof the
+      # direct-drive post-fx-golden above cannot give: it exercises the driver's
+      # submission-vs-execution ordering. Variant 2 (EVEN bloom→crt) is the bug
+      # case — before the transient-view fix it read target_b before bloom wrote it.
+      # The odd 1-pass + 3-pass variants guard against regression. Regenerate the
+      # odd-length goldens with the matching `-bless` steps after a shader change.
+      - name: Post-fx integration golden (real gfx driver, bloom→crt)
+        run: zig build post-fx-integration-golden
+      - name: Post-fx integration golden (real gfx driver, 1-pass, no-regression)
+        run: zig build post-fx-integration-golden-single
+      - name: Post-fx integration golden (real gfx driver, 3-pass, no-regression)
+        run: zig build post-fx-integration-golden-triple
 
   # Integration: generate + cross-build the bgfx-android example (which now lives
   # here, not in labelle-assembler). Verifies the backend works end-to-end through
