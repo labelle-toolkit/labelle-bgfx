@@ -24,6 +24,9 @@ void main()
 	col.r = texture2D(s_tex, warp + vec2(ab, 0.0)).r;
 	col.g = texture2D(s_tex, warp).g;
 	col.b = texture2D(s_tex, warp - vec2(ab, 0.0)).b;
+	// Carry the source alpha (from the primary/green tap) so transparent regions
+	// stay transparent rather than being forced opaque.
+	float srcA = texture2D(s_tex, warp).a;
 
 	// Outside the warped image → black (the tube bezel).
 	float inside = step(0.0, warp.x) * step(warp.x, 1.0) * step(0.0, warp.y) * step(warp.y, 1.0);
@@ -37,5 +40,5 @@ void main()
 	float stripe = 0.6 + 0.4 * step(0.5, fract(warp.x * u_postfx_texel.z / 3.0));
 	float m = mix(1.0, stripe, clamp(u_postfx_params.z, 0.0, 1.0));
 
-	gl_FragColor = vec4(col * scan * m, 1.0);
+	gl_FragColor = vec4(col * scan * m, srcA);
 }

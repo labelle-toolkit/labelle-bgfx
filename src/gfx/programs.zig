@@ -564,32 +564,68 @@ fn destroyPostFxPrograms() void {
     postfx_initialized = false;
 }
 
+/// True when this renderer stores render-target textures BOTTOM-LEFT origin
+/// (OpenGL / OpenGLES). On such backends the full-screen post-fx quad must
+/// v-flip its sampled UVs — exactly as `render_target.draw` compensates with a
+/// negative-height source rect — otherwise an ODD number of passes writes an
+/// upside-down intermediate target. Metal / Vulkan / D3D are top-left origin, so
+/// this returns false and the quad samples straight (Metal golden UNCHANGED).
+fn postFxFlipV() bool {
+    const caps = bgfx.getCaps();
+    return caps != null and caps.*.originBottomLeft;
+}
+
 /// The two triangles of a full-screen quad in NDC (top = +1, matching
 /// `state.toNdcY`) with UV 0..1 (top-left = 0,0, matching `drawTexturePro`'s
 /// source→dest mapping) so a plain sample of `src` writes an upright, pixel-
-/// aligned copy into `dst` (identity on a top-left-origin backend). Vertex colour
-/// is white — the post-fx shaders ignore `v_color0`.
-fn fullscreenQuad() [6]PosTexColorVertex {
+/// aligned copy into `dst`. `flip_v` inverts the sampled V so the copy stays
+/// upright on a BOTTOM-LEFT-origin backend (GL/GLES) too — pass `postFxFlipV()`.
+/// On a top-left backend (`flip_v == false`) this is the identity copy. Vertex
+/// colour is white — the post-fx shaders ignore `v_color0`.
+fn fullscreenQuad(flip_v: bool) [6]PosTexColorVertex {
     const white: u32 = 0xFFFFFFFF;
+    const vt: f32 = if (flip_v) 1.0 else 0.0; // V at NDC top (+1)
+    const vb: f32 = if (flip_v) 0.0 else 1.0; // V at NDC bottom (-1)
     return .{
-        .{ .x = -1.0, .y = 1.0, .u = 0.0, .v = 0.0, .abgr = white }, // top-left
-        .{ .x = 1.0, .y = 1.0, .u = 1.0, .v = 0.0, .abgr = white }, // top-right
-        .{ .x = 1.0, .y = -1.0, .u = 1.0, .v = 1.0, .abgr = white }, // bottom-right
-        .{ .x = -1.0, .y = 1.0, .u = 0.0, .v = 0.0, .abgr = white }, // top-left
-        .{ .x = 1.0, .y = -1.0, .u = 1.0, .v = 1.0, .abgr = white }, // bottom-right
-        .{ .x = -1.0, .y = -1.0, .u = 0.0, .v = 1.0, .abgr = white }, // bottom-left
+        .{ .x = -1.0, .y = 1.0, .u = 0.0, .v = vt, .abgr = white }, // top-left
+        .{ .x = 1.0, .y = 1.0, .u = 1.0, .v = vt, .abgr = white }, // top-right
+        .{ .x = 1.0, .y = -1.0, .u = 1.0, .v = vb, .abgr = white }, // bottom-right
+        .{ .x = -1.0, .y = 1.0, .u = 0.0, .v = vt, .abgr = white }, // top-left
+        .{ .x = 1.0, .y = -1.0, .u = 1.0, .v = vb, .abgr = white }, // bottom-right
+        .{ .x = -1.0, .y = -1.0, .u = 0.0, .v = vb, .abgr = white }, // bottom-left
     };
+}
+
+// Pure host-side check of the GL/GLES origin fix (labelle-gfx#305 P2 review):
+// the flipped quad must invert V at every vertex while leaving position and U
+// untouched, so a bottom-left-origin backend (GL/GLES, `postFxFlipV() == true`)
+// samples an intermediate target upright — matching `render_target.draw`'s
+// negative-height flip. Compile-checked in the `gfx_mod` test graph. (Only the
+// Metal, top-left, `flip_v == false` path is golden-covered on CI — there is no
+// display-GL runner — so this pins the flip's INTENT alongside the code comment.)
+test "fullscreenQuad flip inverts V, preserving position and U" {
+    const straight = fullscreenQuad(false);
+    const flipped = fullscreenQuad(true);
+    for (straight, flipped) |s, f| {
+        try std.testing.expectEqual(s.x, f.x);
+        try std.testing.expectEqual(s.y, f.y);
+        try std.testing.expectEqual(s.u, f.u);
+        try std.testing.expectEqual(@as(f32, 1.0) - s.v, f.v); // V mirrored
+    }
 }
 
 /// Submit a full-screen post-fx pass into the ACTIVE view (the `dst` render
 /// target — `render_target.applyPostPass` has already `begin`d it): sample
 /// `src_color` through the pass's program with the flat `PostPassUniforms`
-/// marshalled to the three shared `vec4`s, writing an opaque full-screen quad.
+/// marshalled to the three shared `vec4`s, writing a full-screen quad whose RGB
+/// carries the effect and whose ALPHA is passed through from `src` (transparent
+/// scene regions stay transparent — see the shaders' `src.a` output).
 /// `dst_w`/`dst_h` size the texel uniform (src and dst share the design canvas,
 /// so they double as the src sample size). `lut_handle` is bound at unit 1 for
 /// `color_grade` only (its caller guarantees a valid handle; a zero/dead LUT is
-/// blitted straight through upstream). No-ops if the programs failed to build,
-/// so the pass is skipped rather than black-holing the frame.
+/// blitted straight through upstream). If the programs failed to build/link this
+/// degrades to a passthrough `src`→`dst` blit (NOT a no-op) so the ping-pong
+/// chain keeps the correct image instead of leaving `dst` stale.
 pub fn submitPostPass(
     kind: PostPassKind,
     uniforms: PostPassUniforms,
@@ -602,14 +638,19 @@ pub fn submitPostPass(
     // even if a post pass is somehow the very first submit of the frame.
     ensureShadersInitialized();
     if (!isValidHandle(s_tex_uniform.idx)) return;
-    if (!ensurePostFxPrograms()) return;
+    // If the post-fx programs/uniforms failed to build/link on this renderer,
+    // `applyPostPass` has ALREADY begin'd (bound) the `dst` view — returning here
+    // would leave `dst` stale/undefined and break the rest of the ping-pong chain.
+    // Degrade to a passthrough blit of `src`→`dst` (same fallback as a dead LUT)
+    // so the chain continues with the correct image instead of a broken frame.
+    if (!ensurePostFxPrograms()) return submitFullscreenBlit(src_color);
     const program = switch (kind) {
         .bloom => bloom_program,
         .vignette => vignette_program,
         .color_grade => color_grade_program,
         .crt => crt_program,
     };
-    if (!isValidProgram(program)) return;
+    if (!isValidProgram(program)) return submitFullscreenBlit(src_color);
     ensureLayouts();
 
     const identity = [16]f32{
@@ -629,7 +670,7 @@ pub fn submitPostPass(
     bgfx.setUniform(u_postfx_color_uniform, &color, 1);
     bgfx.setUniform(u_postfx_texel_uniform, &texel, 1);
 
-    const verts = fullscreenQuad();
+    const verts = fullscreenQuad(postFxFlipV());
     var tvb: bgfx.TransientVertexBuffer = undefined;
     bgfx.allocTransientVertexBuffer(&tvb, verts.len, &vertex_layout);
     const dest_ptr: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
@@ -661,7 +702,7 @@ pub fn submitFullscreenBlit(src_color: bgfx.TextureHandle) void {
     };
     bgfx.setViewTransform(active_view, &identity, &identity);
 
-    const verts = fullscreenQuad();
+    const verts = fullscreenQuad(postFxFlipV());
     var tvb: bgfx.TransientVertexBuffer = undefined;
     bgfx.allocTransientVertexBuffer(&tvb, verts.len, &vertex_layout);
     const dest_ptr: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));

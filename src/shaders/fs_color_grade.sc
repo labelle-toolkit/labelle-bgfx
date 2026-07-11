@@ -18,7 +18,8 @@ uniform vec4 u_postfx_params;
 
 void main()
 {
-	vec3 c = clamp(texture2D(s_tex, v_texcoord0).rgb, 0.0, 1.0);
+	vec4 src = texture2D(s_tex, v_texcoord0);
+	vec3 c = clamp(src.rgb, 0.0, 1.0);
 	float N = 16.0;
 	float blue = c.b * (N - 1.0);
 	float slice0 = floor(blue);
@@ -30,5 +31,7 @@ void main()
 	vec3 g0 = texture2D(s_lut, vec2(slice0 / N + xr, yg)).rgb;
 	vec3 g1 = texture2D(s_lut, vec2((slice0 + 1.0) / N + xr, yg)).rgb;
 	vec3 graded = mix(g0, g1, f);
-	gl_FragColor = vec4(mix(c, graded, clamp(u_postfx_params.x, 0.0, 1.0)), 1.0);
+	// Preserve the source alpha (don't force opaque) so transparent regions carry
+	// through the composite; only RGB is graded.
+	gl_FragColor = vec4(mix(c, graded, clamp(u_postfx_params.x, 0.0, 1.0)), src.a);
 }
