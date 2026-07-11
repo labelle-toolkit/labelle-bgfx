@@ -4,9 +4,13 @@
 /// modules don't each carry their own shader-init flags.
 const std = @import("std");
 const bgfx = @import("zbgfx").bgfx;
+const core = @import("labelle-core");
 const shaders_data = @import("../shaders.zig");
 const texture_mod = @import("texture.zig");
 const font_mod = @import("font.zig");
+
+const MaterialEffect = core.backend_contract.MaterialEffect;
+const MaterialUniforms = core.backend_contract.MaterialUniforms;
 
 // Blend helpers matching bgfx C macros.
 // BGFX_STATE_BLEND_FUNC_SEPARATE(_srcRGB, _dstRGB, _srcA, _dstA):
@@ -296,6 +300,183 @@ pub fn ensureYuvProgram() bool {
         isValidHandle(s_texY_uniform.idx) and isValidHandle(s_texU_uniform.idx) and isValidHandle(s_texV_uniform.idx);
 }
 
+// ── Material programs (curated per-draw effects, labelle-gfx#305 Slice B) ──────
+// Two programs built from `vs_sprite` + a material fragment shader, following the
+// exact YUV-path pattern above: per-renderer bytecode selected by
+// `bgfx.getRendererType()`, lazily `createProgram`d, latch-failing to the plain
+// sprite path (the material draw degrades — no crash). One program per effect:
+//   `flash_program`   ← fs_flash   (mix sprite→flash colour by amount)
+//   `palette_program` ← fs_palette (recolour by red-channel index via `s_lut`)
+// Both share two `vec4` uniforms (`u_material_color`/`u_material_params`) mapping
+// the flat `MaterialUniforms`; palette additionally binds a LUT sampler at unit 1.
+var flash_program: bgfx.ProgramHandle = .{ .idx = std.math.maxInt(u16) };
+var palette_program: bgfx.ProgramHandle = .{ .idx = std.math.maxInt(u16) };
+var s_lut_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+var u_material_color_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+var u_material_params_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+var material_initialized: bool = false;
+/// Latches a build/link failure so `ensureMaterialPrograms` retries at most once
+/// (mirrors `yuv_failed`) — a per-frame re-create would leak + exhaust the handle
+/// pool. Cleared by `shutdownPrograms` for a fresh post-surface-loss attempt.
+var material_failed: bool = false;
+
+/// Select the renderer-appropriate fragment bytecode for a material shader.
+fn materialFsData(comptime base: []const u8) []const u8 {
+    return switch (bgfx.getRendererType()) {
+        .Metal => &@field(shaders_data, base ++ "_mtl"),
+        .Vulkan => &@field(shaders_data, base ++ "_spv"),
+        .OpenGLES => &@field(shaders_data, base ++ "_essl"),
+        else => &@field(shaders_data, base ++ "_glsl"),
+    };
+}
+
+/// Build ONE material program from a fresh `vs_sprite` handle + the given fragment
+/// bytecode. Returns an invalid handle (and reclaims any created shader) on
+/// failure. Each program gets its OWN vs handle because `createProgram` with
+/// `destroy_shaders=true` consumes the handles it is given.
+fn buildMaterialProgram(fs_data: []const u8) bgfx.ProgramHandle {
+    const invalid = bgfx.ProgramHandle{ .idx = std.math.maxInt(u16) };
+    const vs_data: []const u8 = switch (bgfx.getRendererType()) {
+        .Metal => &shaders_data.vs_sprite_mtl,
+        .Vulkan => &shaders_data.vs_sprite_spv,
+        .OpenGLES => &shaders_data.vs_sprite_essl,
+        else => &shaders_data.vs_sprite_glsl,
+    };
+    const vs_handle = bgfx.createShader(bgfx.makeRef(vs_data.ptr, @intCast(vs_data.len)));
+    const fs_handle = bgfx.createShader(bgfx.makeRef(fs_data.ptr, @intCast(fs_data.len)));
+    if (!isValidHandle(vs_handle.idx) or !isValidHandle(fs_handle.idx)) {
+        if (isValidHandle(vs_handle.idx)) bgfx.destroyShader(vs_handle);
+        if (isValidHandle(fs_handle.idx)) bgfx.destroyShader(fs_handle);
+        return invalid;
+    }
+    const prog = bgfx.createProgram(vs_handle, fs_handle, true);
+    if (!isValidProgram(prog)) {
+        // createProgram does NOT consume the shaders on failure — destroy them
+        // here or leak two handles per attempt (exhausts the pool; see YUV path).
+        bgfx.destroyShader(vs_handle);
+        bgfx.destroyShader(fs_handle);
+        return invalid;
+    }
+    return prog;
+}
+
+/// Lazily build BOTH material programs + their shared uniforms. On any failure,
+/// tears the whole group down and latches `material_failed` so the material draw
+/// degrades to the plain sprite path (via `submitMaterialTriangles` returning
+/// false) rather than crashing or leaking every frame.
+fn initMaterialPrograms() void {
+    if (material_initialized) return;
+
+    flash_program = buildMaterialProgram(materialFsData("fs_flash"));
+    palette_program = buildMaterialProgram(materialFsData("fs_palette"));
+    if (!isValidProgram(flash_program) or !isValidProgram(palette_program)) {
+        std.log.err("bgfx: failed to build material programs (link failed on this renderer); materials degrade to plain sprites", .{});
+        if (isValidProgram(flash_program)) bgfx.destroyProgram(flash_program);
+        if (isValidProgram(palette_program)) bgfx.destroyProgram(palette_program);
+        flash_program = .{ .idx = std.math.maxInt(u16) };
+        palette_program = .{ .idx = std.math.maxInt(u16) };
+        material_failed = true;
+        return;
+    }
+
+    s_lut_uniform = bgfx.createUniform("s_lut", .Sampler, 1);
+    u_material_color_uniform = bgfx.createUniform("u_material_color", .Vec4, 1);
+    u_material_params_uniform = bgfx.createUniform("u_material_params", .Vec4, 1);
+    if (!isValidHandle(s_lut_uniform.idx) or !isValidHandle(u_material_color_uniform.idx) or
+        !isValidHandle(u_material_params_uniform.idx))
+    {
+        std.log.err("bgfx: failed to create material uniforms; materials degrade to plain sprites", .{});
+        destroyMaterialPrograms();
+        material_failed = true;
+        return;
+    }
+
+    material_initialized = true;
+    std.log.info("bgfx: material programs initialized (renderer: {})", .{bgfx.getRendererType()});
+}
+
+/// Ensure the material programs are ready. Tries to build at most once (latches
+/// `material_failed`); cleared by `shutdownPrograms`. Returns true when both
+/// programs + all uniforms are valid.
+pub fn ensureMaterialPrograms() bool {
+    if (!material_initialized) {
+        if (material_failed) return false;
+        initMaterialPrograms();
+    }
+    return material_initialized;
+}
+
+fn destroyMaterialPrograms() void {
+    if (isValidProgram(flash_program)) bgfx.destroyProgram(flash_program);
+    if (isValidProgram(palette_program)) bgfx.destroyProgram(palette_program);
+    flash_program = .{ .idx = std.math.maxInt(u16) };
+    palette_program = .{ .idx = std.math.maxInt(u16) };
+    if (isValidHandle(s_lut_uniform.idx)) bgfx.destroyUniform(s_lut_uniform);
+    if (isValidHandle(u_material_color_uniform.idx)) bgfx.destroyUniform(u_material_color_uniform);
+    if (isValidHandle(u_material_params_uniform.idx)) bgfx.destroyUniform(u_material_params_uniform);
+    s_lut_uniform = .{ .idx = std.math.maxInt(u16) };
+    u_material_color_uniform = .{ .idx = std.math.maxInt(u16) };
+    u_material_params_uniform = .{ .idx = std.math.maxInt(u16) };
+    material_initialized = false;
+}
+
+/// Submit a material-shaded textured quad — the bgfx impl of labelle-core's
+/// optional `drawTextureProMaterial` contract. Mirrors `submitTexturedTriangles`
+/// but selects the effect's program, uploads the flat `MaterialUniforms` as two
+/// `vec4`s, and (for `palette_swap`) binds the LUT ramp at sampler unit 1.
+/// `lut_handle` is ignored for `flash`; the caller guarantees it is valid when
+/// `effect == .palette_swap` (a zero LUT degrades to the plain path upstream).
+/// No-ops (leaving the sprite undrawn) only if the programs failed to build; the
+/// draw site never falls back here, so the caller must have gated on
+/// `ensureMaterialPrograms`/`materialSupported` — see `texture.drawTextureProMaterial`.
+pub fn submitMaterialTriangles(
+    vertices: []const PosTexColorVertex,
+    texture_handle: bgfx.TextureHandle,
+    effect: MaterialEffect,
+    uniforms: MaterialUniforms,
+    lut_handle: bgfx.TextureHandle,
+) void {
+    // The material programs reuse the sprite path's `s_tex_uniform`, so the
+    // sprite shaders must be up first (they may not be if a material sprite is
+    // the very first draw). `ensureShadersInitialized` is idempotent.
+    ensureShadersInitialized();
+    if (!isValidHandle(s_tex_uniform.idx)) return;
+    if (!ensureMaterialPrograms()) return;
+    const program = switch (effect) {
+        .flash => flash_program,
+        .palette_swap => palette_program,
+        else => return, // dissolve/outline/none are not implemented by bgfx
+    };
+    if (!isValidProgram(program)) return;
+    ensureLayouts();
+
+    const identity = [16]f32{
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    };
+    bgfx.setViewTransform(active_view, &identity, &identity);
+
+    // Flat MaterialUniforms → two vec4s the shaders read (see fs_flash/fs_palette).
+    const color = [4]f32{ uniforms.r, uniforms.g, uniforms.b, uniforms.a };
+    const params = [4]f32{ uniforms.scalar0, uniforms.scalar1, @floatFromInt(uniforms.aux_count), 0.0 };
+    bgfx.setUniform(u_material_color_uniform, &color, 1);
+    bgfx.setUniform(u_material_params_uniform, &params, 1);
+
+    const num: u32 = @intCast(vertices.len);
+    var tvb: bgfx.TransientVertexBuffer = undefined;
+    bgfx.allocTransientVertexBuffer(&tvb, num, &vertex_layout);
+    const dest_ptr: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
+    @memcpy(dest_ptr[0..vertices.len], vertices);
+
+    bgfx.setTransientVertexBuffer(0, &tvb, 0, num);
+    bgfx.setTexture(0, s_tex_uniform, texture_handle, 0);
+    if (effect == .palette_swap) bgfx.setTexture(1, s_lut_uniform, lut_handle, 0);
+    bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
+    bgfx.submit(active_view, program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+}
+
 /// Destroy shader programs, uniforms, and textures, resetting to invalid sentinels.
 pub fn shutdownPrograms() void {
     if (isValidProgram(sprite_program)) {
@@ -334,6 +515,11 @@ pub fn shutdownPrograms() void {
     yuv_initialized = false;
     // Give the program one honest re-create attempt after a surface cycle.
     yuv_failed = false;
+
+    // Material programs (labelle-gfx#305) participate in the same teardown so an
+    // Android surface cycle re-creates them lazily on the next material draw.
+    destroyMaterialPrograms();
+    material_failed = false;
 
     // Hand off to the sibling modules that own their own bgfx
     // handles. Pre-split this loop and the font-atlas teardown lived

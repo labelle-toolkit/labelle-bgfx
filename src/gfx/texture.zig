@@ -6,10 +6,14 @@
 /// in the same pass as the shader uniforms.
 const std = @import("std");
 const bgfx = @import("zbgfx").bgfx;
+const core = @import("labelle-core");
 const types = @import("types.zig");
 const state = @import("state.zig");
 const programs = @import("programs.zig");
 const astc = @import("astc.zig");
+
+const MaterialEffect = core.backend_contract.MaterialEffect;
+const Material = core.backend_contract.Material;
 
 // stb_image goes through a tiny shim that empties out clang's nullability
 // qualifiers before include. Zig 0.16's translate-c rejects `_Nonnull` on
@@ -453,6 +457,64 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
 
     const vertices = buildQuadVertices(@intCast(texture.width), @intCast(texture.height), source, dest, origin, rotation, tint.toAbgr());
     programs.submitTexturedTriangles(&vertices, handle);
+}
+
+/// Which curated material effects this bgfx backend implements (labelle-gfx#305
+/// Slice B). The fine-grained gate `core.Backend(Impl).drawTextureProMaterial`
+/// consults before dispatching: `flash` + `palette_swap` are implemented;
+/// `dissolve`/`outline` (and `none`) are not, so they degrade to a plain sprite.
+/// Kept in sync with `programs.submitMaterialTriangles`'s effect switch.
+pub fn materialSupported(effect: MaterialEffect) bool {
+    return switch (effect) {
+        .flash, .palette_swap => true,
+        .dissolve, .outline, .none => false,
+    };
+}
+
+/// Material-aware sprite draw — the bgfx impl of labelle-core's optional
+/// `drawTextureProMaterial` contract (labelle-gfx#305). Same quad-build as
+/// `drawTexturePro`, but routes through the effect's material program with the
+/// `MaterialUniforms` uploaded (see `programs.submitMaterialTriangles`). The
+/// core wrapper only calls this for a supported, non-`none` effect, so the switch
+/// here handles just `flash` + `palette_swap`; anything else falls back to the
+/// plain sprite so a stray call can never leave the sprite undrawn.
+///
+/// `palette_swap` degrades to a PLAIN sprite when `aux_texture == 0` (no LUT
+/// bound) or the LUT handle is dead — never a crash, never a black quad (RFC §3).
+pub fn drawTextureProMaterial(
+    texture: Texture,
+    source: Rectangle,
+    dest: Rectangle,
+    origin: Vector2,
+    rotation: f32,
+    tint: Color,
+    material: Material,
+) void {
+    if (texture.id >= MAX_TEXTURES) return;
+    const handle = texture_handles[texture.id];
+    if (handle.idx == std.math.maxInt(u16)) return;
+
+    // Resolve the LUT ramp for palette_swap from the flat `aux_texture` handle
+    // (a plain texture-pool id, per the contract). A zero/dead handle degrades.
+    var lut_handle = bgfx.TextureHandle{ .idx = std.math.maxInt(u16) };
+    if (material.effect == .palette_swap) {
+        const lut_id = material.uniforms.aux_texture;
+        if (lut_id == 0 or lut_id >= MAX_TEXTURES) {
+            drawTexturePro(texture, source, dest, origin, rotation, tint);
+            return;
+        }
+        lut_handle = texture_handles[lut_id];
+        if (lut_handle.idx == std.math.maxInt(u16)) {
+            drawTexturePro(texture, source, dest, origin, rotation, tint);
+            return;
+        }
+    }
+
+    const vertices = buildQuadVertices(@intCast(texture.width), @intCast(texture.height), source, dest, origin, rotation, tint.toAbgr());
+    switch (material.effect) {
+        .flash, .palette_swap => programs.submitMaterialTriangles(&vertices, handle, material.effect, material.uniforms, lut_handle),
+        else => programs.submitTexturedTriangles(&vertices, handle),
+    }
 }
 
 /// Draw an externally-owned bgfx texture — one NOT in this module's pool —
