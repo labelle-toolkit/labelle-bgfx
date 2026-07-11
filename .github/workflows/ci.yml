@@ -44,6 +44,13 @@ jobs:
       # `zig build material-golden-bless` after an intentional shader change.
       - name: Material golden (flash + palette_swap)
         run: zig build material-golden
+      # Post-fx seam golden (labelle-gfx#305 P2 Slice B, RFC §2.4 / §6): render the
+      # fixed scene, run a bloom→crt stack through applyPostPass (render-target
+      # ping-pong), composite onto the primary, and diff the surfaceless capture
+      # against the committed golden TGA. Regenerate with
+      # `zig build post-fx-golden-bless` after an intentional shader change.
+      - name: Post-fx golden (bloom + crt)
+        run: zig build post-fx-golden
 
   # Integration: generate + cross-build the bgfx-android example (which now lives
   # here, not in labelle-assembler). Verifies the backend works end-to-end through

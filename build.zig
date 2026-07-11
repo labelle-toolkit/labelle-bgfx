@@ -451,14 +451,16 @@ pub fn build(b: *std.Build) void {
             window_m: *std.Build.Module,
             bgfx_a: *std.Build.Step.Compile,
             glfw_a: ?*std.Build.Step.Compile,
+            name_base: []const u8,
+            src_rel: []const u8,
             bless: bool,
         ) *std.Build.Step.Run {
             const opts = bb.addOptions();
             opts.addOption(bool, "bless", bless);
             const exe = bb.addExecutable(.{
-                .name = if (bless) "material_golden_bless" else "material_golden",
+                .name = bb.fmt("{s}{s}", .{ name_base, if (bless) "_bless" else "" }),
                 .root_module = bb.createModule(.{
-                    .root_source_file = bb.path("src/material_golden.zig"),
+                    .root_source_file = bb.path(src_rel),
                     .target = tgt,
                     .optimize = opt,
                     .link_libc = true,
@@ -477,13 +479,27 @@ pub fn build(b: *std.Build) void {
             return bb.addRunArtifact(exe);
         }
     };
-    const golden_check = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, false);
+    const golden_check = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "material_golden", "src/material_golden.zig", false);
     const golden_step = b.step("material-golden", "Diff the material flash + palette_swap scene against the committed golden (#305)");
     golden_step.dependOn(&golden_check.step);
 
-    const golden_bless_run = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, true);
+    const golden_bless_run = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "material_golden", "src/material_golden.zig", true);
     const golden_bless_step = b.step("material-golden-bless", "Regenerate the material golden TGA (#305)");
     golden_bless_step.dependOn(&golden_bless_run.step);
+
+    // ── Post-fx golden harness (labelle-gfx#305 P2 Slice B, RFC §2.4 / §6) ────
+    // `zig build post-fx-golden`       — render the fixed scene, run a bloom→crt
+    //     stack through applyPostPass (render-target ping-pong), and DIFF the
+    //     composited primary against the committed golden TGA (CI gate).
+    // `zig build post-fx-golden-bless` — regenerate + overwrite the golden.
+    // Same surfaceless offscreen path as the material golden. See src/post_fx_golden.zig.
+    const post_fx_golden_check = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "post_fx_golden", "src/post_fx_golden.zig", false);
+    const post_fx_golden_step = b.step("post-fx-golden", "Diff the bloom+crt post-fx stack against the committed golden (#305)");
+    post_fx_golden_step.dependOn(&post_fx_golden_check.step);
+
+    const post_fx_golden_bless_run = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "post_fx_golden", "src/post_fx_golden.zig", true);
+    const post_fx_golden_bless_step = b.step("post-fx-golden-bless", "Regenerate the post-fx golden TGA (#305)");
+    post_fx_golden_bless_step.dependOn(&post_fx_golden_bless_run.step);
 
     // ── Unit tests for the platform-dispatch helper ─────────────────
     // Always build + run on the host — platform.zig is pure Zig with

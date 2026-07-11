@@ -21,9 +21,15 @@
 
 const std = @import("std");
 const bgfx = @import("zbgfx").bgfx;
+const core = @import("labelle-core");
 const programs = @import("programs.zig");
 const texture = @import("texture.zig");
 const types = @import("types.zig");
+
+const PostPass = core.backend_contract.PostPass;
+const PostPassKind = core.backend_contract.PostPassKind;
+/// Opaque render-target handle shape (matches the contract + `gfx.RenderTargetId`).
+const RenderTargetId = core.backend_contract.RenderTargetId;
 
 const INVALID: u16 = std.math.maxInt(u16);
 
@@ -259,6 +265,57 @@ pub fn reset() void {
         view_in_use[id] = false;
         targets[id] = invalid_rt;
     }
+}
+
+// ── Post-fx sub-surface (full-screen pass stack, labelle-gfx#305 P2 Slice B) ──
+// The backend half of the post-fx seam: `applyPostPass` renders ONE full-screen
+// pass reading render target `src` and writing render target `dst`; the gfx
+// `PostFxDriver` (RFC §2.4) allocates the two ping-pong targets (via the opaque
+// `createId` above) and sequences the src→dst hops. `postPassSupported` advertises
+// which curated passes bgfx implements — all four, here. Both are optional,
+// `@hasDecl`-gated contract decls; forwarded out through `gfx.zig`.
+
+/// Which curated post-fx passes this bgfx backend implements (labelle-gfx#305).
+/// bgfx does all four built-ins (fs_bloom / fs_vignette / fs_color_grade /
+/// fs_crt). The gfx driver consults this before every pass; a `false` here would
+/// make the driver skip that pass (warn-once) and run the rest.
+pub fn postPassSupported(kind: PostPassKind) bool {
+    return switch (kind) {
+        .bloom, .vignette, .color_grade, .crt => true,
+    };
+}
+
+/// Apply ONE full-screen post-fx pass: sample render target `src`, write render
+/// target `dst`, under `pass`. No-ops on an unknown/identical id pair (the driver
+/// never passes those, but a stale id must not scribble). `color_grade` with a
+/// zero/dead LUT handle degrades to a straight `src`→`dst` blit (RFC §3) so the
+/// ping-pong chain stays contiguous — never a black frame. Uses the shared
+/// active-view stack (`begin`/`end`) exactly like the mirror path.
+pub fn applyPostPass(pass: PostPass, src: RenderTargetId, dst: RenderTargetId) void {
+    if (!validId(src) or !validId(dst) or src == dst) return;
+    const s = targets[src];
+    const d = targets[dst];
+
+    // Resolve the LUT strip for color_grade (a plain texture-pool handle). A
+    // zero/dead handle degrades to a passthrough blit rather than a black quad.
+    if (pass.kind == .color_grade) {
+        const lut_id = pass.uniforms.aux_texture;
+        const lut = texture.handleForId(lut_id);
+        if (lut_id == 0 or lut.idx == INVALID) {
+            begin(d);
+            programs.submitFullscreenBlit(s.color);
+            end();
+            return;
+        }
+        begin(d);
+        programs.submitPostPass(pass.kind, pass.uniforms, s.color, d.width, d.height, lut);
+        end();
+        return;
+    }
+
+    begin(d);
+    programs.submitPostPass(pass.kind, pass.uniforms, s.color, d.width, d.height, .{ .idx = INVALID });
+    end();
 }
 
 /// Make bgfx draw all render-target views (ids 1..next_view) BEFORE the primary

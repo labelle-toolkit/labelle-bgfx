@@ -58,8 +58,8 @@
         // unification target for the beginDrawing->beginFrame / getScreenWidth->
         // width / windowShouldClose->shouldQuit renames in this backend.
         .labelle_core = .{
-            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.25.0.tar.gz",
-            .hash = "labelle_core-1.25.0-OauRcA-3BgCbF6Y9NmYx_rgW_GZpR1AD_yeJinSVhvSl",
+            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.26.0.tar.gz",
+            .hash = "labelle_core-1.26.0-OauRcDwJBwDfNc5x2S_FBwPrTztNUb_8Ie4HSq8XUoAM",
         },
         // Shared audio engine (pluggable-backends RFC, Phase 2). The bgfx
         // backend's `src/audio.zig` collapses its duplicated WAV decode + PCM
