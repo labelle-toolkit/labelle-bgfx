@@ -48,17 +48,6 @@
                     "z_index": 6
                 }
             }
-        },
-        // Title label — bright white text; blooms at the edges.
-        {
-            "components": {
-                "Position": { "x": 400, "y": 500 },
-                "Text": {
-                    "text": "LaBelle post-fx",
-                    "size": 24,
-                    "color": { "r": 255, "g": 255, "b": 255, "a": 255 }
-                }
-            }
         }
     ]
 }
