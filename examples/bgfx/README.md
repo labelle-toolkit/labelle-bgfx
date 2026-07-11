@@ -75,15 +75,17 @@ gfx **1.28.0**, assembler **>= 0.80.0**, backend (this repo) **>= 0.11.0**.
 ## Note on the engine render path (gfx wiring)
 
 The declarative `.post_fx` stack reaches the framebuffer via the engine's
-**camera-aware** render path (`GfxRenderer.renderWithLayerHooks`). In the shipped
-**gfx 1.28.0** the `PostFxDriver.begin` / `.resolve` calls are wired only into
-the retained engine's *standalone* `render()`, which that camera-aware path does
-**not** call — so the passes need `renderWithLayerHooks` to wrap its layer loop
-with `post_fx.begin/resolve` (a small, behavior-preserving gfx fix — no-op when
-the stack is empty). The screenshots here were produced with that fix applied;
-the runtime API, assembler codegen, shaders, and headless driver seam are all
-otherwise exercised end-to-end. See the bgfx repo's `zig build post-fx-golden`
-and `post-fx-integration-golden` steps for the headless driver goldens.
+**camera-aware** render path (`GfxRenderer.renderWithLayerHooks`). Shipped
+**gfx 1.28.0** wired the `PostFxDriver.begin` / `.resolve` calls only into the
+retained engine's *standalone* `render()`, which that camera-aware path does
+**not** call — so through `labelle run` the stack was a no-op (before/after
+captures were pixel-identical). **gfx 1.28.1** (labelle-gfx#309) wraps
+`renderWithLayerHooks`' layer loop with `post_fx.begin/resolve` (a small,
+behavior-preserving change — no-op when the stack is empty); this example pins
+that version, and the screenshots here were produced with it. The runtime API,
+assembler codegen, shaders, and headless driver seam are otherwise exercised
+end-to-end — see the bgfx repo's `zig build post-fx-golden` and
+`post-fx-integration-golden` CI steps for the headless driver goldens.
 
 ## Scene format
 

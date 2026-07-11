@@ -17,14 +17,13 @@
     .y_axis = .up,
     .ecs = .mock,
     // Post-fx release pins (labelle-gfx#305 Phase 2).
-    //   NOTE: the declarative `.post_fx` effect only reaches the framebuffer
-    //   through the engine's camera-aware render path once gfx wires
-    //   post_fx.begin/resolve into `renderWithLayerHooks` (see README —
-    //   shipped gfx 1.28.0 wires it only into the standalone retained
-    //   render()). The screenshots were produced with that one-line gfx fix.
+    //   gfx 1.28.1 wires PostFxDriver.begin/resolve into the engine's
+    //   camera-aware render path (`renderWithLayerHooks`); shipped 1.28.0
+    //   wired it only into the standalone retained render(), so `.post_fx`
+    //   was a no-op through `labelle run`. See labelle-gfx#309 / the README.
     .core_version = "1.26.0",
     .engine_version = "2.4.0",
-    .gfx_version = "1.28.0",
+    .gfx_version = "1.28.1",
     // Local dev checkouts, resolved as siblings of the main labelle-bgfx
     // checkout (the standard monorepo dev layout). Keep them on their
     // respective mains: cli >= 1.55.x, assembler >= 0.80.0 (the version that

@@ -5,7 +5,7 @@
     .resolved = .{
         .core = .{ .version = "1.26.0" },
         .engine = .{ .version = "2.4.0" },
-        .gfx = .{ .version = "1.28.0" },
+        .gfx = .{ .version = "1.28.1" },
         .labelle = .{ .version = "local:../../../labelle-cli" },
     },
 }
