@@ -979,6 +979,10 @@ pub fn beginFrame() void {
     // runs every frame uniformly so HiDPI changes are picked up without a
     // dedicated resize callback.
     ensureSurface();
+    // Reset the per-frame transient post-fx view cursor (labelle-gfx#305) at the
+    // frame boundary, so each frame's post-fx passes reuse the same small view band
+    // (submit order == bgfx execution order) and it never exhausts across frames.
+    gfx.resetPostFxFrame();
     bgfx.setViewRect(0, 0, 0, @intCast(screen_w), @intCast(screen_h));
     // Touch view 0 so bgfx ALWAYS clears + presents it, even on a frame
     // with zero draw calls. `setViewRect` alone does NOT do this — bgfx

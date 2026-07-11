@@ -21,9 +21,15 @@
 
 const std = @import("std");
 const bgfx = @import("zbgfx").bgfx;
+const core = @import("labelle-core");
 const programs = @import("programs.zig");
 const texture = @import("texture.zig");
 const types = @import("types.zig");
+
+const PostPass = core.backend_contract.PostPass;
+const PostPassKind = core.backend_contract.PostPassKind;
+/// Opaque render-target handle shape (matches the contract + `gfx.RenderTargetId`).
+const RenderTargetId = core.backend_contract.RenderTargetId;
 
 const INVALID: u16 = std.math.maxInt(u16);
 
@@ -51,21 +57,59 @@ fn invalidTarget() RenderTarget {
 }
 
 /// bgfx's default cap is 256 views. View 0 is the primary (`programs.PRIMARY_VIEW`);
-/// render targets take ids 1..MAX_VIEW. Occupancy is tracked so ids RECYCLE on
-/// `destroy` — the cap is CONCURRENT, not lifetime, so a game that churns targets
-/// across level loads / resizes never permanently exhausts it.
+/// persistent render targets take ids 1..RT_VIEW_MAX. Occupancy is tracked so ids
+/// RECYCLE on `destroy` — the cap is CONCURRENT, not lifetime, so a game that
+/// churns targets across level loads / resizes never permanently exhausts it.
 const MAX_VIEW: u16 = 255;
+
+/// The TOP of the view range is reserved for PER-FRAME TRANSIENT post-fx views
+/// (`allocPostFxView`). A post-fx pass submits into a transient view whose id
+/// increases with pass order, so bgfx's ascending-view-id execution == the
+/// driver's SUBMISSION order regardless of which physical target is the pass's
+/// `dst`. This is the fix for labelle-gfx#305: the gfx `PostFxDriver`'s two-buffer
+/// ping-pong (scene→a, bloom a→b, crt b→a) mis-orders on an EVEN stack when a
+/// pass's submit view id is tied to its dst's IDENTITY (crt writes `a`, the LOWER
+/// id, so bgfx runs it before bloom writes `b`). Decoupling the submit view id
+/// from dst identity — a monotonic transient band — makes v1.28.0's efficient
+/// 2-buffer model correct on bgfx with NO driver change.
+const POSTFX_VIEW_BASE: u16 = 224;
+/// Persistent render-target views live BELOW the post-fx band.
+const RT_VIEW_MAX: u16 = POSTFX_VIEW_BASE - 1; // 223 concurrent RTs — ample
 var view_in_use = [_]bool{false} ** (MAX_VIEW + 1);
 
-/// First free render-target view id (1..MAX_VIEW), or null when all are taken.
-/// Never returns `PRIMARY_VIEW` (0). Split out so the bookkeeping is unit-testable
-/// without a live bgfx device.
+/// First free render-target view id (1..RT_VIEW_MAX), or null when all are taken.
+/// Never returns `PRIMARY_VIEW` (0) or a post-fx-band id. Split out so the
+/// bookkeeping is unit-testable without a live bgfx device.
 fn allocView() ?u16 {
     var id: u16 = 1;
-    while (id <= MAX_VIEW) : (id += 1) {
+    while (id <= RT_VIEW_MAX) : (id += 1) {
         if (!view_in_use[id]) return id;
     }
     return null;
+}
+
+/// Per-frame cursor for transient post-fx view ids (POSTFX_VIEW_BASE..MAX_VIEW).
+/// Reset every frame by `resetPostFxFrame` (called from `window.beginFrame`) so
+/// the small band is reused frame-to-frame and never exhausts across frames.
+var postfx_next_view: u16 = POSTFX_VIEW_BASE;
+
+/// Reset the transient post-fx view cursor to the base of the band. Called once
+/// per frame at frame start; zero-cost (a single store) and harmless on frames
+/// with no post-fx. Keeping the reset at the frame boundary — not inside the
+/// pass chain — is what bounds the band to `#passes` ids per frame.
+pub fn resetPostFxFrame() void {
+    postfx_next_view = POSTFX_VIEW_BASE;
+}
+
+/// Hand out the next transient post-fx view id for THIS frame. Monotonic within a
+/// frame (so submit order == bgfx execution order), reset each frame. Clamps at
+/// the top of the band: an absurdly long stack (> band size) reuses the last id
+/// (a degraded pixel, never an out-of-range view or an RT-band collision) rather
+/// than wrapping into the persistent RT range.
+fn allocPostFxView() u16 {
+    const v = postfx_next_view;
+    if (postfx_next_view < MAX_VIEW) postfx_next_view += 1;
+    return v;
 }
 
 /// Create an offscreen render target sized `w`×`h`. Returns an INVALID target
@@ -251,7 +295,7 @@ pub fn destroyId(id: u32) void {
 ///      `beginRenderTarget`/`drawRenderTarget` with handles from the dead context.
 pub fn reset() void {
     var id: u16 = 1;
-    while (id <= MAX_VIEW) : (id += 1) {
+    while (id <= RT_VIEW_MAX) : (id += 1) {
         if (view_in_use[id] and targets[id].fb.idx != INVALID) {
             bgfx.setViewFrameBuffer(id, .{ .idx = INVALID });
             bgfx.destroyFrameBuffer(targets[id].fb);
@@ -259,36 +303,125 @@ pub fn reset() void {
         view_in_use[id] = false;
         targets[id] = invalid_rt;
     }
+    // Unbind the transient post-fx band too: `applyPostPass` binds a destroyed
+    // target's framebuffer to a band view for a single submit, and though a band
+    // view never draws until rebound, dropping the binding here keeps no stale
+    // framebuffer handle referenced into a torn-down (Android surface-loss) context.
+    id = POSTFX_VIEW_BASE;
+    while (id <= MAX_VIEW) : (id += 1) {
+        bgfx.setViewFrameBuffer(id, .{ .idx = INVALID });
+    }
+    postfx_next_view = POSTFX_VIEW_BASE;
 }
 
-/// Make bgfx draw all render-target views (ids 1..next_view) BEFORE the primary
-/// view, regardless of bgfx's default ascending-id order. Without this the
-/// primary (view 0) composites first and a mirror samples last frame's target.
-/// Idempotent; re-issued by `create` whenever the view range grows.
+// ── Post-fx sub-surface (full-screen pass stack, labelle-gfx#305 P2 Slice B) ──
+// The backend half of the post-fx seam: `applyPostPass` renders ONE full-screen
+// pass reading render target `src` and writing render target `dst`; the gfx
+// `PostFxDriver` (RFC §2.4) allocates the two ping-pong targets (via the opaque
+// `createId` above) and sequences the src→dst hops. `postPassSupported` advertises
+// which curated passes bgfx implements — all four, here. Both are optional,
+// `@hasDecl`-gated contract decls; forwarded out through `gfx.zig`.
+
+/// Which curated post-fx passes this bgfx backend implements (labelle-gfx#305).
+/// bgfx does all four built-ins (fs_bloom / fs_vignette / fs_color_grade /
+/// fs_crt). The gfx driver consults this before every pass; a `false` here would
+/// make the driver skip that pass (warn-once) and run the rest.
+pub fn postPassSupported(kind: PostPassKind) bool {
+    return switch (kind) {
+        .bloom, .vignette, .color_grade, .crt => true,
+    };
+}
+
+/// Apply ONE full-screen post-fx pass: sample render target `src`, write render
+/// target `dst`, under `pass`. No-ops on an unknown/identical id pair (the driver
+/// never passes those, but a stale id must not scribble). `color_grade` with a
+/// zero/dead LUT handle degrades to a straight `src`→`dst` blit (RFC §3) so the
+/// ping-pong chain stays contiguous — never a black frame.
+///
+/// Ordering (labelle-gfx#305 fix): the pass does NOT submit into `dst`'s OWN view
+/// (whose id is tied to `dst`'s identity — the source of the ping-pong mis-order
+/// on an even stack). It submits into a fresh MONOTONIC transient post-fx view
+/// (`allocPostFxView`) bound to `dst`'s framebuffer for this submit. bgfx executes
+/// views in ascending id order and `sequenceViews` sorts the whole post-fx band
+/// AFTER the scene's RT views and BEFORE the primary, so submit order == execution
+/// order and every pass reads a target only after the earlier pass has written it.
+pub fn applyPostPass(pass: PostPass, src: RenderTargetId, dst: RenderTargetId) void {
+    if (!validId(src) or !validId(dst) or src == dst) return;
+    const s = targets[src];
+    const d = targets[dst];
+
+    // Bind dst's framebuffer to a fresh transient view for THIS submit. The view
+    // id — not dst's identity — drives execution order. A full-screen opaque
+    // replace owns every dst texel, so no clear is needed (ClearFlags_None).
+    const view = allocPostFxView();
+    bgfx.setViewFrameBuffer(view, d.fb);
+    bgfx.setViewRect(view, 0, 0, d.width, d.height);
+    bgfx.setViewClear(view, bgfx.ClearFlags_None, 0, 1.0, 0);
+
+    const saved = programs.activeView();
+    programs.setActiveView(view);
+    defer programs.setActiveView(saved);
+
+    // Resolve the LUT strip for color_grade (a plain texture-pool handle). A
+    // zero/dead handle degrades to a passthrough blit rather than a black quad.
+    if (pass.kind == .color_grade) {
+        const lut_id = pass.uniforms.aux_texture;
+        const lut = texture.handleForId(lut_id);
+        if (lut_id == 0 or lut.idx == INVALID) {
+            programs.submitFullscreenBlit(s.color);
+            return;
+        }
+        programs.submitPostPass(pass.kind, pass.uniforms, s.color, d.width, d.height, lut);
+        return;
+    }
+
+    programs.submitPostPass(pass.kind, pass.uniforms, s.color, d.width, d.height, .{ .idx = INVALID });
+}
+
+/// Make bgfx draw the scene's render-target views, THEN the transient post-fx
+/// band, THEN the primary — regardless of bgfx's default ascending-id order.
+/// Without this the primary (view 0) composites first and a mirror / post-fx
+/// resolve samples last frame's target. Idempotent; re-issued by `create`
+/// whenever the view range grows.
+///
+/// Order emitted (covers the full [0, MAX_VIEW] range exactly once):
+///   1. live persistent RT views (1..RT_VIEW_MAX), ascending — the scene targets;
+///      they feed both mirrors and the post-fx passes, so they run first;
+///   2. the ENTIRE post-fx band (POSTFX_VIEW_BASE..MAX_VIEW), ascending — a pass
+///      submits into a monotonic transient view here (`applyPostPass`), so this
+///      band runs AFTER the scene targets and BEFORE the primary, and within it
+///      pass order == id order == execution order (the #305 fix);
+///   3. the PRIMARY (0) — composites last;
+///   4. the free RT-band ids — inert (no draws), slot position irrelevant.
 ///
 /// Only ever called once at least one target exists, so a game that uses no
 /// render targets keeps bgfx's untouched default order (primary first) — zero
 /// behavioural change on the common path.
 fn sequenceViews() void {
-    // Remap the WHOLE view range so the order is correct regardless of how
-    // sparse the live ids are (recycling leaves gaps): live render-target views
-    // first (they feed the primary), then PRIMARY, then the free ids (inert —
-    // they carry no draws, so their slot position is irrelevant). Covering the
-    // full [0, MAX_VIEW] range is what makes a live RT with a high id still sort
-    // before the primary.
     var order: [MAX_VIEW + 1]bgfx.ViewId = undefined;
     var n: u16 = 0;
+    // 1. live persistent RT views (scene targets), ascending.
     var id: u16 = 1;
-    while (id <= MAX_VIEW) : (id += 1) {
+    while (id <= RT_VIEW_MAX) : (id += 1) {
         if (view_in_use[id]) {
             order[n] = id;
             n += 1;
         }
     }
-    order[n] = programs.PRIMARY_VIEW; // 0 composites last
-    n += 1;
-    id = 1;
+    // 2. the whole post-fx transient band, ascending — after the scene targets,
+    //    before the primary. Included unconditionally: an unused band view carries
+    //    no draws, so its slot is harmless, and this keeps the relative order fixed.
+    id = POSTFX_VIEW_BASE;
     while (id <= MAX_VIEW) : (id += 1) {
+        order[n] = id;
+        n += 1;
+    }
+    // 3. PRIMARY composites last.
+    order[n] = programs.PRIMARY_VIEW; // 0
+    n += 1;
+    // 4. free RT-band ids (inert).
+    id = 1;
+    while (id <= RT_VIEW_MAX) : (id += 1) {
         if (!view_in_use[id]) {
             order[n] = id;
             n += 1;

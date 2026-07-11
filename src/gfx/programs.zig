@@ -11,6 +11,8 @@ const font_mod = @import("font.zig");
 
 const MaterialEffect = core.backend_contract.MaterialEffect;
 const MaterialUniforms = core.backend_contract.MaterialUniforms;
+const PostPassKind = core.backend_contract.PostPassKind;
+const PostPassUniforms = core.backend_contract.PostPassUniforms;
 
 // Blend helpers matching bgfx C macros.
 // BGFX_STATE_BLEND_FUNC_SEPARATE(_srcRGB, _dstRGB, _srcA, _dstA):
@@ -477,6 +479,200 @@ pub fn submitMaterialTriangles(
     bgfx.submit(active_view, program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
 }
 
+// ── Post-fx programs (full-screen passes, labelle-gfx#305 P2 Slice B) ──────────
+// Four programs — one per `PostPassKind` — each `vs_sprite` + a post-fx fragment
+// shader (fs_bloom / fs_vignette / fs_color_grade / fs_crt), following the SAME
+// lazy-build + latch-fail pattern as the material programs. Where a material draw
+// shades a sprite quad, a post pass shades a FULL-SCREEN NDC quad that samples one
+// render target's colour texture (`src`) and writes another (`dst`) — the gfx
+// ping-pong driver (RFC §2.4) sequences those src→dst hops; the backend only owns
+// this single primitive. Three shared `vec4` uniforms carry the flat
+// `PostPassUniforms`; `color_grade` additionally binds its LUT strip at unit 1.
+//   u_postfx_params = (scalar0, scalar1, scalar2, scalar3)
+//   u_postfx_color  = (r, g, b, 0)                       — vignette tint
+//   u_postfx_texel  = (1/w, 1/h, w, h)                   — src/dst pixel size
+var bloom_program: bgfx.ProgramHandle = .{ .idx = std.math.maxInt(u16) };
+var vignette_program: bgfx.ProgramHandle = .{ .idx = std.math.maxInt(u16) };
+var color_grade_program: bgfx.ProgramHandle = .{ .idx = std.math.maxInt(u16) };
+var crt_program: bgfx.ProgramHandle = .{ .idx = std.math.maxInt(u16) };
+var s_postfx_lut_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+var u_postfx_params_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+var u_postfx_color_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+var u_postfx_texel_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+var postfx_initialized: bool = false;
+/// Latches a build/link failure so `ensurePostFxPrograms` retries at most once
+/// (mirrors `material_failed` / `yuv_failed`). Cleared by `shutdownPrograms`.
+var postfx_failed: bool = false;
+
+/// Lazily build all four post-fx programs + their shared uniforms. On any failure
+/// tears the whole group down and latches `postfx_failed`, so the post-fx stack
+/// degrades to a no-op (the gfx driver then renders straight to the backbuffer)
+/// rather than crashing or leaking a handle per frame.
+fn initPostFxPrograms() void {
+    if (postfx_initialized) return;
+
+    bloom_program = buildMaterialProgram(materialFsData("fs_bloom"));
+    vignette_program = buildMaterialProgram(materialFsData("fs_vignette"));
+    color_grade_program = buildMaterialProgram(materialFsData("fs_color_grade"));
+    crt_program = buildMaterialProgram(materialFsData("fs_crt"));
+    if (!isValidProgram(bloom_program) or !isValidProgram(vignette_program) or
+        !isValidProgram(color_grade_program) or !isValidProgram(crt_program))
+    {
+        std.log.err("bgfx: failed to build post-fx programs (link failed on this renderer); post-fx stack degrades to a no-op", .{});
+        destroyPostFxPrograms();
+        postfx_failed = true;
+        return;
+    }
+
+    s_postfx_lut_uniform = bgfx.createUniform("s_lut", .Sampler, 1);
+    u_postfx_params_uniform = bgfx.createUniform("u_postfx_params", .Vec4, 1);
+    u_postfx_color_uniform = bgfx.createUniform("u_postfx_color", .Vec4, 1);
+    u_postfx_texel_uniform = bgfx.createUniform("u_postfx_texel", .Vec4, 1);
+    if (!isValidHandle(s_postfx_lut_uniform.idx) or !isValidHandle(u_postfx_params_uniform.idx) or
+        !isValidHandle(u_postfx_color_uniform.idx) or !isValidHandle(u_postfx_texel_uniform.idx))
+    {
+        std.log.err("bgfx: failed to create post-fx uniforms; post-fx stack degrades to a no-op", .{});
+        destroyPostFxPrograms();
+        postfx_failed = true;
+        return;
+    }
+
+    postfx_initialized = true;
+    std.log.info("bgfx: post-fx programs initialized (renderer: {})", .{bgfx.getRendererType()});
+}
+
+/// Ensure the post-fx programs are ready. Tries to build at most once (latches
+/// `postfx_failed`); cleared by `shutdownPrograms`. Returns true when all four
+/// programs + every uniform are valid.
+pub fn ensurePostFxPrograms() bool {
+    if (!postfx_initialized) {
+        if (postfx_failed) return false;
+        initPostFxPrograms();
+    }
+    return postfx_initialized;
+}
+
+fn destroyPostFxPrograms() void {
+    inline for (.{ &bloom_program, &vignette_program, &color_grade_program, &crt_program }) |p| {
+        if (isValidProgram(p.*)) bgfx.destroyProgram(p.*);
+        p.* = .{ .idx = std.math.maxInt(u16) };
+    }
+    inline for (.{ &s_postfx_lut_uniform, &u_postfx_params_uniform, &u_postfx_color_uniform, &u_postfx_texel_uniform }) |u| {
+        if (isValidHandle(u.*.idx)) bgfx.destroyUniform(u.*);
+        u.* = .{ .idx = std.math.maxInt(u16) };
+    }
+    postfx_initialized = false;
+}
+
+/// The two triangles of a full-screen quad in NDC (top = +1, matching
+/// `state.toNdcY`) with UV 0..1 (top-left = 0,0, matching `drawTexturePro`'s
+/// source→dest mapping) so a plain sample of `src` writes an upright, pixel-
+/// aligned copy into `dst` (identity on a top-left-origin backend). Vertex colour
+/// is white — the post-fx shaders ignore `v_color0`.
+fn fullscreenQuad() [6]PosTexColorVertex {
+    const white: u32 = 0xFFFFFFFF;
+    return .{
+        .{ .x = -1.0, .y = 1.0, .u = 0.0, .v = 0.0, .abgr = white }, // top-left
+        .{ .x = 1.0, .y = 1.0, .u = 1.0, .v = 0.0, .abgr = white }, // top-right
+        .{ .x = 1.0, .y = -1.0, .u = 1.0, .v = 1.0, .abgr = white }, // bottom-right
+        .{ .x = -1.0, .y = 1.0, .u = 0.0, .v = 0.0, .abgr = white }, // top-left
+        .{ .x = 1.0, .y = -1.0, .u = 1.0, .v = 1.0, .abgr = white }, // bottom-right
+        .{ .x = -1.0, .y = -1.0, .u = 0.0, .v = 1.0, .abgr = white }, // bottom-left
+    };
+}
+
+/// Submit a full-screen post-fx pass into the ACTIVE view (the `dst` render
+/// target — `render_target.applyPostPass` has already `begin`d it): sample
+/// `src_color` through the pass's program with the flat `PostPassUniforms`
+/// marshalled to the three shared `vec4`s, writing an opaque full-screen quad.
+/// `dst_w`/`dst_h` size the texel uniform (src and dst share the design canvas,
+/// so they double as the src sample size). `lut_handle` is bound at unit 1 for
+/// `color_grade` only (its caller guarantees a valid handle; a zero/dead LUT is
+/// blitted straight through upstream). No-ops if the programs failed to build,
+/// so the pass is skipped rather than black-holing the frame.
+pub fn submitPostPass(
+    kind: PostPassKind,
+    uniforms: PostPassUniforms,
+    src_color: bgfx.TextureHandle,
+    dst_w: u16,
+    dst_h: u16,
+    lut_handle: bgfx.TextureHandle,
+) void {
+    // Post programs reuse the sprite path's `s_tex_uniform`; make sure it exists
+    // even if a post pass is somehow the very first submit of the frame.
+    ensureShadersInitialized();
+    if (!isValidHandle(s_tex_uniform.idx)) return;
+    if (!ensurePostFxPrograms()) return;
+    const program = switch (kind) {
+        .bloom => bloom_program,
+        .vignette => vignette_program,
+        .color_grade => color_grade_program,
+        .crt => crt_program,
+    };
+    if (!isValidProgram(program)) return;
+    ensureLayouts();
+
+    const identity = [16]f32{
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    };
+    bgfx.setViewTransform(active_view, &identity, &identity);
+
+    const params = [4]f32{ uniforms.scalar0, uniforms.scalar1, uniforms.scalar2, uniforms.scalar3 };
+    const color = [4]f32{ uniforms.r, uniforms.g, uniforms.b, 0.0 };
+    const w_f: f32 = @floatFromInt(@max(dst_w, 1));
+    const h_f: f32 = @floatFromInt(@max(dst_h, 1));
+    const texel = [4]f32{ 1.0 / w_f, 1.0 / h_f, w_f, h_f };
+    bgfx.setUniform(u_postfx_params_uniform, &params, 1);
+    bgfx.setUniform(u_postfx_color_uniform, &color, 1);
+    bgfx.setUniform(u_postfx_texel_uniform, &texel, 1);
+
+    const verts = fullscreenQuad();
+    var tvb: bgfx.TransientVertexBuffer = undefined;
+    bgfx.allocTransientVertexBuffer(&tvb, verts.len, &vertex_layout);
+    const dest_ptr: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
+    @memcpy(dest_ptr[0..verts.len], &verts);
+
+    bgfx.setTransientVertexBuffer(0, &tvb, 0, @intCast(verts.len));
+    bgfx.setTexture(0, s_tex_uniform, src_color, 0);
+    if (kind == .color_grade) bgfx.setTexture(1, s_postfx_lut_uniform, lut_handle, 0);
+    // Opaque full-screen replace (no blend) — the pass owns every dst texel.
+    bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA, 0);
+    bgfx.submit(active_view, program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+}
+
+/// Blit `src_color` full-screen into the ACTIVE view (the already-`begin`d `dst`
+/// target) through the plain sprite program — the identity copy the post-fx
+/// driver uses to propagate `src`→`dst` when a pass degrades (e.g. `color_grade`
+/// with no LUT) so the ping-pong chain stays contiguous instead of black-holing.
+pub fn submitFullscreenBlit(src_color: bgfx.TextureHandle) void {
+    ensureShadersInitialized();
+    if (!isValidProgram(sprite_program)) return;
+    if (!isValidHandle(s_tex_uniform.idx)) return;
+    ensureLayouts();
+
+    const identity = [16]f32{
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    };
+    bgfx.setViewTransform(active_view, &identity, &identity);
+
+    const verts = fullscreenQuad();
+    var tvb: bgfx.TransientVertexBuffer = undefined;
+    bgfx.allocTransientVertexBuffer(&tvb, verts.len, &vertex_layout);
+    const dest_ptr: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
+    @memcpy(dest_ptr[0..verts.len], &verts);
+
+    bgfx.setTransientVertexBuffer(0, &tvb, 0, @intCast(verts.len));
+    bgfx.setTexture(0, s_tex_uniform, src_color, 0);
+    bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA, 0);
+    bgfx.submit(active_view, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+}
+
 /// Destroy shader programs, uniforms, and textures, resetting to invalid sentinels.
 pub fn shutdownPrograms() void {
     if (isValidProgram(sprite_program)) {
@@ -520,6 +716,11 @@ pub fn shutdownPrograms() void {
     // Android surface cycle re-creates them lazily on the next material draw.
     destroyMaterialPrograms();
     material_failed = false;
+
+    // Post-fx programs (labelle-gfx#305 P2) share the same teardown so an Android
+    // surface cycle re-creates them lazily on the next post-fx pass.
+    destroyPostFxPrograms();
+    postfx_failed = false;
 
     // Hand off to the sibling modules that own their own bgfx
     // handles. Pre-split this loop and the font-atlas teardown lived

@@ -131,4 +131,15 @@
     // assembler parses manifests with `ignore_unknown_fields = true`, so this
     // forward-looking field is inert until the resolve-side mirror lands.
     .material_effects = .{ .flash, .palette_swap },
+
+    // Curated post-fx passes this backend implements (labelle-gfx#305 P2) — the
+    // `.capabilities` mirror of `core.postFxCapabilities(bgfxImpl)` / the runtime
+    // `postPassSupported`. Advertised as DATA (same rationale as
+    // `.material_effects`) so a project declaring an unsupported pass surfaces at
+    // generate/resolve time rather than a silent per-frame skip (RFC §2.4 / §3,
+    // wired resolve-side in P3). bgfx implements all four built-ins via
+    // `applyPostPass` (src/gfx/render_target.zig) + the fs_bloom / fs_vignette /
+    // fs_color_grade / fs_crt programs (src/gfx/programs.zig `submitPostPass`).
+    // Inert until the resolve-side mirror lands (`ignore_unknown_fields = true`).
+    .post_fx_passes = .{ .bloom, .vignette, .color_grade, .crt },
 }

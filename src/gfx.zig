@@ -197,6 +197,24 @@ pub const destroyRenderTarget = render_target.destroyId; // (id: u32)
 // Android surface loss) — called by window.teardownSurface. Not for game code.
 pub const resetRenderTargets = render_target.reset;
 
+// Post-fx seam (labelle-gfx#305 P2 Slice B). Optional `@hasDecl`-gated contract
+// decls on top of the render-target sub-surface: `core.Backend(Impl).applyPostPass`
+// renders one full-screen pass (`src`→`dst`) driven by the gfx ping-pong, and
+// `postPassSupported` is the fine-grained gate. bgfx implements all four built-in
+// passes (bloom / vignette / color_grade / crt).
+pub const applyPostPass = render_target.applyPostPass;
+pub const postPassSupported = render_target.postPassSupported;
+// Reset the per-frame transient post-fx view cursor (labelle-gfx#305). Called
+// from `window.beginFrame` at frame start so the transient view band the post-fx
+// passes submit into is reused each frame and never exhausts. Zero-cost (a single
+// store) and a no-op semantically on frames with no post-fx.
+pub const resetPostFxFrame = render_target.resetPostFxFrame;
+// Re-export the post-fx value types so consumers (and the golden harness) can
+// build a `PostPass` without importing labelle-core directly.
+pub const PostPass = core.backend_contract.PostPass;
+pub const PostPassKind = core.backend_contract.PostPassKind;
+pub const PostPassUniforms = core.backend_contract.PostPassUniforms;
+
 // ── In-engine video (#549 Path A) ──────────────────────────────────────
 // VideoPlayer wires a decoder → dynamic texture → drawTexturePro. Generic over
 // the decoder so the same player drives ffmpeg (desktop) or AMediaCodec
