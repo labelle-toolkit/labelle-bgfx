@@ -158,6 +158,12 @@ pub const unloadTexture = texture.unloadTexture;
 pub const createDynamicTexture = texture.createDynamicTexture;
 pub const updateTexture = texture.updateTexture;
 pub const drawTexturePro = texture.drawTexturePro;
+// Material seam (labelle-gfx#305 Slice B). Optional `@hasDecl`-gated contract
+// decls: `core.Backend(Impl).drawTextureProMaterial` dispatches here for a
+// supported non-`none` effect, and `materialSupported` is the fine-grained gate.
+// bgfx implements `flash` + `palette_swap`; other effects degrade to plain sprites.
+pub const drawTextureProMaterial = texture.drawTextureProMaterial;
+pub const materialSupported = texture.materialSupported;
 // GPU-compressed (ASTC) upload — the labelle-gfx `loadTextureFromMemory` seam
 // dispatches to these via `@hasDecl` when the blob is compressed (#341).
 pub const isCompressed = texture.isCompressed;

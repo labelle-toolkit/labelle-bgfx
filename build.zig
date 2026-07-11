@@ -435,6 +435,56 @@ pub fn build(b: *std.Build) void {
     const probe_step = b.step("headless-probe", "Run the headless bgfx feasibility probe (#36)");
     probe_step.dependOn(&b.addRunArtifact(probe).step);
 
+    // ── Material golden harness (labelle-gfx#305 Slice B, RFC §6) ────────────
+    // `zig build material-golden`       — render the fixed flash + palette_swap
+    //     scene headless and DIFF it against the committed golden TGA (CI gate).
+    // `zig build material-golden-bless` — regenerate + overwrite the golden.
+    // Runs surfaceless (Metal/Vulkan offscreen FB) exactly like the probes, so it
+    // needs a GPU device but NO window/display server. See src/material_golden.zig.
+    const GoldenBuild = struct {
+        fn make(
+            bb: *std.Build,
+            tgt: std.Build.ResolvedTarget,
+            opt: std.builtin.OptimizeMode,
+            zbgfx_m: *std.Build.Module,
+            gfx_m: *std.Build.Module,
+            window_m: *std.Build.Module,
+            bgfx_a: *std.Build.Step.Compile,
+            glfw_a: ?*std.Build.Step.Compile,
+            bless: bool,
+        ) *std.Build.Step.Run {
+            const opts = bb.addOptions();
+            opts.addOption(bool, "bless", bless);
+            const exe = bb.addExecutable(.{
+                .name = if (bless) "material_golden_bless" else "material_golden",
+                .root_module = bb.createModule(.{
+                    .root_source_file = bb.path("src/material_golden.zig"),
+                    .target = tgt,
+                    .optimize = opt,
+                    .link_libc = true,
+                }),
+            });
+            exe.root_module.addImport("zbgfx", zbgfx_m);
+            exe.root_module.addImport("gfx", gfx_m);
+            exe.root_module.addImport("window", window_m);
+            exe.root_module.addOptions("golden_options", opts);
+            exe.root_module.linkLibrary(bgfx_a);
+            if (glfw_a) |a| exe.root_module.linkLibrary(a);
+            if (tgt.result.os.tag == .windows) {
+                exe.root_module.linkSystemLibrary("gdi32", .{});
+                exe.root_module.linkSystemLibrary("user32", .{});
+            }
+            return bb.addRunArtifact(exe);
+        }
+    };
+    const golden_check = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, false);
+    const golden_step = b.step("material-golden", "Diff the material flash + palette_swap scene against the committed golden (#305)");
+    golden_step.dependOn(&golden_check.step);
+
+    const golden_bless_run = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, true);
+    const golden_bless_step = b.step("material-golden-bless", "Regenerate the material golden TGA (#305)");
+    golden_bless_step.dependOn(&golden_bless_run.step);
+
     // ── Unit tests for the platform-dispatch helper ─────────────────
     // Always build + run on the host — platform.zig is pure Zig with
     // no native deps, and pinning to the host keeps the tests

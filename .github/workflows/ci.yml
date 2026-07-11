@@ -37,6 +37,13 @@ jobs:
             bgfx-${{ runner.os }}-
       - name: Build + test
         run: zig build test
+      # Material seam golden (labelle-gfx#305 Slice B, RFC §6): render the fixed
+      # flash + palette_swap scene surfaceless (Metal offscreen FB — the
+      # macos-latest Apple-Silicon runner has a Metal device + a GUI session) and
+      # diff it against the committed golden TGA. Regenerate with
+      # `zig build material-golden-bless` after an intentional shader change.
+      - name: Material golden (flash + palette_swap)
+        run: zig build material-golden
 
   # Integration: generate + cross-build the bgfx-android example (which now lives
   # here, not in labelle-assembler). Verifies the backend works end-to-end through
