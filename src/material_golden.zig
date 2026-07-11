@@ -1,7 +1,10 @@
 //! Headless golden harness for the bgfx material seam (labelle-gfx#305 Slice B,
-//! RFC-MATERIAL-POSTFX §6). Renders a FIXED scene — one sprite with the `flash`
-//! material (amount 0.6 toward red) and one sprite with `palette_swap` (a 4-entry
-//! index atlas recoloured through a LUT ramp) — FULLY headless (surfaceless bgfx,
+//! RFC-MATERIAL-POSTFX §6). Renders a FIXED scene covering the FULL curated
+//! material set — `flash` (amount 0.6 toward red), `palette_swap` (a 4-entry
+//! index atlas recoloured through a LUT ramp), `dissolve` (a solid sprite
+//! burned away by the built-in procedural noise at threshold 0.5 with an orange
+//! edge glow), and `outline` (a transparent-background shape wrapped in a green
+//! alpha-dilated silhouette) — FULLY headless (surfaceless bgfx,
 //! Metal/Vulkan offscreen framebuffer, no window / no display server, the
 //! `initHeadless` path proven by `mirror_probe` / `screenshot_probe`), then
 //! captures the offscreen framebuffer to an uncompressed 32-bit TGA via
@@ -35,13 +38,13 @@ const window = @import("window");
 // variant; `zig build material-golden` compiles the check variant.
 const options = @import("golden_options");
 
-const W: u16 = 192;
+const W: u16 = 288;
 const H: u16 = 96;
 
-const GOLDEN_BASE: [:0]const u8 = "test/golden/material_flash_palette";
-const GOLDEN_PATH: [:0]const u8 = "test/golden/material_flash_palette.tga";
-const CANDIDATE_BASE: [:0]const u8 = "zig-out/material_flash_palette_candidate";
-const CANDIDATE_PATH: [:0]const u8 = "zig-out/material_flash_palette_candidate.tga";
+const GOLDEN_BASE: [:0]const u8 = "test/golden/material_effects";
+const GOLDEN_PATH: [:0]const u8 = "test/golden/material_effects.tga";
+const CANDIDATE_BASE: [:0]const u8 = "zig-out/material_effects_candidate";
+const CANDIDATE_PATH: [:0]const u8 = "zig-out/material_effects_candidate.tga";
 
 // Diff tolerance: GPU rasterisation is not bit-exact across drivers/refreshes, so
 // allow a small per-channel delta and a tiny fraction of outlier pixels. A broken
@@ -123,6 +126,31 @@ fn makeIndexAtlas(w: u32, h: u32, n: u32) gfx.DecodedImage {
     return .{ .pixels = px, .width = w, .height = h };
 }
 
+/// Build the `outline` subject: a `w`×`h` sprite that is fully transparent
+/// except a centred opaque square of side `inner` (white). The transparent
+/// border is what lets the alpha-dilated silhouette show up INSIDE the quad —
+/// an all-opaque sprite would have no transparent texels for the outline to
+/// fill. The atlas is clamp-sampled, so outline taps past the sprite edge read
+/// the (transparent) border texel, not a neighbouring frame.
+fn makeShape(w: u32, h: u32, inner: u32, r: u8, g: u8, b: u8) gfx.DecodedImage {
+    const px = std.heap.page_allocator.alloc(u8, w * h * 4) catch unreachable;
+    const lo_x = (w - inner) / 2;
+    const lo_y = (h - inner) / 2;
+    var y: u32 = 0;
+    while (y < h) : (y += 1) {
+        var x: u32 = 0;
+        while (x < w) : (x += 1) {
+            const o = (y * w + x) * 4;
+            const solid = x >= lo_x and x < lo_x + inner and y >= lo_y and y < lo_y + inner;
+            px[o] = if (solid) r else 0;
+            px[o + 1] = if (solid) g else 0;
+            px[o + 2] = if (solid) b else 0;
+            px[o + 3] = if (solid) 255 else 0;
+        }
+    }
+    return .{ .pixels = px, .width = w, .height = h };
+}
+
 /// Build the LUT ramp: `n`×1 RGBA, one distinct colour per entry.
 fn makeLut(colors: []const [3]u8) gfx.DecodedImage {
     const n: u32 = @intCast(colors.len);
@@ -149,6 +177,10 @@ fn renderScene() void {
         .{ 40, 90, 230 }, // index 2 → blue
         .{ 230, 210, 40 }, // index 3 → yellow
     })) catch unreachable;
+    // dissolve subject: another solid sprite the procedural noise burns away.
+    const burn = gfx.uploadTexture(makeSolid(48, 48, 90, 160, 200)) catch unreachable;
+    // outline subject: an opaque 24px square on a transparent 48px field.
+    const shape = gfx.uploadTexture(makeShape(48, 48, 24, 235, 235, 235)) catch unreachable;
 
     // A couple of begin/draw/end cycles so the offscreen FB holds the scene
     // before captureHeadless blits it (belt-and-braces, matching the probes).
@@ -160,26 +192,52 @@ fn renderScene() void {
         const src48 = gfx.Rectangle{ .x = 0, .y = 0, .width = 48, .height = 48 };
         const origin = gfx.Vector2{ .x = 0, .y = 0 };
 
-        // Left: the GPU hit-flash — gray mixed 0.6 toward red → reddish sprite.
+        // Four 48px sprites across the 288px canvas (12px left margin, 24px gaps).
+        // Col 1: the GPU hit-flash — gray mixed 0.6 toward red → reddish sprite.
         gfx.drawTextureProMaterial(
             gray,
             src48,
-            .{ .x = 24, .y = 24, .width = 48, .height = 48 },
+            .{ .x = 12, .y = 24, .width = 48, .height = 48 },
             origin,
             0,
             gfx.white,
             .{ .effect = .flash, .uniforms = .{ .r = 1, .g = 0, .b = 0, .a = 1, .scalar0 = 0.6 } },
         );
 
-        // Right: palette_swap — the 4-band index atlas recoloured via the LUT.
+        // Col 2: palette_swap — the 4-band index atlas recoloured via the LUT.
         gfx.drawTextureProMaterial(
             atlas,
             src48,
-            .{ .x = 120, .y = 24, .width = 48, .height = 48 },
+            .{ .x = 84, .y = 24, .width = 48, .height = 48 },
             origin,
             0,
             gfx.white,
             .{ .effect = .palette_swap, .uniforms = .{ .aux_texture = lut.id, .aux_count = 4 } },
+        );
+
+        // Col 3: dissolve — the solid sprite burned away by the built-in
+        // procedural noise at threshold 0.5, an orange glow on the burn front
+        // (edge_width 6px). aux_texture = 0 → procedural noise (no bound texture).
+        gfx.drawTextureProMaterial(
+            burn,
+            src48,
+            .{ .x = 156, .y = 24, .width = 48, .height = 48 },
+            origin,
+            0,
+            gfx.white,
+            .{ .effect = .dissolve, .uniforms = .{ .r = 1.0, .g = 0.5, .b = 0.1, .scalar0 = 0.5, .scalar1 = 6.0 } },
+        );
+
+        // Col 4: outline — the transparent-field square wrapped in a green
+        // silhouette (thickness 3px, softness 0.4 feather).
+        gfx.drawTextureProMaterial(
+            shape,
+            src48,
+            .{ .x = 228, .y = 24, .width = 48, .height = 48 },
+            origin,
+            0,
+            gfx.white,
+            .{ .effect = .outline, .uniforms = .{ .r = 0.1, .g = 0.9, .b = 0.2, .a = 1.0, .scalar0 = 3.0, .scalar1 = 0.4 } },
         );
 
         window.endFrame();

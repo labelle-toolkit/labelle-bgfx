@@ -459,15 +459,16 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
     programs.submitTexturedTriangles(&vertices, handle);
 }
 
-/// Which curated material effects this bgfx backend implements (labelle-gfx#305
-/// Slice B). The fine-grained gate `core.Backend(Impl).drawTextureProMaterial`
-/// consults before dispatching: `flash` + `palette_swap` are implemented;
-/// `dissolve`/`outline` (and `none`) are not, so they degrade to a plain sprite.
-/// Kept in sync with `programs.submitMaterialTriangles`'s effect switch.
+/// Which curated material effects this bgfx backend implements (labelle-gfx#305).
+/// The fine-grained gate `core.Backend(Impl).drawTextureProMaterial` consults
+/// before dispatching: the full curated set — `flash`, `palette_swap`,
+/// `dissolve`, `outline` — is implemented; only `none` (the no-material fast
+/// path) returns false. Kept in sync with `programs.submitMaterialTriangles`'s
+/// effect switch + the `.material_effects` capability manifests.
 pub fn materialSupported(effect: MaterialEffect) bool {
     return switch (effect) {
-        .flash, .palette_swap => true,
-        .dissolve, .outline, .none => false,
+        .flash, .palette_swap, .dissolve, .outline => true,
+        .none => false,
     };
 }
 
@@ -476,11 +477,14 @@ pub fn materialSupported(effect: MaterialEffect) bool {
 /// `drawTexturePro`, but routes through the effect's material program with the
 /// `MaterialUniforms` uploaded (see `programs.submitMaterialTriangles`). The
 /// core wrapper only calls this for a supported, non-`none` effect, so the switch
-/// here handles just `flash` + `palette_swap`; anything else falls back to the
-/// plain sprite so a stray call can never leave the sprite undrawn.
+/// here handles the full curated set (`flash`, `palette_swap`, `dissolve`,
+/// `outline`); anything else falls back to the plain sprite so a stray call can
+/// never leave the sprite undrawn.
 ///
 /// `palette_swap` degrades to a PLAIN sprite when `aux_texture == 0` (no LUT
 /// bound) or the LUT handle is dead — never a crash, never a black quad (RFC §3).
+/// `dissolve` NEVER degrades: its noise texture is optional (`aux_texture == 0`
+/// → built-in procedural noise) and a dead handle falls back to procedural.
 pub fn drawTextureProMaterial(
     texture: Texture,
     source: Rectangle,
@@ -494,25 +498,52 @@ pub fn drawTextureProMaterial(
     const handle = texture_handles[texture.id];
     if (handle.idx == std.math.maxInt(u16)) return;
 
-    // Resolve the LUT ramp for palette_swap from the flat `aux_texture` handle
-    // (a plain texture-pool id, per the contract). A zero/dead handle degrades.
-    var lut_handle = bgfx.TextureHandle{ .idx = std.math.maxInt(u16) };
-    if (material.effect == .palette_swap) {
-        const lut_id = material.uniforms.aux_texture;
-        if (lut_id == 0 or lut_id >= MAX_TEXTURES) {
-            drawTexturePro(texture, source, dest, origin, rotation, tint);
-            return;
-        }
-        lut_handle = texture_handles[lut_id];
-        if (lut_handle.idx == std.math.maxInt(u16)) {
-            drawTexturePro(texture, source, dest, origin, rotation, tint);
-            return;
-        }
+    // The aux texture bound at sampler unit 1: the LUT ramp for palette_swap,
+    // the optional noise texture for dissolve. `mat` is a mutable copy so a
+    // dead/absent dissolve noise handle can be normalised to the procedural path.
+    var mat = material;
+    var aux_handle = bgfx.TextureHandle{ .idx = std.math.maxInt(u16) };
+    switch (material.effect) {
+        .palette_swap => {
+            // A zero/dead LUT degrades to a plain sprite (RFC §3).
+            const lut_id = material.uniforms.aux_texture;
+            if (lut_id == 0 or lut_id >= MAX_TEXTURES) {
+                drawTexturePro(texture, source, dest, origin, rotation, tint);
+                return;
+            }
+            aux_handle = texture_handles[lut_id];
+            if (aux_handle.idx == std.math.maxInt(u16)) {
+                drawTexturePro(texture, source, dest, origin, rotation, tint);
+                return;
+            }
+        },
+        .dissolve => {
+            // Optional noise texture; fall back to procedural (bind the sprite's
+            // own texture as a valid dummy) on absent/out-of-range/dead handles.
+            aux_handle = handle;
+            const noise_id = material.uniforms.aux_texture;
+            if (noise_id != 0 and noise_id < MAX_TEXTURES and
+                texture_handles[noise_id].idx != std.math.maxInt(u16))
+            {
+                aux_handle = texture_handles[noise_id];
+            } else {
+                mat.uniforms.aux_texture = 0; // signal procedural (params.w = 0)
+            }
+        },
+        else => {},
     }
 
     const vertices = buildQuadVertices(@intCast(texture.width), @intCast(texture.height), source, dest, origin, rotation, tint.toAbgr());
     switch (material.effect) {
-        .flash, .palette_swap => programs.submitMaterialTriangles(&vertices, handle, material.effect, material.uniforms, lut_handle),
+        .flash, .palette_swap, .dissolve, .outline => programs.submitMaterialTriangles(
+            &vertices,
+            handle,
+            mat.effect,
+            mat.uniforms,
+            aux_handle,
+            @intCast(texture.width),
+            @intCast(texture.height),
+        ),
         else => programs.submitTexturedTriangles(&vertices, handle),
     }
 }

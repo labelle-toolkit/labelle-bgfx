@@ -75,10 +75,11 @@
     // as DATA so a project declaring an unsupported effect surfaces at
     // generate/resolve time instead of silently degrading per-frame
     // (RFC-MATERIAL-POSTFX §1.2 / §3; resolve-side wiring is P3). bgfx implements
-    // `flash` + `palette_swap` (src/gfx/texture.zig `materialSupported`);
-    // `dissolve` / `outline` are unimplemented and degrade to a plain sprite.
-    // Parsed with `ignore_unknown_fields = true`, so inert until the mirror lands.
-    .material_effects = .{ .flash, .palette_swap },
+    // the FULL curated set — `flash`, `palette_swap`, `dissolve`, `outline`
+    // (src/gfx/texture.zig `materialSupported`; fs_flash/fs_palette/fs_dissolve/
+    // fs_outline). Parsed with `ignore_unknown_fields = true`, so inert until the
+    // mirror lands.
+    .material_effects = .{ .flash, .palette_swap, .dissolve, .outline },
 
     // Curated post-fx passes this backend implements (labelle-gfx#305 P2) — the
     // `.capabilities` mirror of `core.postFxCapabilities(bgfxImpl)`. Advertised as

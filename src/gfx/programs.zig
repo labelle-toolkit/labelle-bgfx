@@ -309,13 +309,23 @@ pub fn ensureYuvProgram() bool {
 // sprite path (the material draw degrades — no crash). One program per effect:
 //   `flash_program`   ← fs_flash   (mix sprite→flash colour by amount)
 //   `palette_program` ← fs_palette (recolour by red-channel index via `s_lut`)
-// Both share two `vec4` uniforms (`u_material_color`/`u_material_params`) mapping
-// the flat `MaterialUniforms`; palette additionally binds a LUT sampler at unit 1.
+// All four share two `vec4` uniforms (`u_material_color`/`u_material_params`)
+// mapping the flat `MaterialUniforms`; palette + dissolve additionally bind an
+// aux sampler at unit 1 (`s_lut` — the LUT ramp for palette, the optional noise
+// texture for dissolve); outline additionally reads `u_material_texel` (the
+// sprite texture's pixel size) to turn a px thickness into a UV offset.
+//   `flash_program`    ← fs_flash    (mix sprite→flash colour by amount)
+//   `palette_program`  ← fs_palette  (recolour by red-channel index via `s_lut`)
+//   `dissolve_program` ← fs_dissolve (noise-gated burn-away + edge glow)
+//   `outline_program`  ← fs_outline  (8-tap alpha-dilated silhouette)
 var flash_program: bgfx.ProgramHandle = .{ .idx = std.math.maxInt(u16) };
 var palette_program: bgfx.ProgramHandle = .{ .idx = std.math.maxInt(u16) };
+var dissolve_program: bgfx.ProgramHandle = .{ .idx = std.math.maxInt(u16) };
+var outline_program: bgfx.ProgramHandle = .{ .idx = std.math.maxInt(u16) };
 var s_lut_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var u_material_color_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var u_material_params_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+var u_material_texel_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var material_initialized: bool = false;
 /// Latches a build/link failure so `ensureMaterialPrograms` retries at most once
 /// (mirrors `yuv_failed`) — a per-frame re-create would leak + exhaust the handle
@@ -371,12 +381,13 @@ fn initMaterialPrograms() void {
 
     flash_program = buildMaterialProgram(materialFsData("fs_flash"));
     palette_program = buildMaterialProgram(materialFsData("fs_palette"));
-    if (!isValidProgram(flash_program) or !isValidProgram(palette_program)) {
+    dissolve_program = buildMaterialProgram(materialFsData("fs_dissolve"));
+    outline_program = buildMaterialProgram(materialFsData("fs_outline"));
+    if (!isValidProgram(flash_program) or !isValidProgram(palette_program) or
+        !isValidProgram(dissolve_program) or !isValidProgram(outline_program))
+    {
         std.log.err("bgfx: failed to build material programs (link failed on this renderer); materials degrade to plain sprites", .{});
-        if (isValidProgram(flash_program)) bgfx.destroyProgram(flash_program);
-        if (isValidProgram(palette_program)) bgfx.destroyProgram(palette_program);
-        flash_program = .{ .idx = std.math.maxInt(u16) };
-        palette_program = .{ .idx = std.math.maxInt(u16) };
+        destroyMaterialPrograms();
         material_failed = true;
         return;
     }
@@ -384,8 +395,9 @@ fn initMaterialPrograms() void {
     s_lut_uniform = bgfx.createUniform("s_lut", .Sampler, 1);
     u_material_color_uniform = bgfx.createUniform("u_material_color", .Vec4, 1);
     u_material_params_uniform = bgfx.createUniform("u_material_params", .Vec4, 1);
+    u_material_texel_uniform = bgfx.createUniform("u_material_texel", .Vec4, 1);
     if (!isValidHandle(s_lut_uniform.idx) or !isValidHandle(u_material_color_uniform.idx) or
-        !isValidHandle(u_material_params_uniform.idx))
+        !isValidHandle(u_material_params_uniform.idx) or !isValidHandle(u_material_texel_uniform.idx))
     {
         std.log.err("bgfx: failed to create material uniforms; materials degrade to plain sprites", .{});
         destroyMaterialPrograms();
@@ -409,16 +421,14 @@ pub fn ensureMaterialPrograms() bool {
 }
 
 fn destroyMaterialPrograms() void {
-    if (isValidProgram(flash_program)) bgfx.destroyProgram(flash_program);
-    if (isValidProgram(palette_program)) bgfx.destroyProgram(palette_program);
-    flash_program = .{ .idx = std.math.maxInt(u16) };
-    palette_program = .{ .idx = std.math.maxInt(u16) };
-    if (isValidHandle(s_lut_uniform.idx)) bgfx.destroyUniform(s_lut_uniform);
-    if (isValidHandle(u_material_color_uniform.idx)) bgfx.destroyUniform(u_material_color_uniform);
-    if (isValidHandle(u_material_params_uniform.idx)) bgfx.destroyUniform(u_material_params_uniform);
-    s_lut_uniform = .{ .idx = std.math.maxInt(u16) };
-    u_material_color_uniform = .{ .idx = std.math.maxInt(u16) };
-    u_material_params_uniform = .{ .idx = std.math.maxInt(u16) };
+    inline for (.{ &flash_program, &palette_program, &dissolve_program, &outline_program }) |p| {
+        if (isValidProgram(p.*)) bgfx.destroyProgram(p.*);
+        p.* = .{ .idx = std.math.maxInt(u16) };
+    }
+    inline for (.{ &s_lut_uniform, &u_material_color_uniform, &u_material_params_uniform, &u_material_texel_uniform }) |u| {
+        if (isValidHandle(u.*.idx)) bgfx.destroyUniform(u.*);
+        u.* = .{ .idx = std.math.maxInt(u16) };
+    }
     material_initialized = false;
 }
 
@@ -426,17 +436,25 @@ fn destroyMaterialPrograms() void {
 /// optional `drawTextureProMaterial` contract. Mirrors `submitTexturedTriangles`
 /// but selects the effect's program, uploads the flat `MaterialUniforms` as two
 /// `vec4`s, and (for `palette_swap`) binds the LUT ramp at sampler unit 1.
-/// `lut_handle` is ignored for `flash`; the caller guarantees it is valid when
-/// `effect == .palette_swap` (a zero LUT degrades to the plain path upstream).
-/// No-ops (leaving the sprite undrawn) only if the programs failed to build; the
-/// draw site never falls back here, so the caller must have gated on
-/// `ensureMaterialPrograms`/`materialSupported` — see `texture.drawTextureProMaterial`.
+/// `lut_handle` is the aux texture bound at unit 1 (sampler `s_lut`): the LUT
+/// ramp for `palette_swap`, the noise texture for `dissolve`. It is ignored for
+/// `flash`/`outline`; the caller guarantees it is valid whenever it is sampled
+/// (`palette_swap` with a zero LUT degrades to the plain path upstream; the
+/// `dissolve` procedural path binds the sprite's own texture as a harmless dummy
+/// so unit 1 is never an unbound-sampler read). `tex_w`/`tex_h` are the sprite
+/// texture's pixel dimensions, used to build `u_material_texel` for `outline`
+/// (px thickness → UV offset). No-ops (leaving the sprite undrawn) only if the
+/// programs failed to build; the draw site never falls back here, so the caller
+/// must have gated on `ensureMaterialPrograms`/`materialSupported` — see
+/// `texture.drawTextureProMaterial`.
 pub fn submitMaterialTriangles(
     vertices: []const PosTexColorVertex,
     texture_handle: bgfx.TextureHandle,
     effect: MaterialEffect,
     uniforms: MaterialUniforms,
     lut_handle: bgfx.TextureHandle,
+    tex_w: u32,
+    tex_h: u32,
 ) void {
     // The material programs reuse the sprite path's `s_tex_uniform`, so the
     // sprite shaders must be up first (they may not be if a material sprite is
@@ -447,7 +465,9 @@ pub fn submitMaterialTriangles(
     const program = switch (effect) {
         .flash => flash_program,
         .palette_swap => palette_program,
-        else => return, // dissolve/outline/none are not implemented by bgfx
+        .dissolve => dissolve_program,
+        .outline => outline_program,
+        else => return, // none is not a material draw
     };
     if (!isValidProgram(program)) return;
     ensureLayouts();
@@ -460,11 +480,21 @@ pub fn submitMaterialTriangles(
     };
     bgfx.setViewTransform(active_view, &identity, &identity);
 
-    // Flat MaterialUniforms → two vec4s the shaders read (see fs_flash/fs_palette).
+    // Flat MaterialUniforms → the vec4s the shaders read (see the fs_* sources).
+    // params.w carries the `dissolve` use-noise-texture flag (1 when a real noise
+    // texture is bound at s_lut, 0 for the built-in procedural noise); it is 0
+    // for every other effect. params.z is `palette_swap`'s ramp entry count.
     const color = [4]f32{ uniforms.r, uniforms.g, uniforms.b, uniforms.a };
-    const params = [4]f32{ uniforms.scalar0, uniforms.scalar1, @floatFromInt(uniforms.aux_count), 0.0 };
+    const use_noise: f32 = if (effect == .dissolve and uniforms.aux_texture != 0) 1.0 else 0.0;
+    const params = [4]f32{ uniforms.scalar0, uniforms.scalar1, @floatFromInt(uniforms.aux_count), use_noise };
     bgfx.setUniform(u_material_color_uniform, &color, 1);
     bgfx.setUniform(u_material_params_uniform, &params, 1);
+    // Texel size (1/w, 1/h, w, h) for `outline`'s px→UV thickness. Harmless to
+    // set for the other programs (they don't declare it).
+    const w_f: f32 = @floatFromInt(@max(tex_w, 1));
+    const h_f: f32 = @floatFromInt(@max(tex_h, 1));
+    const texel = [4]f32{ 1.0 / w_f, 1.0 / h_f, w_f, h_f };
+    bgfx.setUniform(u_material_texel_uniform, &texel, 1);
 
     const num: u32 = @intCast(vertices.len);
     var tvb: bgfx.TransientVertexBuffer = undefined;
@@ -474,7 +504,8 @@ pub fn submitMaterialTriangles(
 
     bgfx.setTransientVertexBuffer(0, &tvb, 0, num);
     bgfx.setTexture(0, s_tex_uniform, texture_handle, 0);
-    if (effect == .palette_swap) bgfx.setTexture(1, s_lut_uniform, lut_handle, 0);
+    // palette_swap + dissolve sample the aux texture at unit 1 (`s_lut`).
+    if (effect == .palette_swap or effect == .dissolve) bgfx.setTexture(1, s_lut_uniform, lut_handle, 0);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
     bgfx.submit(active_view, program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
 }
