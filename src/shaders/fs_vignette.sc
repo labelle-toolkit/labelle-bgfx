@@ -14,10 +14,13 @@ uniform vec4 u_postfx_color;
 
 void main()
 {
-	vec3 base = texture2D(s_tex, v_texcoord0).rgb;
+	vec4 src = texture2D(s_tex, v_texcoord0);
+	vec3 base = src.rgb;
 	vec2 d = v_texcoord0 - vec2(0.5, 0.5);
 	float dist = length(d) * 1.41421356; // 0 at centre … ~1 at the corner
 	float edge = smoothstep(u_postfx_params.y, u_postfx_params.y + max(u_postfx_params.z, 0.0001), dist);
 	vec3 col = mix(base, u_postfx_color.rgb, edge * clamp(u_postfx_params.x, 0.0, 1.0));
-	gl_FragColor = vec4(col, 1.0);
+	// Preserve the source alpha (don't force opaque) so transparent regions stay
+	// transparent through the composite.
+	gl_FragColor = vec4(col, src.a);
 }

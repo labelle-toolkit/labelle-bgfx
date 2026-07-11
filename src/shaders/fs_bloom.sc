@@ -19,7 +19,8 @@ uniform vec4 u_postfx_texel;
 void main()
 {
 	vec2 uv = v_texcoord0;
-	vec3 base = texture2D(s_tex, uv).rgb;
+	vec4 src = texture2D(s_tex, uv);
+	vec3 base = src.rgb;
 	float threshold = u_postfx_params.x;
 	vec2 step_uv = u_postfx_texel.xy * max(u_postfx_params.z, 0.0);
 	vec3 sum = vec3(0.0, 0.0, 0.0);
@@ -36,5 +37,7 @@ void main()
 		}
 	}
 	vec3 bloom = sum / max(wsum, 0.0001);
-	gl_FragColor = vec4(base + bloom * u_postfx_params.y, 1.0);
+	// Preserve the source alpha (don't force opaque) — transparent scene regions
+	// must stay transparent so the final composite doesn't cover the background.
+	gl_FragColor = vec4(base + bloom * u_postfx_params.y, src.a);
 }

@@ -24,10 +24,19 @@ void main()
 	col.r = texture2D(s_tex, warp + vec2(ab, 0.0)).r;
 	col.g = texture2D(s_tex, warp).g;
 	col.b = texture2D(s_tex, warp - vec2(ab, 0.0)).b;
+	// Carry the source alpha (from the primary/green tap) so transparent regions
+	// stay transparent rather than being forced opaque.
+	float srcA = texture2D(s_tex, warp).a;
 
 	// Outside the warped image → black (the tube bezel).
 	float inside = step(0.0, warp.x) * step(warp.x, 1.0) * step(0.0, warp.y) * step(warp.y, 1.0);
 	col *= inside;
+	// Gate alpha by the same tube mask, but toward OPAQUE outside: inside the tube
+	// the source alpha is preserved (Fix 3 — transparent scene regions stay
+	// transparent in the visible image); outside, `warp` is out of bounds so the
+	// sampled `srcA` is an unpredictable clamped-edge value — force it to 1.0 so
+	// the bezel is a deterministic opaque-black CRT frame (the authentic look).
+	srcA = mix(1.0, srcA, inside);
 
 	// Scanlines: darken alternate rows by `scanline`.
 	float lines = 0.5 + 0.5 * abs(sin(warp.y * u_postfx_texel.w * 3.14159265));
@@ -37,5 +46,5 @@ void main()
 	float stripe = 0.6 + 0.4 * step(0.5, fract(warp.x * u_postfx_texel.z / 3.0));
 	float m = mix(1.0, stripe, clamp(u_postfx_params.z, 0.0, 1.0));
 
-	gl_FragColor = vec4(col * scan * m, 1.0);
+	gl_FragColor = vec4(col * scan * m, srcA);
 }
