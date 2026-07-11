@@ -998,6 +998,47 @@ pub fn beginFrame() void {
     bgfx.touch(0);
 }
 
+/// Clamp an `i32` screen coordinate into bgfx's `u16` viewport range so a
+/// negative or oversized rect can't underflow / wrap the cast.
+fn clampViewportDim(v: i32) u16 {
+    if (v <= 0) return 0;
+    if (v >= std.math.maxInt(u16)) return std.math.maxInt(u16);
+    return @intCast(v);
+}
+
+/// Apply a screen-space viewport to the main draw view (labelle-engine#761
+/// Phase 2/3). Sizes view 0 (`setViewRect`) and clips its draws to the rect
+/// (`setViewScissor`). Origin is top-left (bgfx convention), matching the
+/// engine's `Camera.viewport` / gfx `ScreenViewport`. This is the real
+/// backend hook the gfx renderer's per-camera `applyViewport` calls; a
+/// backend without it (older/stub) falls back to full-window rendering.
+///
+/// Scope note: all gfx draws currently submit to view 0, and this scopes
+/// that one view. So it delivers a SINGLE authored viewport correctly —
+/// letterbox / minimap / picture-in-picture / a single-camera viewport.
+/// TRUE simultaneous N-camera split-screen (each camera composited into its
+/// own rect in one frame) additionally requires the gfx renderer to submit
+/// each camera to its OWN bgfx view id; with a shared view 0 the last
+/// camera's rect wins. That per-camera-view refactor is the remaining
+/// split-screen piece (tracked on #761); the rect/scissor math here is what
+/// it will drive per view.
+pub fn setViewport(x: i32, y: i32, w: i32, h: i32) void {
+    const vx = clampViewportDim(x);
+    const vy = clampViewportDim(y);
+    const vw = clampViewportDim(w);
+    const vh = clampViewportDim(h);
+    bgfx.setViewRect(0, vx, vy, vw, vh);
+    bgfx.setViewScissor(0, vx, vy, vw, vh);
+}
+
+/// Restore full-window rendering — counterpart to `setViewport`. Resets view
+/// 0 to the whole framebuffer and disables the scissor (an all-zero rect is
+/// bgfx's "scissor off" sentinel).
+pub fn clearViewport() void {
+    bgfx.setViewRect(0, 0, 0, @intCast(screen_w), @intCast(screen_h));
+    bgfx.setViewScissor(0, 0, 0, 0, 0);
+}
+
 const INVALID_HANDLE: u16 = std.math.maxInt(u16);
 
 /// Pending screenshot path, set by `takeScreenshot` and consumed by the
