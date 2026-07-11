@@ -3,9 +3,12 @@
 //! material set — `flash` (amount 0.6 toward red), `palette_swap` (a 4-entry
 //! index atlas recoloured through a LUT ramp), `dissolve` (a solid sprite
 //! burned away by the built-in procedural noise at threshold 0.5 with an orange
-//! edge glow), and `outline` (TWO subjects: an opaque square with base.a ∈
-//! {0,1}, and an anti-aliased soft disc whose fractional-alpha boundary
-//! exercises the over-operator composite) — FULLY headless (surfaceless bgfx,
+//! edge glow), and `outline` (an opaque square, an anti-aliased soft disc whose
+//! fractional-alpha boundary exercises the over-operator composite, an ATLAS
+//! sub-rect frame whose opaque red neighbour must NOT bleed into the outline,
+//! and a tint.a=0.5 case whose outline fades with the sprite). An atlas
+//! `dissolve` frame guards the sprite-local noise remap too — FULLY headless
+//! (surfaceless bgfx,
 //! Metal/Vulkan offscreen framebuffer, no window / no display server, the
 //! `initHeadless` path proven by `mirror_probe` / `screenshot_probe`), then
 //! captures the offscreen framebuffer to an uncompressed 32-bit TGA via
@@ -39,7 +42,7 @@ const window = @import("window");
 // variant; `zig build material-golden` compiles the check variant.
 const options = @import("golden_options");
 
-const W: u16 = 360;
+const W: u16 = 576;
 const H: u16 = 96;
 
 const GOLDEN_BASE: [:0]const u8 = "test/golden/material_effects";
@@ -194,6 +197,45 @@ fn makeLut(colors: []const [3]u8) gfx.DecodedImage {
     return .{ .pixels = px, .width = n, .height = 1 };
 }
 
+/// Build a 2-frame ATLAS (`fw`×`h`, two side-by-side `fw/2`-wide frames):
+///   frame 0 (left)  = a small opaque `inner`-px square (colour rgb0) on a
+///                     transparent field — the material subject, drawn from the
+///                     source sub-rect (0,0,fw/2,h).
+///   frame 1 (right) = solid OPAQUE `rgb1` — the "neighbouring frame" whose
+///                     content an atlas-unaware outline would bleed. Its opaque
+///                     pixels start right at the frame-0/frame-1 seam, so taps
+///                     from transparent frame-0 pixels near the seam reach it.
+/// The point: with the per-frame tap gate, the outline must NOT show along
+/// frame 0's right edge (adjacent to the opaque neighbour); without it, a green
+/// outline bleeds there.
+fn makeAtlas2(fw: u32, h: u32, inner: u32, r0: u8, g0: u8, b0: u8, r1: u8, g1: u8, b1: u8) gfx.DecodedImage {
+    const px = std.heap.page_allocator.alloc(u8, fw * h * 4) catch unreachable;
+    const half = fw / 2;
+    // Centre the opaque square within frame 0.
+    const lo_x = (half - inner) / 2;
+    const lo_y = (h - inner) / 2;
+    var y: u32 = 0;
+    while (y < h) : (y += 1) {
+        var x: u32 = 0;
+        while (x < fw) : (x += 1) {
+            const o = (y * fw + x) * 4;
+            if (x < half) {
+                const solid = x >= lo_x and x < lo_x + inner and y >= lo_y and y < lo_y + inner;
+                px[o] = if (solid) r0 else 0;
+                px[o + 1] = if (solid) g0 else 0;
+                px[o + 2] = if (solid) b0 else 0;
+                px[o + 3] = if (solid) 255 else 0;
+            } else {
+                px[o] = r1;
+                px[o + 1] = g1;
+                px[o + 2] = b1;
+                px[o + 3] = 255;
+            }
+        }
+    }
+    return .{ .pixels = px, .width = fw, .height = h };
+}
+
 fn renderScene() void {
     gfx.setScreenSize(W, H);
     gfx.setDesignSize(W, H);
@@ -214,6 +256,11 @@ fn renderScene() void {
     // outline subject with ANTI-ALIASED edges: a soft disc so base.a is fractional
     // along its boundary (exercises the over-operator composite — see makeSoftDisc).
     const disc = gfx.uploadTexture(makeSoftDisc(48, 48, 15.0, 3.0, 235, 235, 235)) catch unreachable;
+    // ATLAS subject: a 96x48 texture, frame 0 = a small opaque square on
+    // transparent, frame 1 = solid opaque red. Drawn from frame 0's sub-rect; the
+    // opaque red neighbour is what an atlas-unaware outline/dissolve would bleed
+    // or mis-scale against. Guards the u_material_rect fixes (#1, #2).
+    const atlas2 = gfx.uploadTexture(makeAtlas2(96, 48, 20, 235, 235, 235, 210, 40, 40)) catch unreachable;
 
     // A couple of begin/draw/end cycles so the offscreen FB holds the scene
     // before captureHeadless blits it (belt-and-braces, matching the probes).
@@ -283,6 +330,49 @@ fn renderScene() void {
             origin,
             0,
             gfx.white,
+            .{ .effect = .outline, .uniforms = .{ .r = 0.1, .g = 0.9, .b = 0.2, .a = 1.0, .scalar0 = 3.0, .scalar1 = 0.4 } },
+        );
+
+        // Col 6: ATLAS outline — frame 0 of the 96px atlas (sub-rect 0..48) whose
+        // neighbour frame 1 (48..96) is solid opaque red. The per-frame tap gate
+        // must keep the green outline OFF frame 0's right edge (no red-neighbour
+        // bleed). Guards #2.
+        const atlas_f0 = gfx.Rectangle{ .x = 0, .y = 0, .width = 48, .height = 48 };
+        gfx.drawTextureProMaterial(
+            atlas2,
+            atlas_f0,
+            .{ .x = 372, .y = 24, .width = 48, .height = 48 },
+            origin,
+            0,
+            gfx.white,
+            .{ .effect = .outline, .uniforms = .{ .r = 0.1, .g = 0.9, .b = 0.2, .a = 1.0, .scalar0 = 3.0, .scalar1 = 0.4 } },
+        );
+
+        // Col 7: ATLAS dissolve — frame 1 (sub-rect 48..96, solid red) burned by
+        // the procedural noise remapped to sprite-LOCAL UV, so the noise cell size
+        // is per-frame-consistent (not scaled by the frame's atlas fraction).
+        // Guards #1.
+        const atlas_f1 = gfx.Rectangle{ .x = 48, .y = 0, .width = 48, .height = 48 };
+        gfx.drawTextureProMaterial(
+            atlas2,
+            atlas_f1,
+            .{ .x = 444, .y = 24, .width = 48, .height = 48 },
+            origin,
+            0,
+            gfx.white,
+            .{ .effect = .dissolve, .uniforms = .{ .r = 1.0, .g = 0.5, .b = 0.1, .scalar0 = 0.5, .scalar1 = 6.0 } },
+        );
+
+        // Col 8: TINT-FADED outline — the opaque square at tint.a = 0.5. The
+        // outline must fade WITH the sprite (outline_a scales by v_color0.a), so
+        // it reads ~half-strength vs col 4. Guards #3.
+        gfx.drawTextureProMaterial(
+            shape,
+            src48,
+            .{ .x = 516, .y = 24, .width = 48, .height = 48 },
+            origin,
+            0,
+            gfx.Color{ .r = 255, .g = 255, .b = 255, .a = 128 },
             .{ .effect = .outline, .uniforms = .{ .r = 0.1, .g = 0.9, .b = 0.2, .a = 1.0, .scalar0 = 3.0, .scalar1 = 0.4 } },
         );
 

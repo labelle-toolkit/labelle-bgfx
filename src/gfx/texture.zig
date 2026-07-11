@@ -533,6 +533,29 @@ pub fn drawTextureProMaterial(
         else => {},
     }
 
+    // The sprite's source frame in whole-atlas UV space (u0, v0, u1, v1). labelle
+    // sprites are atlas SUB-RECTS, so the material shaders need the frame bounds:
+    // dissolve remaps the atlas UV to sprite-local (per-frame-consistent noise
+    // scale) and outline gates its neighbour taps to this rect so it can't dilate
+    // an adjacent frame's content into the outline. Absolute extents (|w|,|h|) so
+    // the flip convention (negative source.width/height) doesn't invert the bounds.
+    //
+    // KNOWN LIMITATION (#4): the outline is drawn through the normal sprite quad,
+    // so it can only appear WITHIN `dest`. A tightly-cropped frame whose opaque
+    // pixels reach the frame edge has no room for the OUTWARD outline there — it
+    // is clipped at the frame boundary. A full outward outline needs quad
+    // expansion (draw into a dest enlarged by `thickness` px, with the UVs holding
+    // the frame rect so the gate still blocks neighbours) — a P3 follow-up, out of
+    // scope for this v1 seam.
+    const tw: f32 = @floatFromInt(texture.width);
+    const th: f32 = @floatFromInt(texture.height);
+    const rect = [4]f32{
+        source.x / tw,
+        source.y / th,
+        (source.x + @abs(source.width)) / tw,
+        (source.y + @abs(source.height)) / th,
+    };
+
     const vertices = buildQuadVertices(@intCast(texture.width), @intCast(texture.height), source, dest, origin, rotation, tint.toAbgr());
     switch (material.effect) {
         .flash, .palette_swap, .dissolve, .outline => programs.submitMaterialTriangles(
@@ -543,6 +566,7 @@ pub fn drawTextureProMaterial(
             aux_handle,
             @intCast(texture.width),
             @intCast(texture.height),
+            rect,
         ),
         else => programs.submitTexturedTriangles(&vertices, handle),
     }

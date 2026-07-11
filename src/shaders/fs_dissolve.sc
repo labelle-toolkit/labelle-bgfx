@@ -40,6 +40,14 @@ SAMPLER2D(s_tex, 0);
 SAMPLER2D(s_lut, 1);
 uniform vec4 u_material_color;
 uniform vec4 u_material_params;
+// The sprite's source frame in whole-atlas UV space: (u0, v0, u1, v1). For a
+// standalone (non-atlas) texture this is (0, 0, 1, 1). Used to remap the atlas
+// UV `v_texcoord0` to a sprite-LOCAL 0..1 UV so the noise cell size is
+// per-frame-consistent (labelle sprites are atlas sub-rects — without this the
+// procedural noise / noise-texture lookup would be scaled by the frame's
+// fraction of the atlas, so identical frames at different atlas positions would
+// dissolve with different-sized cells).
+uniform vec4 u_material_rect;
 
 #define NOISE_SCALE 9.0
 
@@ -66,9 +74,14 @@ void main()
 {
 	vec4 texel = texture2D(s_tex, v_texcoord0) * v_color0;
 
+	// Sprite-local 0..1 UV (frame sub-rect → 0..1), so the noise scale is the
+	// same for a frame wherever it sits in the atlas. The sprite texel itself is
+	// still sampled at the atlas UV `v_texcoord0` above.
+	vec2 local = (v_texcoord0 - u_material_rect.xy) / max(u_material_rect.zw - u_material_rect.xy, vec2(1e-6, 1e-6));
+
 	float n = mix(
-		dissolveNoise(v_texcoord0 * NOISE_SCALE),
-		texture2D(s_lut, v_texcoord0).r,
+		dissolveNoise(local * NOISE_SCALE),
+		texture2D(s_lut, local).r,
 		step(0.5, u_material_params.w));
 
 	float threshold = u_material_params.x;

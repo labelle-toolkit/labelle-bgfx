@@ -326,6 +326,11 @@ var s_lut_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var u_material_color_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var u_material_params_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var u_material_texel_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+// The sprite's source frame in whole-atlas UV space (u0, v0, u1, v1). dissolve
+// remaps the atlas UV to sprite-local for a per-frame-consistent noise scale;
+// outline gates its neighbour taps to this rect so it can't dilate an adjacent
+// atlas frame's content. (0,0,1,1) for a standalone texture.
+var u_material_rect_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var material_initialized: bool = false;
 /// Latches a build/link failure so `ensureMaterialPrograms` retries at most once
 /// (mirrors `yuv_failed`) — a per-frame re-create would leak + exhaust the handle
@@ -396,8 +401,10 @@ fn initMaterialPrograms() void {
     u_material_color_uniform = bgfx.createUniform("u_material_color", .Vec4, 1);
     u_material_params_uniform = bgfx.createUniform("u_material_params", .Vec4, 1);
     u_material_texel_uniform = bgfx.createUniform("u_material_texel", .Vec4, 1);
+    u_material_rect_uniform = bgfx.createUniform("u_material_rect", .Vec4, 1);
     if (!isValidHandle(s_lut_uniform.idx) or !isValidHandle(u_material_color_uniform.idx) or
-        !isValidHandle(u_material_params_uniform.idx) or !isValidHandle(u_material_texel_uniform.idx))
+        !isValidHandle(u_material_params_uniform.idx) or !isValidHandle(u_material_texel_uniform.idx) or
+        !isValidHandle(u_material_rect_uniform.idx))
     {
         std.log.err("bgfx: failed to create material uniforms; materials degrade to plain sprites", .{});
         destroyMaterialPrograms();
@@ -425,7 +432,7 @@ fn destroyMaterialPrograms() void {
         if (isValidProgram(p.*)) bgfx.destroyProgram(p.*);
         p.* = .{ .idx = std.math.maxInt(u16) };
     }
-    inline for (.{ &s_lut_uniform, &u_material_color_uniform, &u_material_params_uniform, &u_material_texel_uniform }) |u| {
+    inline for (.{ &s_lut_uniform, &u_material_color_uniform, &u_material_params_uniform, &u_material_texel_uniform, &u_material_rect_uniform }) |u| {
         if (isValidHandle(u.*.idx)) bgfx.destroyUniform(u.*);
         u.* = .{ .idx = std.math.maxInt(u16) };
     }
@@ -443,10 +450,12 @@ fn destroyMaterialPrograms() void {
 /// `dissolve` procedural path binds the sprite's own texture as a harmless dummy
 /// so unit 1 is never an unbound-sampler read). `tex_w`/`tex_h` are the sprite
 /// texture's pixel dimensions, used to build `u_material_texel` for `outline`
-/// (px thickness → UV offset). No-ops (leaving the sprite undrawn) only if the
-/// programs failed to build; the draw site never falls back here, so the caller
-/// must have gated on `ensureMaterialPrograms`/`materialSupported` — see
-/// `texture.drawTextureProMaterial`.
+/// (px thickness → UV offset). `rect` is the sprite's source frame in whole-atlas
+/// UV space (u0, v0, u1, v1) → `u_material_rect`, driving dissolve's sprite-local
+/// noise remap and outline's per-frame tap gating ((0,0,1,1) for a standalone
+/// texture). No-ops (leaving the sprite undrawn) only if the programs failed to
+/// build; the draw site never falls back here, so the caller must have gated on
+/// `ensureMaterialPrograms`/`materialSupported` — see `texture.drawTextureProMaterial`.
 pub fn submitMaterialTriangles(
     vertices: []const PosTexColorVertex,
     texture_handle: bgfx.TextureHandle,
@@ -455,6 +464,7 @@ pub fn submitMaterialTriangles(
     lut_handle: bgfx.TextureHandle,
     tex_w: u32,
     tex_h: u32,
+    rect: [4]f32,
 ) void {
     // The material programs reuse the sprite path's `s_tex_uniform`, so the
     // sprite shaders must be up first (they may not be if a material sprite is
@@ -495,6 +505,9 @@ pub fn submitMaterialTriangles(
     const h_f: f32 = @floatFromInt(@max(tex_h, 1));
     const texel = [4]f32{ 1.0 / w_f, 1.0 / h_f, w_f, h_f };
     bgfx.setUniform(u_material_texel_uniform, &texel, 1);
+    // Source frame UV bounds (u0, v0, u1, v1) for dissolve's local-UV noise remap
+    // + outline's per-frame tap gate. Harmless for flash/palette (unused there).
+    bgfx.setUniform(u_material_rect_uniform, &rect, 1);
 
     const num: u32 = @intCast(vertices.len);
     var tvb: bgfx.TransientVertexBuffer = undefined;
