@@ -1,8 +1,13 @@
 {
-    // Main scene — example game
+    // Main scene — post-fx showcase (labelle-gfx#305 Phase 2).
+    //
+    // Unified format (engine v2.0): file-level entities live under the
+    // flat top-level "children" array (the legacy "entities" key was
+    // removed in engine v2.0.0 / #592). Inline entities keep "components".
     "name": "main",
-    "entities": [
-        // Player entity
+    "children": [
+        // Player — mid-brightness blue rectangle (below the bloom
+        // threshold, so it stays crisp while the bright shapes glow).
         {
             "name": "player",
             "components": {
@@ -10,18 +15,46 @@
                 "Shape": {
                     "shape": { "rectangle": { "width": 32, "height": 32 } },
                     "color": { "r": 60, "g": 120, "b": 220, "a": 255 },
-                    "layer": "characters",
+                    "layer": "hud",
                     "z_index": 5
                 },
                 "Velocity": { "x": 0, "y": 0 }
             }
         },
-        // Title label
+        // Bright emissive core — full-white block, well above the bloom
+        // threshold. This is what the bloom pass spreads into a glow.
+        {
+            "name": "glow_core",
+            "components": {
+                "Position": { "x": 250, "y": 320 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 48, "height": 48 } },
+                    "color": { "r": 255, "g": 255, "b": 255, "a": 255 },
+                    "layer": "hud",
+                    "z_index": 6
+                }
+            }
+        },
+        // Hot accent — bright yellow, also above threshold, gives the
+        // bloom a coloured halo distinct from the white core.
+        {
+            "name": "glow_accent",
+            "components": {
+                "Position": { "x": 550, "y": 300 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 40, "height": 40 } },
+                    "color": { "r": 255, "g": 230, "b": 40, "a": 255 },
+                    "layer": "hud",
+                    "z_index": 6
+                }
+            }
+        },
+        // Title label — bright white text; blooms at the edges.
         {
             "components": {
-                "Position": { "x": 400, "y": 50 },
+                "Position": { "x": 400, "y": 500 },
                 "Text": {
-                    "text": "LaBelle Example",
+                    "text": "LaBelle post-fx",
                     "size": 24,
                     "color": { "r": 255, "g": 255, "b": 255, "a": 255 }
                 }

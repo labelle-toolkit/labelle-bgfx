@@ -1,12 +1,34 @@
 .{
     .name = "example_bgfx",
-    .title = "LaBelle v2 — bgfx",
+    .title = "LaBelle v2 — bgfx post-fx",
     .backend = .bgfx,
+    // Resolve the bgfx backend from THIS repo (the example lives inside
+    // labelle-bgfx) so codegen picks up the post-fx shaders (bloom / crt /
+    // vignette / color_grade, >= v0.11.0). The builtin `.backend = .bgfx`
+    // provider otherwise pins a stale remote tag; an explicit local
+    // backend_package overrides it in place. `local:../..` is the repo root
+    // relative to this example dir (examples/bgfx), and resolves correctly in
+    // both a plain checkout and a git worktree.
+    .backend_package = .{
+        .name = "bgfx",
+        .repo = "local:../..",
+        .version = "0.11.0",
+    },
     .y_axis = .up,
     .ecs = .mock,
-    .core_version = "1.22.0",
-    .engine_version = "1.65.0",
-    .gfx_version = "1.19.0",
+    // Post-fx release pins (labelle-gfx#305 Phase 2).
+    //   NOTE: the declarative `.post_fx` effect only reaches the framebuffer
+    //   through the engine's camera-aware render path once gfx wires
+    //   post_fx.begin/resolve into `renderWithLayerHooks` (see README —
+    //   shipped gfx 1.28.0 wires it only into the standalone retained
+    //   render()). The screenshots were produced with that one-line gfx fix.
+    .core_version = "1.26.0",
+    .engine_version = "2.4.0",
+    .gfx_version = "1.28.0",
+    // Local dev checkouts, resolved as siblings of the main labelle-bgfx
+    // checkout (the standard monorepo dev layout). Keep them on their
+    // respective mains: cli >= 1.55.x, assembler >= 0.80.0 (the version that
+    // lowers `project.labelle` `.post_fx` into the gated `setPostFx` seed).
     .labelle_version = "local:../../../labelle-cli",
     .assembler_version = "local:../../../labelle-assembler",
     .states = .{ "playing" },
@@ -16,5 +38,13 @@
         .{ .name = "characters", .order = 2, .space = .world },
         .{ .name = "effects", .order = 3, .space = .world },
         .{ .name = "hud", .order = 4, .space = .screen },
+    },
+    // Declarative post-fx stack — the assembler emits `g.setPostFx(...)`,
+    // the engine forwards it to gfx's PostFxDriver, and bgfx renders the
+    // passes offscreen -> composite. Order matters: bloom first (glow the
+    // bright shapes), then crt (scanlines + curvature + chromatic aberration).
+    .post_fx = .{
+        .{ .bloom = .{ .threshold = 0.75, .intensity = 1.4, .radius = 1.5 } },
+        .{ .crt = .{ .curvature = 0.12, .scanline = 0.5, .mask = 0.3, .aberration = 0.004 } },
     },
 }
