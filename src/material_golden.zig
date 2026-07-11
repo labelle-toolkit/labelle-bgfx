@@ -53,6 +53,26 @@ const SEEK_SET: c_int = 0;
 const SEEK_END: c_int = 2;
 extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
 extern "c" fn ftell(stream: *std.c.FILE) c_long;
+extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+
+/// Create the parent-directory chain of `base` (makePath-style) so
+/// `captureHeadless`'s `fopen(.., "wb")` can't fail on a CLEAN checkout where the
+/// output dir (e.g. `zig-out/`) does not pre-exist — the CI failure this fixes
+/// (locally `zig-out/` survived from prior builds, masking it). Zig 0.16 dropped
+/// `std.fs.cwd()` (needs an `Io`) and we already link libc, so mkdir each
+/// ancestor prefix via libc; an already-existing dir (EEXIST) is harmless.
+fn ensureParentDir(base: [:0]const u8) void {
+    const dir = std.fs.path.dirname(base) orelse return;
+    var buf: [1024:0]u8 = undefined;
+    if (dir.len >= buf.len) return;
+    var i: usize = 1;
+    while (i <= dir.len) : (i += 1) {
+        if (i < dir.len and dir[i] != '/') continue;
+        @memcpy(buf[0..i], dir[0..i]);
+        buf[i] = 0;
+        _ = mkdir(&buf, 0o755);
+    }
+}
 
 fn readFile(path: [:0]const u8) ?[]u8 {
     const file = std.c.fopen(path.ptr, "rb") orelse return null;
@@ -194,6 +214,9 @@ pub fn main() !void {
     renderScene();
 
     const out_base = if (bless) GOLDEN_BASE else CANDIDATE_BASE;
+    // Guarantee the output dir exists before captureHeadless fopens the TGA —
+    // both the candidate (`zig-out/`) and the golden (`test/golden/`) dirnames.
+    ensureParentDir(out_base);
     if (!window.captureHeadless(out_base)) {
         std.debug.print("GOLDEN_RESULT: CAPTURE_FAILED\n", .{});
         window.closeWindow();
