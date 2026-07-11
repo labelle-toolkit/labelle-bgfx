@@ -302,11 +302,14 @@ pub fn ensureYuvProgram() bool {
         isValidHandle(s_texY_uniform.idx) and isValidHandle(s_texU_uniform.idx) and isValidHandle(s_texV_uniform.idx);
 }
 
-// ── Material programs (curated per-draw effects, labelle-gfx#305 Slice B) ──────
-// Two programs built from `vs_sprite` + a material fragment shader, following the
+// ── Material programs (curated per-draw effects, labelle-gfx#305) ──────────────
+// Four programs built from `vs_sprite` + a material fragment shader, following the
 // exact YUV-path pattern above: per-renderer bytecode selected by
-// `bgfx.getRendererType()`, lazily `createProgram`d, latch-failing to the plain
-// sprite path (the material draw degrades — no crash). One program per effect:
+// `bgfx.getRendererType()`, lazily `createProgram`d, degrading to the plain sprite
+// path (the material draw degrades — no crash). Built PER-EFFECT: a link failure
+// in one effect leaves the others valid, and only the failed effect degrades
+// (gated by `materialProgramReady` at the draw site) — never the whole seam. One
+// program per effect:
 //   `flash_program`   ← fs_flash   (mix sprite→flash colour by amount)
 //   `palette_program` ← fs_palette (recolour by red-channel index via `s_lut`)
 // All four share two `vec4` uniforms (`u_material_color`/`u_material_params`)
@@ -377,25 +380,34 @@ fn buildMaterialProgram(fs_data: []const u8) bgfx.ProgramHandle {
     return prog;
 }
 
-/// Lazily build BOTH material programs + their shared uniforms. On any failure,
-/// tears the whole group down and latches `material_failed` so the material draw
-/// degrades to the plain sprite path (via `submitMaterialTriangles` returning
-/// false) rather than crashing or leaking every frame.
+/// The material program backing `effect` (invalid sentinel for `none`/unbuilt).
+fn programForEffect(effect: MaterialEffect) bgfx.ProgramHandle {
+    return switch (effect) {
+        .flash => flash_program,
+        .palette_swap => palette_program,
+        .dissolve => dissolve_program,
+        .outline => outline_program,
+        else => .{ .idx = std.math.maxInt(u16) },
+    };
+}
+
+/// Lazily build the four material programs (PER-EFFECT) + their shared uniforms.
+/// Each program is built INDEPENDENTLY: a link failure in one effect (e.g. a
+/// driver that rejects `fs_outline`) leaves the OTHER three valid — only the
+/// failed effect degrades to a plain sprite (gated by `materialProgramReady` at
+/// the draw site), never the whole material seam. The shared uniforms are the
+/// one hard, latched failure: they feed every material shader, so if they can't
+/// be created NO material can run — tear the group down and latch `material_failed`.
 fn initMaterialPrograms() void {
     if (material_initialized) return;
 
+    // Build each program on its own; keep whichever succeed. `buildMaterialProgram`
+    // already reclaims its shaders on failure, so an invalid handle here is a
+    // clean "this effect is unavailable", not a leak.
     flash_program = buildMaterialProgram(materialFsData("fs_flash"));
     palette_program = buildMaterialProgram(materialFsData("fs_palette"));
     dissolve_program = buildMaterialProgram(materialFsData("fs_dissolve"));
     outline_program = buildMaterialProgram(materialFsData("fs_outline"));
-    if (!isValidProgram(flash_program) or !isValidProgram(palette_program) or
-        !isValidProgram(dissolve_program) or !isValidProgram(outline_program))
-    {
-        std.log.err("bgfx: failed to build material programs (link failed on this renderer); materials degrade to plain sprites", .{});
-        destroyMaterialPrograms();
-        material_failed = true;
-        return;
-    }
 
     s_lut_uniform = bgfx.createUniform("s_lut", .Sampler, 1);
     u_material_color_uniform = bgfx.createUniform("u_material_color", .Vec4, 1);
@@ -406,25 +418,45 @@ fn initMaterialPrograms() void {
         !isValidHandle(u_material_params_uniform.idx) or !isValidHandle(u_material_texel_uniform.idx) or
         !isValidHandle(u_material_rect_uniform.idx))
     {
-        std.log.err("bgfx: failed to create material uniforms; materials degrade to plain sprites", .{});
-        destroyMaterialPrograms();
+        std.log.err("bgfx: failed to create material uniforms; ALL materials degrade to plain sprites", .{});
+        destroyMaterialPrograms(); // also clears any programs that DID build
         material_failed = true;
         return;
+    }
+
+    // A per-effect link failure is a warning (that effect degrades), not fatal.
+    if (!isValidProgram(flash_program) or !isValidProgram(palette_program) or
+        !isValidProgram(dissolve_program) or !isValidProgram(outline_program))
+    {
+        std.log.warn("bgfx: some material programs failed to link; those effects degrade to plain sprites (flash={} palette_swap={} dissolve={} outline={})", .{
+            isValidProgram(flash_program),   isValidProgram(palette_program),
+            isValidProgram(dissolve_program), isValidProgram(outline_program),
+        });
     }
 
     material_initialized = true;
     std.log.info("bgfx: material programs initialized (renderer: {})", .{bgfx.getRendererType()});
 }
 
-/// Ensure the material programs are ready. Tries to build at most once (latches
-/// `material_failed`); cleared by `shutdownPrograms`. Returns true when both
-/// programs + all uniforms are valid.
+/// Ensure the material SHARED INFRA (uniforms) is ready. Tries to build at most
+/// once (latches `material_failed`); cleared by `shutdownPrograms`. Returns true
+/// when the shared uniforms exist — per-EFFECT program availability is checked
+/// separately by `materialProgramReady` (one effect failing to link does not
+/// disable the others).
 pub fn ensureMaterialPrograms() bool {
     if (!material_initialized) {
         if (material_failed) return false;
         initMaterialPrograms();
     }
     return material_initialized;
+}
+
+/// True when the material program for `effect` built + linked on this renderer
+/// (and the shared uniforms exist). Per-effect: consulted by the draw site so a
+/// single failed effect degrades to a plain sprite while the others keep working.
+pub fn materialProgramReady(effect: MaterialEffect) bool {
+    if (!ensureMaterialPrograms()) return false; // shared uniforms dead → all degrade
+    return isValidProgram(programForEffect(effect));
 }
 
 fn destroyMaterialPrograms() void {
@@ -472,13 +504,11 @@ pub fn submitMaterialTriangles(
     ensureShadersInitialized();
     if (!isValidHandle(s_tex_uniform.idx)) return;
     if (!ensureMaterialPrograms()) return;
-    const program = switch (effect) {
-        .flash => flash_program,
-        .palette_swap => palette_program,
-        .dissolve => dissolve_program,
-        .outline => outline_program,
-        else => return, // none is not a material draw
-    };
+    // Per-effect: this specific program may have failed to link even though the
+    // shared infra + other effects are fine. The caller gates on
+    // `materialProgramReady` and falls back to a plain sprite, so reaching here
+    // with a dead program is defensive — no-op rather than submit a null program.
+    const program = programForEffect(effect);
     if (!isValidProgram(program)) return;
     ensureLayouts();
 

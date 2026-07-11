@@ -42,7 +42,7 @@ const window = @import("window");
 // variant; `zig build material-golden` compiles the check variant.
 const options = @import("golden_options");
 
-const W: u16 = 576;
+const W: u16 = 648;
 const H: u16 = 96;
 
 const GOLDEN_BASE: [:0]const u8 = "test/golden/material_effects";
@@ -374,6 +374,19 @@ fn renderScene() void {
             0,
             gfx.Color{ .r = 255, .g = 255, .b = 255, .a = 128 },
             .{ .effect = .outline, .uniforms = .{ .r = 0.1, .g = 0.9, .b = 0.2, .a = 1.0, .scalar0 = 3.0, .scalar1 = 0.4 } },
+        );
+
+        // Col 9: dissolve at threshold = 1.0 — FULLY dissolved. Every texel must
+        // vanish (alpha 0), leaving only the background, even for noise texels of
+        // exactly 1.0. Guards the threshold==1 boundary fix (Finding B).
+        gfx.drawTextureProMaterial(
+            burn,
+            src48,
+            .{ .x = 588, .y = 24, .width = 48, .height = 48 },
+            origin,
+            0,
+            gfx.white,
+            .{ .effect = .dissolve, .uniforms = .{ .r = 1.0, .g = 0.5, .b = 0.1, .scalar0 = 1.0, .scalar1 = 6.0 } },
         );
 
         window.endFrame();

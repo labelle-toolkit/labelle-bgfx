@@ -87,7 +87,12 @@ void main()
 	float threshold = u_material_params.x;
 	float reveal = n - threshold;                       // < 0 → dissolved away
 	float band = max(fwidth(n) * u_material_params.y, 1e-4);
-	float alive = step(0.0, reveal);                    // 1 = kept, 0 = gone
+	// Keep texels whose noise is at/above the threshold. The `step` compare is
+	// inclusive, so at threshold == 0 every texel survives (fully solid); but a
+	// noise texel of EXACTLY 1.0 would otherwise survive at threshold == 1.0,
+	// leaving the sprite not-quite-gone. The `(1 - step(1.0, threshold))` factor
+	// forces full clear at threshold == 1.0 while leaving both endpoints correct.
+	float alive = step(0.0, reveal) * (1.0 - step(1.0, threshold)); // 1 = kept, 0 = gone
 	float edge = 1.0 - smoothstep(0.0, band, max(reveal, 0.0)); // 1 at the front
 
 	vec3 rgb = mix(texel.rgb, u_material_color.rgb, edge);

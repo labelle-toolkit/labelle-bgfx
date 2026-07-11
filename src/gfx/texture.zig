@@ -498,6 +498,15 @@ pub fn drawTextureProMaterial(
     const handle = texture_handles[texture.id];
     if (handle.idx == std.math.maxInt(u16)) return;
 
+    // Per-effect runtime gate: `materialSupported` says bgfx IMPLEMENTS this
+    // effect, but its program may have failed to link on THIS renderer while the
+    // others are fine (per-effect isolation, programs.zig). Degrade only the
+    // failed effect to a plain sprite — the working effects are unaffected.
+    if (!programs.materialProgramReady(material.effect)) {
+        drawTexturePro(texture, source, dest, origin, rotation, tint);
+        return;
+    }
+
     // The aux texture bound at sampler unit 1: the LUT ramp for palette_swap,
     // the optional noise texture for dissolve. `mat` is a mutable copy so a
     // dead/absent dissolve noise handle can be normalised to the procedural path.
