@@ -56,13 +56,18 @@ void main()
 	float soft = smoothstep(0.0, 1.0, ring);
 	float coverage = mix(hard, soft, clamp(u_material_params.y, 0.0, 1.0));
 
-	// Outline only where the sprite itself is not already opaque.
+	// The outline's effective contribution under the sprite: its own alpha
+	// (colour alpha × coverage) times the fraction the sprite leaves uncovered,
+	// i.e. Ao·(1−As). This ALREADY folds in the over-operator's (1−As) term.
 	float outline_a = u_material_color.a * coverage * (1.0 - base.a);
 
-	// Composite the sprite OVER the outline (straight-alpha result for the
-	// STATE_BLEND_ALPHA path): premultiply, add, then un-premultiply.
-	float a = base.a + outline_a * (1.0 - base.a);
-	vec3 pre = base.rgb * base.a + u_material_color.rgb * outline_a * (1.0 - base.a);
+	// Sprite OVER outline (straight-alpha result for the STATE_BLEND_ALPHA path).
+	// A-over-B: result_a = As + Ao·(1−As); premultiplied colour = As·Cs +
+	// Ao·(1−As)·Co. Since `outline_a` is ALREADY Ao·(1−As), it is used DIRECTLY
+	// here — multiplying by (1−As) a second time would double-attenuate the
+	// outline on semi-transparent / anti-aliased sprite edges (0 < base.a < 1).
+	float a = base.a + outline_a;
+	vec3 pre = base.rgb * base.a + u_material_color.rgb * outline_a;
 	vec3 rgb = a > 0.0 ? pre / a : vec3(0.0, 0.0, 0.0);
 	gl_FragColor = vec4(rgb, a);
 }

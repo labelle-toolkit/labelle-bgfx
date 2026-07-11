@@ -3,8 +3,9 @@
 //! material set — `flash` (amount 0.6 toward red), `palette_swap` (a 4-entry
 //! index atlas recoloured through a LUT ramp), `dissolve` (a solid sprite
 //! burned away by the built-in procedural noise at threshold 0.5 with an orange
-//! edge glow), and `outline` (a transparent-background shape wrapped in a green
-//! alpha-dilated silhouette) — FULLY headless (surfaceless bgfx,
+//! edge glow), and `outline` (TWO subjects: an opaque square with base.a ∈
+//! {0,1}, and an anti-aliased soft disc whose fractional-alpha boundary
+//! exercises the over-operator composite) — FULLY headless (surfaceless bgfx,
 //! Metal/Vulkan offscreen framebuffer, no window / no display server, the
 //! `initHeadless` path proven by `mirror_probe` / `screenshot_probe`), then
 //! captures the offscreen framebuffer to an uncompressed 32-bit TGA via
@@ -38,7 +39,7 @@ const window = @import("window");
 // variant; `zig build material-golden` compiles the check variant.
 const options = @import("golden_options");
 
-const W: u16 = 288;
+const W: u16 = 360;
 const H: u16 = 96;
 
 const GOLDEN_BASE: [:0]const u8 = "test/golden/material_effects";
@@ -151,6 +152,35 @@ fn makeShape(w: u32, h: u32, inner: u32, r: u8, g: u8, b: u8) gfx.DecodedImage {
     return .{ .pixels = px, .width = w, .height = h };
 }
 
+/// Build a SOFT-EDGED `outline` subject: a `w`×`h` transparent field with a
+/// centred anti-aliased disc of radius `radius`, its alpha ramping linearly from
+/// 1 (interior) to 0 (exterior) over a `feather`-px band. This is the case the
+/// opaque square CANNOT cover: along the disc boundary `base.a` is strictly
+/// between 0 and 1, so the outline composite's over-operator math is actually
+/// exercised — a double-`(1−base.a)` bug reads visibly faint here.
+fn makeSoftDisc(w: u32, h: u32, radius: f32, feather: f32, r: u8, g: u8, b: u8) gfx.DecodedImage {
+    const px = std.heap.page_allocator.alloc(u8, w * h * 4) catch unreachable;
+    const cx = @as(f32, @floatFromInt(w)) / 2.0;
+    const cy = @as(f32, @floatFromInt(h)) / 2.0;
+    var y: u32 = 0;
+    while (y < h) : (y += 1) {
+        var x: u32 = 0;
+        while (x < w) : (x += 1) {
+            const dx = (@as(f32, @floatFromInt(x)) + 0.5) - cx;
+            const dy = (@as(f32, @floatFromInt(y)) + 0.5) - cy;
+            const dist = @sqrt(dx * dx + dy * dy);
+            // 1 inside, 0 outside, linear over the feather band straddling the edge.
+            const cov = std.math.clamp((radius - dist) / feather + 0.5, 0.0, 1.0);
+            const o = (y * w + x) * 4;
+            px[o] = r;
+            px[o + 1] = g;
+            px[o + 2] = b;
+            px[o + 3] = @intFromFloat(cov * 255.0 + 0.5);
+        }
+    }
+    return .{ .pixels = px, .width = w, .height = h };
+}
+
 /// Build the LUT ramp: `n`×1 RGBA, one distinct colour per entry.
 fn makeLut(colors: []const [3]u8) gfx.DecodedImage {
     const n: u32 = @intCast(colors.len);
@@ -181,6 +211,9 @@ fn renderScene() void {
     const burn = gfx.uploadTexture(makeSolid(48, 48, 90, 160, 200)) catch unreachable;
     // outline subject: an opaque 24px square on a transparent 48px field.
     const shape = gfx.uploadTexture(makeShape(48, 48, 24, 235, 235, 235)) catch unreachable;
+    // outline subject with ANTI-ALIASED edges: a soft disc so base.a is fractional
+    // along its boundary (exercises the over-operator composite — see makeSoftDisc).
+    const disc = gfx.uploadTexture(makeSoftDisc(48, 48, 15.0, 3.0, 235, 235, 235)) catch unreachable;
 
     // A couple of begin/draw/end cycles so the offscreen FB holds the scene
     // before captureHeadless blits it (belt-and-braces, matching the probes).
@@ -228,12 +261,25 @@ fn renderScene() void {
             .{ .effect = .dissolve, .uniforms = .{ .r = 1.0, .g = 0.5, .b = 0.1, .scalar0 = 0.5, .scalar1 = 6.0 } },
         );
 
-        // Col 4: outline — the transparent-field square wrapped in a green
-        // silhouette (thickness 3px, softness 0.4 feather).
+        // Col 4: outline — the transparent-field OPAQUE square wrapped in a green
+        // silhouette (thickness 3px, softness 0.4 feather). base.a ∈ {0,1}.
         gfx.drawTextureProMaterial(
             shape,
             src48,
             .{ .x = 228, .y = 24, .width = 48, .height = 48 },
+            origin,
+            0,
+            gfx.white,
+            .{ .effect = .outline, .uniforms = .{ .r = 0.1, .g = 0.9, .b = 0.2, .a = 1.0, .scalar0 = 3.0, .scalar1 = 0.4 } },
+        );
+
+        // Col 5: outline on an ANTI-ALIASED soft disc — the fractional-alpha edge
+        // case. Same green outline; the composite math (over-operator) is only
+        // exercised here where 0 < base.a < 1, catching a double-attenuation bug.
+        gfx.drawTextureProMaterial(
+            disc,
+            src48,
+            .{ .x = 300, .y = 24, .width = 48, .height = 48 },
             origin,
             0,
             gfx.white,
