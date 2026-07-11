@@ -499,7 +499,7 @@ pub fn build(b: *std.Build) void {
         }
     };
     const golden_check = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "material_golden", "src/material_golden.zig", false);
-    const golden_step = b.step("material-golden", "Diff the material flash + palette_swap scene against the committed golden (#305)");
+    const golden_step = b.step("material-golden", "Diff the material flash + palette_swap + dissolve + outline scene against the committed golden (#305)");
     golden_step.dependOn(&golden_check.step);
 
     const golden_bless_run = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "material_golden", "src/material_golden.zig", true);
