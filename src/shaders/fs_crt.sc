@@ -31,6 +31,10 @@ void main()
 	// Outside the warped image → black (the tube bezel).
 	float inside = step(0.0, warp.x) * step(warp.x, 1.0) * step(0.0, warp.y) * step(warp.y, 1.0);
 	col *= inside;
+	// Gate alpha by the same tube mask: outside the tube `warp` is out of bounds,
+	// so the sampled `srcA` is an unpredictable clamped-edge value — zero it to
+	// match the RGB gating so the bezel is cleanly transparent (deterministic).
+	srcA *= inside;
 
 	// Scanlines: darken alternate rows by `scanline`.
 	float lines = 0.5 + 0.5 * abs(sin(warp.y * u_postfx_texel.w * 3.14159265));
