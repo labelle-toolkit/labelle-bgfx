@@ -39,6 +39,7 @@ const yuv = @import("yuv.zig");
 const planes = @import("planes.zig");
 
 extern fn close(c_int) c_int;
+extern fn usleep(usec: u32) c_int; // worker idle backoff (bionic)
 
 const is_android = builtin.abi == .android or builtin.abi == .androideabi;
 
@@ -128,6 +129,13 @@ const AndroidVideoDecoder = struct {
     // any vendor / `COLOR_FormatYUV420Flexible` / tiled layout reads uniformly.
     // This is the robustness fix vs the old ByteBuffer/NV12-only path.
     extern fn AImageReader_new(width: i32, height: i32, format: i32, max_images: i32, reader: *?*ImageReader) i32;
+    // API 26+: like AImageReader_new but with explicit AHardwareBuffer usage
+    // flags. We need CPU_READ_OFTEN: the plain constructor allocates the gralloc
+    // buffers with default usage (CPU_READ_RARELY → UNCACHED CPU mapping), and
+    // byte-wise reads of uncached memory made the per-frame plane copy take
+    // 30–80 ms on-device (measured) — the video judder. CPU_READ_OFTEN maps the
+    // buffers cacheable, making the same copy ~milliseconds.
+    extern fn AImageReader_newWithUsage(width: i32, height: i32, format: i32, usage: u64, max_images: i32, reader: *?*ImageReader) i32;
     extern fn AImageReader_getWindow(*ImageReader, window: *?*Window) i32;
     extern fn AImageReader_acquireLatestImage(*ImageReader, image: *?*Image) i32;
     // FIFO acquire (oldest un-acquired) — feed-ahead consumes the reader in order.
@@ -154,26 +162,77 @@ const AndroidVideoDecoder = struct {
     const KEY_WIDTH: [*:0]const u8 = "width";
     const KEY_HEIGHT: [*:0]const u8 = "height";
 
-    extractor: *Extractor,
-    codec: *Codec,
-    reader: *ImageReader,
-    // The decoder OWNS this fd (handed over by `backend.zig` from
-    // `AAsset_openFileDescriptor64`): it's `close()`d in `deinit` so loop/replay
-    // can't leak a descriptor. `backend.zig` must NOT close it.
-    fd: c_int,
-    w: u32,
-    h: u32,
-    input_done: bool,
-    // Output-side end-of-stream: set when AMediaCodec tags an output buffer with
-    // FLAG_EOS (stream fully drained). `eof()` exposes it so the player can mark
-    // a play-once clip finished — mirrors the desktop decoder, which already has
-    // eof(); Android lacked it, so intros never auto-advanced to the next scene.
-    eof_seen: bool,
+    // Decoded-frame ring buffer — the jitter cushion that decouples decoding from
+    // presentation. A WORKER THREAD fills it: feed the codec, render output into
+    // the ImageReader, then copy each frame's planes into a ring slot of ordinary
+    // (cached) heap buffers. The copy is the expensive step — CPU reads of the
+    // codec's gralloc buffers measured ~20–80 ms/frame on-device (effectively
+    // uncached memory regardless of CPU_READ_OFTEN) — so it MUST happen off the
+    // render thread; on it, every advanced frame blew the 16.6 ms budget and
+    // judddered. The render thread (`decodeFramePlanes`) just memcpys a ready
+    // slot out of cached RAM (~1–2 ms).
+    const RING_SIZE = 4; // decoded-frame cushion (~130 ms at 30 fps)
+    // Reader slots: frames rendered but not yet acquired by the worker, plus
+    // headroom. The worker acquires (and releases) promptly, so this stays small.
+    const READER_MAX_IMAGES = 8;
+
+    /// One decoded frame in ordinary heap memory (tight planes, worker-filled).
+    const Frame = struct {
+        y: []u8, // w*h (row-tightened luma)
+        u: []u8, // cw*ch (tight, de-interleaved chroma)
+        v: []u8, // cw*ch
+        pts: f64 = 0, // presentation timestamp, seconds
+    };
+
+    /// Heap-allocated shared state. The outer `AndroidVideoDecoder` is moved by
+    /// value (into the Player, into the backend's slot array), so the worker
+    /// thread must reference stable heap memory, never the outer struct.
+    ///
+    /// Threading contract: `extractor`/`codec`/`reader`/`input_done` are
+    /// worker-only after `openFd` returns. `ring_head`/`ring_count`/`eof_seen`
+    /// are shared and guarded by `mutex`. Slot CONTENT is safely accessed
+    /// unlocked by exactly one side at a time: the worker writes only the tail
+    /// slot (invisible until `ring_count` is bumped), the render thread reads
+    /// only the head slot (the worker can't touch it while `ring_count` ≥ 1,
+    /// since tail ≠ head until the pop completes).
+    const State = struct {
+        extractor: *Extractor,
+        codec: *Codec,
+        reader: *ImageReader,
+        // The decoder OWNS this fd (handed over by `backend.zig` from
+        // `AAsset_openFileDescriptor64`): closed in `deinit`. backend.zig must
+        // NOT close it.
+        fd: c_int,
+        w: u32,
+        h: u32,
+        allocator: std.mem.Allocator,
+        input_done: bool, // worker-only
+        // Zig 0.16's std.atomic.Mutex is a try/unlock spinlock; `lock` below
+        // spins. Fine here: every critical section is a few counter updates.
+        mutex: std.atomic.Mutex,
+        ring: [RING_SIZE]Frame,
+        ring_head: usize, // oldest ready frame (render thread pops here)
+        ring_count: usize, // ready frames in the ring
+        // Output-side end-of-stream: set (under mutex) when AMediaCodec tags an
+        // output buffer FLAG_EOS. `eof()` combines it with an empty ring so every
+        // buffered frame is presented before the game hands off.
+        eof_seen: bool,
+        running: std.atomic.Value(bool),
+        thread: ?std.Thread,
+    };
+
+    st: *State,
+
+    /// Blocking lock over Zig 0.16's try-only `std.atomic.Mutex`. Contention is
+    /// rare and critical sections are a few instructions, so spinning is cheap.
+    fn lock(m: *std.atomic.Mutex) void {
+        while (!m.tryLock()) std.atomic.spinLoopHint();
+    }
 
     /// Open a video stream from a file descriptor (the APK asset fd from
     /// `AAsset_openFileDescriptor`, with its offset/length). Selects the first
     /// `video/*` track and configures a hardware decoder in ByteBuffer mode.
-    pub fn openFd(_: std.mem.Allocator, fd: c_int, offset: i64, length: i64) Error!AndroidVideoDecoder {
+    pub fn openFd(a: std.mem.Allocator, fd: c_int, offset: i64, length: i64) Error!AndroidVideoDecoder {
         // Ownership transfers here: the decoder now owns `fd`. On any error path
         // close it (the returned struct never gets built); on success the field
         // takes over and `deinit` closes it. backend.zig must not close it.
@@ -216,9 +275,21 @@ const AndroidVideoDecoder = struct {
         if (AMediaExtractor_selectTrack(ex, track) != AMEDIA_OK) return error.DecoderInit;
 
         // Output to a YUV_420_888 ImageReader (format-agnostic, CPU-readable).
+        // maxImages = READER_MAX_IMAGES so we can HOLD a RING_SIZE cushion of
+        // acquired frames while leaving the decoder free slots to render ahead.
+        //
+        // CPU_READ_OFTEN is load-bearing: it makes gralloc map the buffers
+        // CACHEABLE for the CPU. The plain constructor's default (CPU_READ_RARELY,
+        // uncached) made the per-frame plane copy take 30–80 ms on-device — the
+        // source of the video judder. Fall back to the plain constructor if the
+        // usage combination is unsupported (some codec/gralloc pairings reject it).
+        const AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN: u64 = 3;
         var reader_opt: ?*ImageReader = null;
-        if (AImageReader_new(@max(w, 1), @max(h, 1), FORMAT_YUV_420_888, 4, &reader_opt) != AMEDIA_OK)
-            return error.DecoderInit;
+        if (AImageReader_newWithUsage(@max(w, 1), @max(h, 1), FORMAT_YUV_420_888, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, READER_MAX_IMAGES, &reader_opt) != AMEDIA_OK or reader_opt == null) {
+            reader_opt = null;
+            if (AImageReader_new(@max(w, 1), @max(h, 1), FORMAT_YUV_420_888, READER_MAX_IMAGES, &reader_opt) != AMEDIA_OK)
+                return error.DecoderInit;
+        }
         const reader = reader_opt orelse return error.DecoderInit;
         errdefer AImageReader_delete(reader);
         var window_opt: ?*Window = null;
@@ -235,23 +306,79 @@ const AndroidVideoDecoder = struct {
             return error.DecoderInit;
         if (AMediaCodec_start(codec) != AMEDIA_OK) return error.DecoderInit;
 
-        return .{
+        const uw: u32 = @intCast(@max(w, 0));
+        const uh: u32 = @intCast(@max(h, 0));
+        const st = a.create(State) catch return error.DecoderInit;
+        errdefer a.destroy(st);
+        const ring = allocRing(a, uw, uh) orelse return error.DecoderInit;
+        st.* = .{
             .extractor = ex,
             .codec = codec,
             .reader = reader,
             .fd = fd,
-            .w = @intCast(@max(w, 0)),
-            .h = @intCast(@max(h, 0)),
+            .w = uw,
+            .h = uh,
+            .allocator = a,
             .input_done = false,
+            .mutex = .unlocked,
+            .ring = ring,
+            .ring_head = 0,
+            .ring_count = 0,
             .eof_seen = false,
+            .running = std.atomic.Value(bool).init(true),
+            .thread = null,
         };
+        st.thread = std.Thread.spawn(.{}, workerMain, .{st}) catch {
+            freeRing(a, st.ring);
+            return error.DecoderInit;
+        };
+        return .{ .st = st };
+    }
+
+    /// Allocate the ring's tight plane buffers (Y = w*h, U/V = cw*ch per slot).
+    /// Null on OOM, freeing anything already allocated.
+    fn allocRing(a: std.mem.Allocator, w: u32, h: u32) ?[RING_SIZE]Frame {
+        const cw = planes.chromaWidth(w);
+        const ch = planes.chromaHeight(h);
+        var ring: [RING_SIZE]Frame = undefined;
+        var done: usize = 0;
+        while (done < RING_SIZE) : (done += 1) {
+            const y = a.alloc(u8, @as(usize, w) * h) catch break;
+            const u = a.alloc(u8, @as(usize, cw) * ch) catch {
+                a.free(y);
+                break;
+            };
+            const v = a.alloc(u8, @as(usize, cw) * ch) catch {
+                a.free(u);
+                a.free(y);
+                break;
+            };
+            ring[done] = .{ .y = y, .u = u, .v = v };
+        }
+        if (done < RING_SIZE) {
+            for (ring[0..done]) |f| {
+                a.free(f.y);
+                a.free(f.u);
+                a.free(f.v);
+            }
+            return null;
+        }
+        return ring;
+    }
+
+    fn freeRing(a: std.mem.Allocator, ring: [RING_SIZE]Frame) void {
+        for (ring) |f| {
+            a.free(f.y);
+            a.free(f.u);
+            a.free(f.v);
+        }
     }
 
     pub fn width(self: *const AndroidVideoDecoder) u32 {
-        return self.w;
+        return self.st.w;
     }
     pub fn height(self: *const AndroidVideoDecoder) u32 {
-        return self.h;
+        return self.st.h;
     }
 
     /// True once the decoder has drained the stream (an output buffer carried
@@ -259,72 +386,107 @@ const AndroidVideoDecoder = struct {
     /// ended, so the engine emits `engine__video_finished` and the game hands
     /// off. Without it, Android intros played forever (no auto-advance).
     pub fn eof(self: *const AndroidVideoDecoder) bool {
-        return self.eof_seen;
+        const st = self.st;
+        lock(&st.mutex);
+        defer st.mutex.unlock();
+        // Finished only once the codec drained AND the ring is empty, so every
+        // buffered frame is presented before the game hands off.
+        return st.eof_seen and st.ring_count == 0;
     }
 
-    // Feed-ahead tunables (perf/video-feed-ahead). All codec dequeues below use
-    // a 0µs (NON-BLOCKING) timeout so a decode step never stalls the frame-loop
-    // thread that calls `player.update`. We feed the codec's input queue ahead
-    // and drain its output into the ImageReader FIFO so a small cushion (bounded
-    // by the reader's max_images=4) absorbs codec/decode jitter.
-    const FEED_AHEAD: u32 = 4; // max input samples queued per pump
-    const DRAIN_AHEAD: u32 = 4; // max output buffers released per pump
+    /// Ready frames currently in the ring (thread-safe read).
+    fn ringCount(st: *State) usize {
+        lock(&st.mutex);
+        defer st.mutex.unlock();
+        return st.ring_count;
+    }
 
-    /// Pump a decode step: feed up to `FEED_AHEAD` input samples and drain up to
-    /// `DRAIN_AHEAD` output buffers into the ImageReader (both non-blocking),
-    /// then acquire the OLDEST un-acquired frame (FIFO) as a YUV_420_888 AImage,
-    /// or null if none is ready this call. The caller OWNS the returned image and
-    /// must `AImage_delete` it. Shared by the RGBA (`decodeFrame`) and plane
-    /// (`decodeFramePlanes`) paths.
-    fn pumpAndAcquire(self: *AndroidVideoDecoder) ?*Image {
-        // -- Feed input AHEAD (non-blocking). Keep the hardware decoder's input
-        // queue full so it can keep producing frames during render-thread stalls,
-        // instead of only ever being one sample ahead.
-        var fed: u32 = 0;
-        while (!self.input_done and fed < FEED_AHEAD) : (fed += 1) {
-            const in_idx = AMediaCodec_dequeueInputBuffer(self.codec, 0);
-            if (in_idx < 0) break; // no free input buffer right now
-            const idx: usize = @intCast(in_idx);
-            var cap: usize = 0;
-            const buf = AMediaCodec_getInputBuffer(self.codec, idx, &cap) orelse break;
-            const n = AMediaExtractor_readSampleData(self.extractor, buf, cap);
-            if (n < 0) {
-                _ = AMediaCodec_queueInputBuffer(self.codec, idx, 0, 0, 0, FLAG_EOS);
-                self.input_done = true;
-            } else {
-                // Tag the sample with the extractor's current presentation time
-                // (clamped ≥ 0) for PTS accuracy — read BEFORE advance.
-                const sample_us = AMediaExtractor_getSampleTime(self.extractor);
-                const time_us: u64 = @intCast(@max(sample_us, 0));
-                _ = AMediaCodec_queueInputBuffer(self.codec, idx, 0, @intCast(n), time_us, 0);
-                _ = AMediaExtractor_advance(self.extractor);
+    /// Worker thread: keeps the codec fed and the ring full, entirely off the
+    /// render thread. Each iteration feeds input, then moves ready output into
+    /// ring slots — including the expensive gralloc→RAM plane copy (~20–80 ms/
+    /// frame on-device: the codec's buffers are effectively uncached for the CPU,
+    /// which is WHY this work can't live on the render thread). The ring bounds
+    /// look-ahead: input is fed and output rendered only while there's room, so
+    /// a full ring back-pressures the codec (output buffers fill → input stalls →
+    /// extractor stops) instead of overflowing the reader and dropping frames.
+    /// All codec dequeues are non-blocking; idle iterations back off with a short
+    /// sleep. Exits when `running` clears (deinit joins).
+    fn workerMain(st: *State) void {
+        while (st.running.load(.acquire)) {
+            var did_work = false;
+
+            // -- Feed input while the ring has room. The codec self-regulates:
+            // once its input buffers are all queued, dequeueInputBuffer returns
+            // <0 and we stop.
+            while (!st.input_done and ringCount(st) < RING_SIZE) {
+                const in_idx = AMediaCodec_dequeueInputBuffer(st.codec, 0);
+                if (in_idx < 0) break; // no free input buffer right now
+                const idx: usize = @intCast(in_idx);
+                var cap: usize = 0;
+                const buf = AMediaCodec_getInputBuffer(st.codec, idx, &cap) orelse break;
+                const n = AMediaExtractor_readSampleData(st.extractor, buf, cap);
+                if (n < 0) {
+                    _ = AMediaCodec_queueInputBuffer(st.codec, idx, 0, 0, 0, FLAG_EOS);
+                    st.input_done = true;
+                } else {
+                    // Tag the sample with the extractor's current presentation
+                    // time (clamped ≥ 0) for PTS accuracy — read BEFORE advance.
+                    const sample_us = AMediaExtractor_getSampleTime(st.extractor);
+                    const time_us: u64 = @intCast(@max(sample_us, 0));
+                    _ = AMediaCodec_queueInputBuffer(st.codec, idx, 0, @intCast(n), time_us, 0);
+                    _ = AMediaExtractor_advance(st.extractor);
+                    did_work = true;
+                }
             }
-        }
 
-        // -- Drain output (non-blocking) → render ready frames into the
-        // ImageReader FIFO. The reader's max_images caps how far ahead the codec
-        // can run (once full it backpressures), so this self-regulates.
-        var drained: u32 = 0;
-        while (drained < DRAIN_AHEAD) : (drained += 1) {
-            var info: BufferInfo = undefined;
-            const out_idx = AMediaCodec_dequeueOutputBuffer(self.codec, &info, 0);
-            if (out_idx == INFO_FORMAT_CHANGED) {
-                self.refreshFormat();
-                continue;
+            // -- Move decoded frames into ring slots, ONE render per iteration,
+            // ONLY while the ring has room. Rendering only what we can hold is
+            // load-bearing: draining ALL decoded output but consuming at
+            // ~playback rate overflowed the reader and DROPPED ~85% of frames —
+            // the survivors were sparse and the video crawled at ~5 fps. Leaving
+            // un-rendered output in the codec back-pressures it instead. Acquire
+            // may lag a render by one iteration (async surface handoff); it
+            // self-catches next time around.
+            while (ringCount(st) < RING_SIZE) {
+                var info: BufferInfo = undefined;
+                const out_idx = AMediaCodec_dequeueOutputBuffer(st.codec, &info, 0);
+                if (out_idx == INFO_FORMAT_CHANGED) {
+                    refreshFormat(st);
+                    continue;
+                }
+                if (out_idx < 0) break; // no decoded output ready right now
+                if (info.flags & FLAG_EOS != 0) {
+                    lock(&st.mutex);
+                    st.eof_seen = true;
+                    st.mutex.unlock();
+                }
+                _ = AMediaCodec_releaseOutputBuffer(st.codec, @intCast(out_idx), true);
+
+                // Acquire whatever is ready (FIFO) and copy it into the tail
+                // slot. The slot is invisible to the render thread until
+                // `ring_count` is bumped, so the (slow) copy runs unlocked.
+                var img_opt: ?*Image = null;
+                if (AImageReader_acquireNextImage(st.reader, &img_opt) == AMEDIA_OK) {
+                    if (img_opt) |img| {
+                        defer AImage_delete(img);
+                        lock(&st.mutex);
+                        const tail = (st.ring_head + st.ring_count) % RING_SIZE;
+                        st.mutex.unlock();
+                        const slot = &st.ring[tail];
+                        if (fillPlanes(st, img, slot.y, slot.u, slot.v)) {
+                            slot.pts = imageTimestamp(img);
+                            lock(&st.mutex);
+                            st.ring_count += 1;
+                            st.mutex.unlock();
+                        }
+                        did_work = true;
+                    }
+                }
             }
-            if (out_idx < 0) break; // no output ready right now
-            // FLAG_EOS on an output buffer = the input-side EOS propagated all the
-            // way through; `eof()` then reports the clip ended.
-            if (info.flags & FLAG_EOS != 0) self.eof_seen = true;
-            _ = AMediaCodec_releaseOutputBuffer(self.codec, @intCast(out_idx), true);
-        }
 
-        // -- Acquire the OLDEST un-acquired frame (FIFO): the player consumes
-        // frames in order and the cushion above absorbs jitter. `acquireLatest`
-        // would DROP the cushion (skip-then-freeze) whenever the codec ran ahead.
-        var img_opt: ?*Image = null;
-        if (AImageReader_acquireNextImage(self.reader, &img_opt) != AMEDIA_OK) return null;
-        return img_opt;
+            // Idle (ring full, or codec has nothing yet): back off briefly.
+            if (!did_work) _ = usleep(2000);
+        }
     }
 
     fn imageTimestamp(img: *Image) f64 {
@@ -333,49 +495,71 @@ const AndroidVideoDecoder = struct {
         return @as(f64, @floatFromInt(ts_ns)) / 1_000_000_000.0; // PTS seconds
     }
 
-    /// Pump one decode step and, if a frame came out, convert it to RGBA8 into
-    /// `out` (width*height*4 bytes) on the CPU (`yuv.zig`). Returns the frame's
-    /// presentation timestamp in seconds (for A/V sync), or null if no frame was
-    /// produced this call. This is the CPU fallback path; `decodeFramePlanes` is
-    /// the default GPU path.
-    pub fn decodeFrame(self: *AndroidVideoDecoder, out: []u8) ?f64 {
-        if (out.len != @as(usize, self.w) * self.h * 4) return null;
-        const img = self.pumpAndAcquire() orelse return null;
-        defer AImage_delete(img);
-        if (!self.convertImage(img, out)) return null;
-        return imageTimestamp(img);
+    /// Pop the oldest ready frame under the mutex. Returns a pointer to the head
+    /// slot WITHOUT advancing it — call `popDone` after copying the content out.
+    /// Safe: the worker never writes the head slot while `ring_count` ≥ 1.
+    fn popPeek(st: *State) ?*const Frame {
+        lock(&st.mutex);
+        defer st.mutex.unlock();
+        if (st.ring_count == 0) return null;
+        return &st.ring[st.ring_head];
     }
 
-    /// GPU-YUV path: pump one decode step and, if a frame came out, copy its
-    /// Y/U/V planes (row-tightened, and de-interleaved for semi-planar/NV12) into
-    /// the caller's tight plane buffers — `y` is w*h, `u`/`v` are cw*ch (half-res,
-    /// rounded up). Returns the frame PTS in seconds, or null if no frame this
-    /// call. The shader does the YUV→RGB convert, so this is a chroma-only copy
-    /// (¼ the data) instead of the full RGBA convert in `decodeFrame`.
+    fn popDone(st: *State) void {
+        lock(&st.mutex);
+        defer st.mutex.unlock();
+        st.ring_head = (st.ring_head + 1) % RING_SIZE;
+        st.ring_count -= 1;
+    }
+
+    /// CPU fallback path: pop the oldest ready frame and convert its (already
+    /// tight) YUV planes to RGBA8 into `out` (width*height*4 bytes). Returns the
+    /// frame PTS in seconds, or null if no frame is ready yet.
+    pub fn decodeFrame(self: *AndroidVideoDecoder, out: []u8) ?f64 {
+        const st = self.st;
+        if (out.len != @as(usize, st.w) * st.h * 4) return null;
+        const cw = planes.chromaWidth(st.w);
+        const slot = popPeek(st) orelse return null;
+        // Ring planes are tight: luma stride w / pixel 1; chroma stride cw / 1.
+        yuv.yuv420ToRgba(slot.y, st.w, 1, slot.u, slot.v, cw, 1, st.w, st.h, out);
+        const pts = slot.pts;
+        popDone(st);
+        return pts;
+    }
+
+    /// GPU-YUV path: pop the oldest ready frame and memcpy its tight Y/U/V planes
+    /// into the caller's plane buffers — `y` is w*h, `u`/`v` are cw*ch. Returns
+    /// the frame PTS in seconds, or null if no frame is ready yet. The planes were
+    /// tightened by the worker into ordinary cached RAM, so this is a fast copy
+    /// (~1–2 ms) — the slow gralloc read happens off-thread.
     pub fn decodeFramePlanes(self: *AndroidVideoDecoder, y: []u8, u: []u8, v: []u8) ?f64 {
-        const cw = planes.chromaWidth(self.w);
-        const ch = planes.chromaHeight(self.h);
-        if (y.len != @as(usize, self.w) * self.h) return null;
+        const st = self.st;
+        const cw = planes.chromaWidth(st.w);
+        const ch = planes.chromaHeight(st.h);
+        if (y.len != @as(usize, st.w) * st.h) return null;
         if (u.len != @as(usize, cw) * ch or v.len != @as(usize, cw) * ch) return null;
-        const img = self.pumpAndAcquire() orelse return null;
-        defer AImage_delete(img);
-        if (!self.fillPlanes(img, y, u, v)) return null;
-        return imageTimestamp(img);
+        const slot = popPeek(st) orelse return null;
+        @memcpy(y, slot.y);
+        @memcpy(u, slot.u);
+        @memcpy(v, slot.v);
+        const pts = slot.pts;
+        popDone(st);
+        return pts;
     }
 
     /// An output-format change is emitted once before the first frame. We
     /// deliberately do NOT re-read width/height here.
     ///
-    /// `openFd` already sized `self.w`/`self.h` (and thus the ImageReader) from
-    /// the track's display dimensions, and `Player.init` allocated its texture +
+    /// `openFd` already sized `w`/`h` (and thus the ImageReader) from the
+    /// track's display dimensions, and `Player.init` allocated its texture +
     /// `pixels` buffer from `width()`/`height()` before any frame is decoded.
     /// Mutating the dims now — to the aligned/coded size (e.g. 1080 → 1088) OR to
     /// a crop rect that differs from the open dims — would desync that buffer, so
     /// `decodeFrame`'s `out.len != w*h*4` guard would then reject every frame
     /// (black screen). Keep the allocation dimensions stable; crop-accurate
     /// display, if ever needed, belongs at draw time as a source-rect crop.
-    fn refreshFormat(self: *AndroidVideoDecoder) void {
-        _ = self;
+    fn refreshFormat(st: *State) void {
+        _ = st;
     }
 
     /// The three crop-offset, stride-described plane slices of a YUV_420_888
@@ -452,44 +636,34 @@ const AndroidVideoDecoder = struct {
         };
     }
 
-    /// CPU fallback: convert a YUV_420_888 AImage to RGBA8 via `yuv.yuv420ToRgba`.
-    fn convertImage(self: *AndroidVideoDecoder, img: *Image, out: []u8) bool {
+    /// Copy the AImage's Y/U/V planes into tight per-plane buffers (row-
+    /// tightening Y; row-tightening AND de-interleaving U/V for the NV12
+    /// `pixel_stride == 2` case). Runs on the WORKER thread — reads of the
+    /// image's gralloc memory are slow (~10–30 ms/frame even vectorized) and
+    /// must not touch the render thread.
+    fn fillPlanes(st: *State, img: *Image, y_dst: []u8, u_dst: []u8, v_dst: []u8) bool {
         const p = readPlanes(img) orelse return false;
-        yuv.yuv420ToRgba(
-            p.y,
-            p.y_row_stride,
-            p.y_pixel_stride,
-            p.u,
-            p.v,
-            p.uv_row_stride,
-            p.uv_pixel_stride,
-            self.w,
-            self.h,
-            out,
-        );
-        return true;
-    }
-
-    /// GPU path: copy the AImage's Y/U/V planes into tight per-plane buffers
-    /// (row-tightening Y; row-tightening AND de-interleaving U/V for the NV12
-    /// `pixel_stride == 2` case) for upload to the three R8 plane textures.
-    fn fillPlanes(self: *AndroidVideoDecoder, img: *Image, y_dst: []u8, u_dst: []u8, v_dst: []u8) bool {
-        const p = readPlanes(img) orelse return false;
-        const cw = planes.chromaWidth(self.w);
-        const ch = planes.chromaHeight(self.h);
-        planes.tightenPlane(p.y, p.y_row_stride, p.y_pixel_stride, self.w, self.h, y_dst);
+        const cw = planes.chromaWidth(st.w);
+        const ch = planes.chromaHeight(st.h);
+        planes.tightenPlane(p.y, p.y_row_stride, p.y_pixel_stride, st.w, st.h, y_dst);
         planes.tightenPlane(p.u, p.uv_row_stride, p.uv_pixel_stride, cw, ch, u_dst);
         planes.tightenPlane(p.v, p.uv_row_stride, p.uv_pixel_stride, cw, ch, v_dst);
         return true;
     }
 
     pub fn deinit(self: *AndroidVideoDecoder) void {
-        _ = AMediaCodec_stop(self.codec);
-        AMediaCodec_delete(self.codec);
-        AImageReader_delete(self.reader);
-        AMediaExtractor_delete(self.extractor);
-        // The decoder owns the asset fd (see the struct field comment); release
+        const st = self.st;
+        // Stop the worker first — it owns the codec/extractor/reader while alive.
+        st.running.store(false, .release);
+        if (st.thread) |t| t.join();
+        _ = AMediaCodec_stop(st.codec);
+        AMediaCodec_delete(st.codec);
+        AImageReader_delete(st.reader);
+        AMediaExtractor_delete(st.extractor);
+        // The decoder owns the asset fd (see the State field comment); release
         // it so loop/replay can't leak descriptors. backend.zig must not close it.
-        _ = close(self.fd);
+        _ = close(st.fd);
+        freeRing(st.allocator, st.ring);
+        st.allocator.destroy(st);
     }
 };

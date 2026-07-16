@@ -216,7 +216,25 @@ pub fn Player(comptime Decoder: type) type {
             }
             if (self.audio.update) |f| f(self.audio.ctx);
 
-            // Advance the master clock.
+            // Select the frame to present by the master clock (audio device, or
+            // wall-clock dt). Frames are picked by PTS, so this is robust to a
+            // sparse/variable supply and needs no fps knowledge — unlike a
+            // rate-learning pacer, which feedback-loops when frames are dropped.
+            // (On Android a decoder-owned worker thread keeps its frame ring
+            // full; `decodeNext` never blocks on decode work.)
+            self.paceByClock(dt);
+
+            // End-of-stream: the decoder drained (only meaningful for decoders
+            // that report it; looping/never-ending sources never set it).
+            if (comptime @hasDecl(Decoder, "eof")) {
+                if (self.decoder.eof()) self.ended = true;
+            }
+        }
+
+        /// PTS/clock pacing: advance `play_time` by the audio-clock delta (or `dt`
+        /// with no clock), then present the frame that clock reached, dropping
+        /// late frames.
+        fn paceByClock(self: *Self, dt: f32) void {
             if (self.audio.clock) |c| {
                 const now = c(self.audio.ctx);
                 const delta = now - self.last_clock;
@@ -226,7 +244,6 @@ pub fn Player(comptime Decoder: type) type {
                 self.play_time += dt;
             }
 
-            // Present the frame the master clock has reached; drop late frames.
             var uploaded = false;
             var caught: u32 = 0;
             while (self.cur_pts < self.play_time and caught < MAX_CATCHUP_FRAMES) : (caught += 1) {
@@ -234,17 +251,10 @@ pub fn Player(comptime Decoder: type) type {
                 self.cur_pts = pts;
                 uploaded = true;
                 // Caught up: this freshly decoded frame's PTS has reached (or
-                // overshot) the clock. Upload it (it's the best available next
-                // frame) but stop here — don't keep decoding into the future.
+                // overshot) the clock. Upload it but stop — don't decode ahead.
                 if (pts >= self.play_time) break;
             }
             if (uploaded) self.uploadCurrent();
-
-            // End-of-stream: the decoder drained (only meaningful for decoders
-            // that report it; looping/never-ending sources never set it).
-            if (comptime @hasDecl(Decoder, "eof")) {
-                if (self.decoder.eof()) self.ended = true;
-            }
         }
 
         /// True once the stream has played to the end (play-once clips). Loops are

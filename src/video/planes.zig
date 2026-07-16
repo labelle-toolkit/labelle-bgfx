@@ -64,8 +64,32 @@ pub fn tightenPlane(
         if (pixel_stride == 1) {
             // Tight (or merely row-padded) row → straight copy.
             @memcpy(dst[dst_row..][0..width], src[src_row..][0..width]);
+        } else if (pixel_stride == 2) {
+            // Interleaved NV12 chroma → de-interleave with a wide shuffle
+            // (compiles to NEON uzp/ld2 on aarch64). The scalar byte-by-byte
+            // gather measured 21–30 ms/frame at 1080p on-device (each byte a
+            // separate load from the gralloc buffer) and was the dominant video
+            // frame cost; 32-byte vector loads bring it in line with the row
+            // memcpy. The bounds check keeps the last chunk from reading one
+            // byte past the plane (the final pair's other channel may be the
+            // buffer's last byte); any tail falls through to the scalar loop.
+            const V = 16; // dst bytes per step (32 interleaved src bytes)
+            const even_mask = comptime blk: {
+                var m: [V]i32 = undefined;
+                for (&m, 0..) |*e, i| e.* = @intCast(i * 2);
+                break :blk m;
+            };
+            var col: u32 = 0;
+            while (col + V <= width and src_row + 2 * (col + V) <= src.len) : (col += V) {
+                const chunk: @Vector(2 * V, u8) = src[src_row + 2 * col ..][0 .. 2 * V].*;
+                const gathered: @Vector(V, u8) = @shuffle(u8, chunk, undefined, even_mask);
+                dst[dst_row + col ..][0..V].* = gathered;
+            }
+            while (col < width) : (col += 1) {
+                dst[dst_row + col] = src[src_row + col * 2];
+            }
         } else {
-            // Interleaved (NV12) or otherwise strided → gather every sample.
+            // Arbitrary stride → gather every sample.
             var col: u32 = 0;
             while (col < width) : (col += 1) {
                 dst[dst_row + col] = src[src_row + col * pixel_stride];
@@ -122,6 +146,31 @@ test "tightenPlane: semi-planar with row padding de-interleaves and de-pads" {
     tightenPlane(uv[1..], row_stride, 2, cw, ch, &v_tight);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 11, 12, 13 }, &u_tight);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 20, 21, 22, 23 }, &v_tight);
+}
+
+test "tightenPlane: wide NV12 rows exercise the vectorized de-interleave" {
+    // width 37 > 16 → two 16-wide vector steps + a 5-byte scalar tail per row.
+    const cw = 37;
+    const ch = 3;
+    const row_stride = cw * 2 + 6; // interleaved pairs + right padding
+    var uv: [row_stride * ch]u8 = undefined;
+    for (0..ch) |r| {
+        for (0..cw) |c| {
+            uv[r * row_stride + c * 2] = @intCast((r * cw + c) % 251); // U
+            uv[r * row_stride + c * 2 + 1] = @intCast((r * cw + c + 7) % 251); // V
+        }
+        for (cw * 2..row_stride) |p| uv[r * row_stride + p] = 0xEE; // padding
+    }
+    var u_tight: [cw * ch]u8 = undefined;
+    var v_tight: [cw * ch]u8 = undefined;
+    tightenPlane(uv[0..], row_stride, 2, cw, ch, &u_tight);
+    tightenPlane(uv[1..], row_stride, 2, cw, ch, &v_tight);
+    for (0..ch) |r| {
+        for (0..cw) |c| {
+            try std.testing.expectEqual(@as(u8, @intCast((r * cw + c) % 251)), u_tight[r * cw + c]);
+            try std.testing.expectEqual(@as(u8, @intCast((r * cw + c + 7) % 251)), v_tight[r * cw + c]);
+        }
+    }
 }
 
 test "chroma dims round up for odd luma sizes" {
