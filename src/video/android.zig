@@ -213,6 +213,14 @@ const AndroidVideoDecoder = struct {
         ring: [RING_SIZE]Frame,
         ring_head: usize, // oldest ready frame (render thread pops here)
         ring_count: usize, // ready frames in the ring
+        // Frames released to the reader's surface (render=true) but not yet
+        // acquired — the async surface handoff can lag a release by a beat.
+        // Bounding the render loop on `ring_count + pending` (not just
+        // ring_count) keeps the worker from rendering more frames than the
+        // cushion can hold when acquires lag, which would overflow the reader
+        // and DROP frames; `eof()` also counts it so the last frames of a clip
+        // aren't cut while still in the handoff.
+        pending: usize,
         // Output-side end-of-stream: set (under mutex) when AMediaCodec tags an
         // output buffer FLAG_EOS. `eof()` combines it with an empty ring so every
         // buffered frame is presented before the game hands off.
@@ -324,6 +332,7 @@ const AndroidVideoDecoder = struct {
             .ring = ring,
             .ring_head = 0,
             .ring_count = 0,
+            .pending = 0,
             .eof_seen = false,
             .running = std.atomic.Value(bool).init(true),
             .thread = null,
@@ -389,9 +398,10 @@ const AndroidVideoDecoder = struct {
         const st = self.st;
         lock(&st.mutex);
         defer st.mutex.unlock();
-        // Finished only once the codec drained AND the ring is empty, so every
-        // buffered frame is presented before the game hands off.
-        return st.eof_seen and st.ring_count == 0;
+        // Finished only once the codec drained AND every buffered frame — in
+        // the ring AND still in the surface handoff (`pending`) — has been
+        // presented, so a clip's last frames aren't cut.
+        return st.eof_seen and st.ring_count == 0 and st.pending == 0;
     }
 
     /// Ready frames currently in the ring (thread-safe read).
@@ -399,6 +409,43 @@ const AndroidVideoDecoder = struct {
         lock(&st.mutex);
         defer st.mutex.unlock();
         return st.ring_count;
+    }
+
+    /// Frames the cushion is on the hook for: ready in the ring plus released
+    /// to the reader but not yet acquired (thread-safe read).
+    fn cushionLoad(st: *State) usize {
+        lock(&st.mutex);
+        defer st.mutex.unlock();
+        return st.ring_count + st.pending;
+    }
+
+    /// Try to move ONE rendered frame from the reader into the ring: acquire
+    /// (FIFO), copy its planes into the tail slot, publish by bumping
+    /// `ring_count`. The tail slot is invisible to the render thread until the
+    /// bump, so the (slow) copy runs unlocked. Returns false when nothing was
+    /// ready to acquire or the ring is full. A frame whose plane read fails is
+    /// still consumed (better a skipped frame than a stuck `pending`).
+    fn publishOne(st: *State) bool {
+        {
+            lock(&st.mutex);
+            defer st.mutex.unlock();
+            if (st.pending == 0 or st.ring_count >= RING_SIZE) return false;
+        }
+        var img_opt: ?*Image = null;
+        if (AImageReader_acquireNextImage(st.reader, &img_opt) != AMEDIA_OK) return false;
+        const img = img_opt orelse return false;
+        defer AImage_delete(img);
+        lock(&st.mutex);
+        const tail = (st.ring_head + st.ring_count) % RING_SIZE;
+        st.mutex.unlock();
+        const slot = &st.ring[tail];
+        const filled = fillPlanes(st, img, slot.y, slot.u, slot.v);
+        if (filled) slot.pts = imageTimestamp(img);
+        lock(&st.mutex);
+        if (filled) st.ring_count += 1;
+        if (st.pending > 0) st.pending -= 1;
+        st.mutex.unlock();
+        return true;
     }
 
     /// Worker thread: keeps the codec fed and the ring full, entirely off the
@@ -412,13 +459,19 @@ const AndroidVideoDecoder = struct {
     /// All codec dequeues are non-blocking; idle iterations back off with a short
     /// sleep. Exits when `running` clears (deinit joins).
     fn workerMain(st: *State) void {
+        // Consecutive fully-idle iterations after EOS with frames still
+        // "pending" — see the failsafe at the bottom of the loop.
+        var pending_dry: u32 = 0;
         while (st.running.load(.acquire)) {
             var did_work = false;
 
-            // -- Feed input while the ring has room. The codec self-regulates:
+            // -- Feed input while the cushion has room. The codec self-regulates:
             // once its input buffers are all queued, dequeueInputBuffer returns
-            // <0 and we stop.
-            while (!st.input_done and ringCount(st) < RING_SIZE) {
+            // <0 and we stop. State mutates only on a successful queue — a
+            // failed EOS queue retries next iteration, and a failed sample queue
+            // does NOT advance the extractor (the sample retries with a fresh
+            // buffer rather than being silently skipped).
+            while (!st.input_done and cushionLoad(st) < RING_SIZE) {
                 const in_idx = AMediaCodec_dequeueInputBuffer(st.codec, 0);
                 if (in_idx < 0) break; // no free input buffer right now
                 const idx: usize = @intCast(in_idx);
@@ -426,28 +479,34 @@ const AndroidVideoDecoder = struct {
                 const buf = AMediaCodec_getInputBuffer(st.codec, idx, &cap) orelse break;
                 const n = AMediaExtractor_readSampleData(st.extractor, buf, cap);
                 if (n < 0) {
-                    _ = AMediaCodec_queueInputBuffer(st.codec, idx, 0, 0, 0, FLAG_EOS);
-                    st.input_done = true;
+                    if (AMediaCodec_queueInputBuffer(st.codec, idx, 0, 0, 0, FLAG_EOS) == AMEDIA_OK)
+                        st.input_done = true;
                 } else {
                     // Tag the sample with the extractor's current presentation
                     // time (clamped ≥ 0) for PTS accuracy — read BEFORE advance.
                     const sample_us = AMediaExtractor_getSampleTime(st.extractor);
                     const time_us: u64 = @intCast(@max(sample_us, 0));
-                    _ = AMediaCodec_queueInputBuffer(st.codec, idx, 0, @intCast(n), time_us, 0);
+                    if (AMediaCodec_queueInputBuffer(st.codec, idx, 0, @intCast(n), time_us, 0) != AMEDIA_OK) break;
                     _ = AMediaExtractor_advance(st.extractor);
                     did_work = true;
                 }
             }
 
-            // -- Move decoded frames into ring slots, ONE render per iteration,
-            // ONLY while the ring has room. Rendering only what we can hold is
-            // load-bearing: draining ALL decoded output but consuming at
-            // ~playback rate overflowed the reader and DROPPED ~85% of frames —
-            // the survivors were sparse and the video crawled at ~5 fps. Leaving
-            // un-rendered output in the codec back-pressures it instead. Acquire
-            // may lag a render by one iteration (async surface handoff); it
-            // self-catches next time around.
-            while (ringCount(st) < RING_SIZE) {
+            // -- Publish frames that finished the async surface handoff on a
+            // previous iteration (their release preceded the acquire being
+            // ready). Runs even when the codec has no new output, so the last
+            // frames of a clip can't sit unacquired in the reader.
+            while (publishOne(st)) did_work = true;
+
+            // -- Render decoded output toward the reader, ONE frame per
+            // iteration, ONLY while the cushion (ring + pending handoffs) has
+            // room. Rendering only what we can hold is load-bearing: draining
+            // ALL decoded output but consuming at ~playback rate overflowed the
+            // reader and DROPPED ~85% of frames — the survivors were sparse and
+            // the video crawled at ~5 fps. Leaving un-rendered output in the
+            // codec back-pressures it instead. `pending` (not just ring_count)
+            // bounds the loop so lagging acquires can't let renders run ahead.
+            while (cushionLoad(st) < RING_SIZE) {
                 var info: BufferInfo = undefined;
                 const out_idx = AMediaCodec_dequeueOutputBuffer(st.codec, &info, 0);
                 if (out_idx == INFO_FORMAT_CHANGED) {
@@ -460,32 +519,48 @@ const AndroidVideoDecoder = struct {
                     st.eof_seen = true;
                     st.mutex.unlock();
                 }
-                _ = AMediaCodec_releaseOutputBuffer(st.codec, @intCast(out_idx), true);
-
-                // Acquire whatever is ready (FIFO) and copy it into the tail
-                // slot. The slot is invisible to the render thread until
-                // `ring_count` is bumped, so the (slow) copy runs unlocked.
-                var img_opt: ?*Image = null;
-                if (AImageReader_acquireNextImage(st.reader, &img_opt) == AMEDIA_OK) {
-                    if (img_opt) |img| {
-                        defer AImage_delete(img);
-                        lock(&st.mutex);
-                        const tail = (st.ring_head + st.ring_count) % RING_SIZE;
-                        st.mutex.unlock();
-                        const slot = &st.ring[tail];
-                        if (fillPlanes(st, img, slot.y, slot.u, slot.v)) {
-                            slot.pts = imageTimestamp(img);
-                            lock(&st.mutex);
-                            st.ring_count += 1;
-                            st.mutex.unlock();
-                        }
-                        did_work = true;
-                    }
-                }
+                // Only a non-empty buffer produces a frame in the reader (the
+                // EOS carrier is typically zero-size); render and count it as
+                // pending only then, or `pending` would never drain and `eof()`
+                // would never fire.
+                const has_frame = info.size > 0;
+                _ = AMediaCodec_releaseOutputBuffer(st.codec, @intCast(out_idx), has_frame);
+                if (!has_frame) continue;
+                lock(&st.mutex);
+                st.pending += 1;
+                st.mutex.unlock();
+                did_work = true;
+                // Common case: the frame is already acquirable — publish now.
+                _ = publishOne(st);
             }
 
-            // Idle (ring full, or codec has nothing yet): back off briefly.
-            if (!did_work) _ = usleep(2000);
+            // Failsafe: `pending` expects every released frame to become
+            // acquirable, but the reader's BufferQueue MAY drop frames
+            // internally (async/mailbox semantics under load) — a release with
+            // no matching acquire, ever. After EOS that would pin `pending` > 0
+            // and hold `eof()` false forever: the intro freezes on its last
+            // frame and never hands off (observed on-device). If the stream is
+            // done and ~100 ms of drain attempts surface nothing, the remaining
+            // pending frames are gone — write them off so eof() can fire. A
+            // genuinely in-flight frame arrives within a couple of iterations,
+            // so the timeout only triggers on true drops.
+            if (!did_work) {
+                var stuck = false;
+                {
+                    lock(&st.mutex);
+                    defer st.mutex.unlock();
+                    stuck = st.eof_seen and st.pending > 0;
+                }
+                if (stuck) {
+                    pending_dry += 1;
+                    if (pending_dry >= 50) { // ~100 ms of consecutive dry drains
+                        lock(&st.mutex);
+                        st.pending = 0;
+                        st.mutex.unlock();
+                    }
+                } else pending_dry = 0;
+                _ = usleep(2000); // idle: back off briefly
+            } else pending_dry = 0;
         }
     }
 
