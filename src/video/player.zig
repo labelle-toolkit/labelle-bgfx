@@ -46,9 +46,12 @@ pub const AudioHooks = struct {
     clock: ?*const fn (ctx: ?*anyopaque) f64 = null,
 };
 
-/// Cap on frames decoded-and-dropped in one `update` while catching up, so a
-/// long stall can't trigger a decode spiral that stalls the render thread.
-const MAX_CATCHUP_FRAMES = 4;
+/// Cap on frames consumed in one `update` while catching up. Lowered 4 -> 2
+/// (perf/video-feed-ahead): with the Android decoder now feeding ahead into a
+/// FIFO cushion, one `update` rarely needs to consume more than the next frame,
+/// and capping tight keeps a post-stall catch-up from spiking the frame loop —
+/// the cushion absorbs the slack across the following updates instead.
+const MAX_CATCHUP_FRAMES = 2;
 
 pub fn Player(comptime Decoder: type) type {
     return struct {

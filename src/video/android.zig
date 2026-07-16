@@ -130,6 +130,8 @@ const AndroidVideoDecoder = struct {
     extern fn AImageReader_new(width: i32, height: i32, format: i32, max_images: i32, reader: *?*ImageReader) i32;
     extern fn AImageReader_getWindow(*ImageReader, window: *?*Window) i32;
     extern fn AImageReader_acquireLatestImage(*ImageReader, image: *?*Image) i32;
+    // FIFO acquire (oldest un-acquired) — feed-ahead consumes the reader in order.
+    extern fn AImageReader_acquireNextImage(*ImageReader, image: *?*Image) i32;
     extern fn AImageReader_delete(*ImageReader) void;
     const CropRect = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
     extern fn AImage_getNumberOfPlanes(*const Image, num: *i32) i32;
@@ -260,56 +262,68 @@ const AndroidVideoDecoder = struct {
         return self.eof_seen;
     }
 
-    /// Pump one decode step (feed at most one input sample, drain one output
-    /// buffer) and acquire the most recent rendered frame as a YUV_420_888
-    /// AImage, or null if no frame is ready this call. The caller OWNS the
-    /// returned image and must `AImage_delete` it. Shared by the RGBA
-    /// (`decodeFrame`) and plane (`decodeFramePlanes`) output paths.
+    // Feed-ahead tunables (perf/video-feed-ahead). All codec dequeues below use
+    // a 0µs (NON-BLOCKING) timeout so a decode step never stalls the frame-loop
+    // thread that calls `player.update`. We feed the codec's input queue ahead
+    // and drain its output into the ImageReader FIFO so a small cushion (bounded
+    // by the reader's max_images=4) absorbs codec/decode jitter.
+    const FEED_AHEAD: u32 = 4; // max input samples queued per pump
+    const DRAIN_AHEAD: u32 = 4; // max output buffers released per pump
+
+    /// Pump a decode step: feed up to `FEED_AHEAD` input samples and drain up to
+    /// `DRAIN_AHEAD` output buffers into the ImageReader (both non-blocking),
+    /// then acquire the OLDEST un-acquired frame (FIFO) as a YUV_420_888 AImage,
+    /// or null if none is ready this call. The caller OWNS the returned image and
+    /// must `AImage_delete` it. Shared by the RGBA (`decodeFrame`) and plane
+    /// (`decodeFramePlanes`) paths.
     fn pumpAndAcquire(self: *AndroidVideoDecoder) ?*Image {
-        // -- Feed input.
-        if (!self.input_done) {
-            const in_idx = AMediaCodec_dequeueInputBuffer(self.codec, 2000);
-            if (in_idx >= 0) {
-                const idx: usize = @intCast(in_idx);
-                var cap: usize = 0;
-                if (AMediaCodec_getInputBuffer(self.codec, idx, &cap)) |buf| {
-                    const n = AMediaExtractor_readSampleData(self.extractor, buf, cap);
-                    if (n < 0) {
-                        _ = AMediaCodec_queueInputBuffer(self.codec, idx, 0, 0, 0, FLAG_EOS);
-                        self.input_done = true;
-                    } else {
-                        // Tag the sample with the extractor's current presentation
-                        // time (clamped ≥ 0) for PTS accuracy — read BEFORE advance.
-                        const sample_us = AMediaExtractor_getSampleTime(self.extractor);
-                        const time_us: u64 = @intCast(@max(sample_us, 0));
-                        _ = AMediaCodec_queueInputBuffer(self.codec, idx, 0, @intCast(n), time_us, 0);
-                        _ = AMediaExtractor_advance(self.extractor);
-                    }
-                }
+        // -- Feed input AHEAD (non-blocking). Keep the hardware decoder's input
+        // queue full so it can keep producing frames during render-thread stalls,
+        // instead of only ever being one sample ahead.
+        var fed: u32 = 0;
+        while (!self.input_done and fed < FEED_AHEAD) : (fed += 1) {
+            const in_idx = AMediaCodec_dequeueInputBuffer(self.codec, 0);
+            if (in_idx < 0) break; // no free input buffer right now
+            const idx: usize = @intCast(in_idx);
+            var cap: usize = 0;
+            const buf = AMediaCodec_getInputBuffer(self.codec, idx, &cap) orelse break;
+            const n = AMediaExtractor_readSampleData(self.extractor, buf, cap);
+            if (n < 0) {
+                _ = AMediaCodec_queueInputBuffer(self.codec, idx, 0, 0, 0, FLAG_EOS);
+                self.input_done = true;
+            } else {
+                // Tag the sample with the extractor's current presentation time
+                // (clamped ≥ 0) for PTS accuracy — read BEFORE advance.
+                const sample_us = AMediaExtractor_getSampleTime(self.extractor);
+                const time_us: u64 = @intCast(@max(sample_us, 0));
+                _ = AMediaCodec_queueInputBuffer(self.codec, idx, 0, @intCast(n), time_us, 0);
+                _ = AMediaExtractor_advance(self.extractor);
             }
         }
 
-        // -- Drain output → render decoded frames into the ImageReader surface.
-        var info: BufferInfo = undefined;
-        const out_idx = AMediaCodec_dequeueOutputBuffer(self.codec, &info, 2000);
-        if (out_idx == INFO_FORMAT_CHANGED) {
-            self.refreshFormat();
-            return null;
-        }
-        if (out_idx >= 0) {
-            // An output buffer tagged FLAG_EOS means the stream is fully drained
-            // (the input-side FLAG_EOS has propagated all the way through). Record
-            // it so `eof()` reports the clip ended.
+        // -- Drain output (non-blocking) → render ready frames into the
+        // ImageReader FIFO. The reader's max_images caps how far ahead the codec
+        // can run (once full it backpressures), so this self-regulates.
+        var drained: u32 = 0;
+        while (drained < DRAIN_AHEAD) : (drained += 1) {
+            var info: BufferInfo = undefined;
+            const out_idx = AMediaCodec_dequeueOutputBuffer(self.codec, &info, 0);
+            if (out_idx == INFO_FORMAT_CHANGED) {
+                self.refreshFormat();
+                continue;
+            }
+            if (out_idx < 0) break; // no output ready right now
+            // FLAG_EOS on an output buffer = the input-side EOS propagated all the
+            // way through; `eof()` then reports the clip ended.
             if (info.flags & FLAG_EOS != 0) self.eof_seen = true;
-            // render = true: send the frame to the ImageReader's surface.
             _ = AMediaCodec_releaseOutputBuffer(self.codec, @intCast(out_idx), true);
         }
 
-        // -- Acquire the most recent rendered frame as a YUV_420_888 AImage.
-        // The render is asynchronous, so an image may not be ready every call;
-        // the caller's catch-up loop retries.
+        // -- Acquire the OLDEST un-acquired frame (FIFO): the player consumes
+        // frames in order and the cushion above absorbs jitter. `acquireLatest`
+        // would DROP the cushion (skip-then-freeze) whenever the codec ran ahead.
         var img_opt: ?*Image = null;
-        if (AImageReader_acquireLatestImage(self.reader, &img_opt) != AMEDIA_OK) return null;
+        if (AImageReader_acquireNextImage(self.reader, &img_opt) != AMEDIA_OK) return null;
         return img_opt;
     }
 
