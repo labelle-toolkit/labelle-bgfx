@@ -229,8 +229,22 @@ pub const resetPostFxFrame = render_target.resetPostFxFrame;
 ///      (`designViewportToPhysical`, HiDPI + letterbox aware) and routed to a
 ///      dedicated camera-segment view (rect + scissor), so N cameras compose
 ///      simultaneously.
+///
+/// Whole-frame post-fx (v1, DECISION for review #2): while a render-target pass
+/// is open (post-fx scene capture / mirror) this is a NO-OP — per-camera
+/// viewports COLLAPSE to whole-frame. The scene renders into the design-sized
+/// RT with the full-canvas NDC basis (a single fullscreen camera composes
+/// correctly; the common post-fx case), and post-fx processes the whole RT.
+/// This is coherent + correct for the documented v1: we neither mis-map a
+/// physical rect into the RT's design space (review #1) nor reuse one RT view
+/// across N camera segments (review #2). Per-camera post-fx is a follow-up.
+///
+/// Degenerate rect (non-positive w/h, review #3): treated as a full-window
+/// clear — resets the NDC basis and restores the full framebuffer — so no
+/// viewport basis / scissor state leaks into the next pass.
 pub fn applyCameraViewport(x: i32, y: i32, w: i32, h: i32) void {
-    if (w <= 0 or h <= 0) return;
+    if (render_target.renderTargetActive()) return; // whole-frame post-fx (v1)
+    if (w <= 0 or h <= 0) return clearViewport();
     const xf: f32 = @floatFromInt(x);
     const yf: f32 = @floatFromInt(y);
     const wf: f32 = @floatFromInt(w);
@@ -243,8 +257,10 @@ pub fn applyCameraViewport(x: i32, y: i32, w: i32, h: i32) void {
 /// Restore full-window rendering (`full_w`×`full_h` PHYSICAL framebuffer px) —
 /// clears the viewport NDC basis (pinned/UI draws return to the full design
 /// canvas + letterbox) and opens a full-window camera segment (or, before the
-/// band engaged this frame, keeps the legacy primary-view path).
+/// band engaged this frame, keeps the legacy primary-view path). No-op mid
+/// render-target pass (whole-frame post-fx v1 — see `applyCameraViewport`).
 pub fn clearCameraViewport(full_w: u16, full_h: u16) void {
+    if (render_target.renderTargetActive()) return; // whole-frame post-fx (v1)
     state.endViewport();
     render_target.clearCameraViewport(full_w, full_h);
 }
@@ -277,10 +293,10 @@ pub fn setViewport(x: i32, y: i32, w: i32, h: i32) void {
 /// hook. Uses the current physical framebuffer size (fed each frame via
 /// `setScreenSize`).
 pub fn clearViewport() void {
-    const fw = state.physicalWidth();
-    const fh = state.physicalHeight();
-    const fwu: u16 = if (fw <= 0) 0 else if (fw >= std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(fw);
-    const fhu: u16 = if (fh <= 0) 0 else if (fh >= std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(fh);
+    // `@max(0, …)` floors negatives to 0; `std.math.cast` returns null on u16
+    // overflow, clamped to maxInt. Both feed a u16 framebuffer rect.
+    const fwu = std.math.cast(u16, @max(0, state.physicalWidth())) orelse std.math.maxInt(u16);
+    const fhu = std.math.cast(u16, @max(0, state.physicalHeight())) orelse std.math.maxInt(u16);
     clearCameraViewport(fwu, fhu);
 }
 // Re-export the post-fx value types so consumers (and the golden harness) can

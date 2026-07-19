@@ -147,14 +147,17 @@ fn allocPostFxView() u16 {
 // `sequenceViews` pins the same relative order explicitly (scene RT views →
 // post-fx band → primary → camera band).
 //
-// Post-fx interaction (v1, documented): when a render-target pass is open
-// (`stack_depth > 0` — the post-fx driver renders the whole scene into its
-// ping-pong target) the band is NOT engaged; a viewport request scopes the
-// ACTIVE RT view's rect + scissor instead. Post-fx therefore stays WHOLE-FRAME:
-// a single camera's viewport composes correctly under post-fx, while N-camera
-// split-screen under an active post-fx stack keeps the pre-#51 last-rect-wins
-// degradation (per-camera band views bound to the RT framebuffer — and
-// re-ordering them before the post-fx band — is the deliberate follow-up).
+// Post-fx interaction (v1, documented): whole-frame COLLAPSE. While a
+// render-target pass is open (`renderTargetActive()` — the post-fx driver
+// renders the whole scene into its design-sized ping-pong target) the gfx
+// facade's `applyCameraViewport`/`clearCameraViewport` are a NO-OP, so this
+// band never engages mid-RT-pass. The scene renders into the RT with the full
+// design canvas (a single fullscreen camera — the common post-fx case —
+// composes correctly), post-fx processes the whole RT, then composites to the
+// backbuffer. This avoids BOTH mis-mapping a physical rect into the RT's design
+// space AND reusing one RT view across N camera segments (round-1 review). True
+// per-camera post-fx (distinct RT-bound band views in target space, ordered
+// before the post-fx band) is the deliberate follow-up.
 
 /// Per-frame cursor for transient camera-segment views. Reset each frame by
 /// `resetCameraFrame` (called from `window.beginFrame`).
@@ -186,17 +189,24 @@ pub fn setCameraPassFramebuffer(fb: bgfx.FrameBufferHandle) void {
 /// Called once per frame from `window.beginFrame` (alongside `resetPostFxFrame`)
 /// so the band is reused frame-to-frame; also restores the active view when the
 /// previous frame ended inside a band segment (e.g. imgui drew into the last
-/// full-window segment).
+/// full-window segment). The active-view restore keys ONLY off the view id
+/// being in the band — not the engagement flag — so a stale band view can never
+/// leak into the new frame's primary-view draws (gemini review).
 pub fn resetCameraFrame() void {
-    if (camera_band_engaged and programs.activeView() >= CAMERA_VIEW_BASE and
-        programs.activeView() <= CAMERA_VIEW_MAX)
-    {
+    if (programs.activeView() >= CAMERA_VIEW_BASE and programs.activeView() <= CAMERA_VIEW_MAX) {
         programs.setActiveView(programs.PRIMARY_VIEW);
     }
     camera_next_view = CAMERA_VIEW_BASE;
     camera_band_engaged = false;
     camera_seg_scissored = false;
     camera_seg_rect = .{ 0, 0, 0, 0 };
+}
+
+/// True while a render-target pass is open (post-fx scene capture / mirror). The
+/// gfx facade consults this to COLLAPSE per-camera viewports to whole-frame
+/// under post-fx (the documented v1) — see `gfx.applyCameraViewport`.
+pub fn renderTargetActive() bool {
+    return stack_depth > 0;
 }
 
 /// Hand out the next transient camera-segment view id for THIS frame.
@@ -243,21 +253,14 @@ fn openCameraSegment(x: u16, y: u16, w: u16, h: u16, scissored: bool) void {
     camera_seg_rect = .{ x, y, w, h };
 }
 
-/// Apply a per-camera screen viewport (the backend half of the gfx renderer's
-/// `applyViewport`, labelle-bgfx#51). Routes subsequent draws into a band
-/// segment carrying this rect + scissor, so each camera of a split-screen frame
-/// renders into its own screen region simultaneously.
-///
-/// Inside an open render-target pass (post-fx scene capture / mirror) the band
-/// is not engaged; the rect + scissor scope the ACTIVE RT view instead — see
-/// the section comment (post-fx stays whole-frame in v1).
+/// Apply a per-camera screen viewport in PHYSICAL framebuffer pixels (the
+/// backend half of the gfx renderer's `applyViewport`, labelle-bgfx#51). Routes
+/// subsequent draws into a band segment carrying this rect + scissor, so each
+/// camera of a split-screen frame renders into its own screen region
+/// simultaneously. Backbuffer-only: the RT-pass collapse (whole-frame post-fx)
+/// is decided one level up in `gfx.applyCameraViewport`, which no-ops when
+/// `renderTargetActive()`, so this never runs mid-RT-pass.
 pub fn applyCameraViewport(x: u16, y: u16, w: u16, h: u16) void {
-    if (stack_depth > 0) {
-        const v = programs.activeView();
-        bgfx.setViewRect(v, x, y, w, h);
-        bgfx.setViewScissor(v, x, y, w, h);
-        return;
-    }
     openCameraSegment(x, y, w, h, true);
 }
 
@@ -267,18 +270,8 @@ pub fn applyCameraViewport(x: u16, y: u16, w: u16, h: u16) void {
 /// (rect + scissor-off on view 0) so viewport-less games are byte-identical to
 /// the pre-#51 renderer; after engagement it opens a full-window band segment
 /// so pinned/UI passes keep executing in submission order over the camera rects.
+/// Backbuffer-only (see `applyCameraViewport`).
 pub fn clearCameraViewport(full_w: u16, full_h: u16) void {
-    if (stack_depth > 0) {
-        // Restore the active RT view to its full rect, scissor off.
-        const v = programs.activeView();
-        if (v >= 1 and v <= RT_VIEW_MAX and targets[v].isValid()) {
-            bgfx.setViewRect(v, 0, 0, targets[v].width, targets[v].height);
-        } else {
-            bgfx.setViewRect(v, 0, 0, full_w, full_h);
-        }
-        bgfx.setViewScissor(v, 0, 0, 0, 0);
-        return;
-    }
     if (!camera_band_engaged) {
         bgfx.setViewRect(programs.PRIMARY_VIEW, 0, 0, full_w, full_h);
         bgfx.setViewScissor(programs.PRIMARY_VIEW, 0, 0, 0, 0);
