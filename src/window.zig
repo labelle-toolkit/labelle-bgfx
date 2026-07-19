@@ -525,6 +525,13 @@ pub fn initHeadless(w: i32, h: i32) bool {
     screen_w = w;
     screen_h = h;
     surface_valid = true;
+    // Keep `current_reset` truthful: init was given `ResetFlags_None` above
+    // (there is no swapchain for the vsync bit to mean anything), but the
+    // module default carries `RESET_VSYNC`. Without this sync, the first
+    // `setVsync(false)` — which the generated loop issues on every
+    // `--uncapped` run — saw a stale "vsync on" and re-issued `bgfx.reset`
+    // (#54). With it, `setVsync(false)` is an early-return no-op.
+    current_reset = bgfx.ResetFlags_None;
 
     bgfx.setViewFrameBuffer(0, headless_fb);
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
@@ -895,6 +902,20 @@ pub fn setVsync(on: bool) void {
     const want: u32 = if (on) RESET_VSYNC else 0;
     if ((current_reset & RESET_VSYNC) == want) return; // already in that mode
     current_reset = (current_reset & ~RESET_VSYNC) | want;
+    // TRUE-surfaceless runs (`initHeadless`, #36) have NO swapchain: bgfx is in
+    // headless mode (`nwh == null` ⇒ `m_headless`) and a `bgfx.reset` with a
+    // non-zero size trips its Debug assert — "Running in headless mode,
+    // resolution of non-existing backbuffer can't be larger than 0x0!"
+    // (bgfx_p.h, #54; ReleaseFast compiled the assert out, which is why only
+    // Debug headless runs died). Vsync paces presentation and there is nothing
+    // to present, so record the flag above and skip the reset. `screen_w/h`
+    // hold the OFFSCREEN framebuffer size here, so the `> 0` guard alone does
+    // not cover this. Windowed runs (including the invisible-window
+    // `--headless` fallback, which has a real swapchain) are unchanged.
+    if (isSurfaceless()) {
+        std.log.debug("bgfx: setVsync({}) ignored — surfaceless headless run has no swapchain", .{on});
+        return;
+    }
     if (screen_w > 0 and screen_h > 0) {
         bgfx.reset(@intCast(screen_w), @intCast(screen_h), current_reset, .Count);
     }
@@ -1133,6 +1154,34 @@ test "window advertises the surface-loss capability via the paired contract hook
     // backend decls directly here so the test is independent of the core pin.
     try testing.expect(supportsSurfaceLoss());
     try testing.expect(@hasDecl(@This(), "surfaceLost") and @hasDecl(@This(), "surfaceRestored"));
+}
+
+test "setVsync under a surfaceless run records the flag but never resets bgfx (#54)" {
+    // Simulate the `initHeadless` end-state: a "valid" offscreen framebuffer
+    // handle, positive cached dims, and `current_reset` synced to None. Both
+    // toggles must flip ONLY the recorded flag — a `bgfx.reset` here would
+    // crash this host test (no bgfx context), and on a real surfaceless run it
+    // trips bgfx's Debug assert "Running in headless mode, resolution of
+    // non-existing backbuffer can't be larger than 0x0!". All globals restored.
+    const saved_fb = headless_fb;
+    const saved_reset = current_reset;
+    const saved_w = screen_w;
+    const saved_h = screen_h;
+    defer {
+        headless_fb = saved_fb;
+        current_reset = saved_reset;
+        screen_w = saved_w;
+        screen_h = saved_h;
+    }
+    headless_fb = .{ .idx = 0 };
+    screen_w = 800;
+    screen_h = 600;
+    current_reset = bgfx.ResetFlags_None;
+
+    setVsync(true); // the engine vsync drain (Options → vsync) headless
+    try testing.expect((current_reset & RESET_VSYNC) != 0);
+    setVsync(false); // the `--uncapped` loop-setup call
+    try testing.expect((current_reset & RESET_VSYNC) == 0);
 }
 
 test "surfaceLost forgets the surface, surfaceRestored marks it live again" {
