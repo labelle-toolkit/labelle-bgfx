@@ -239,12 +239,21 @@ pub const resetPostFxFrame = render_target.resetPostFxFrame;
 /// physical rect into the RT's design space (review #1) nor reuse one RT view
 /// across N camera segments (review #2). Per-camera post-fx is a follow-up.
 ///
-/// Degenerate rect (non-positive w/h, review #3): treated as a full-window
-/// clear — resets the NDC basis and restores the full framebuffer — so no
-/// viewport basis / scissor state leaks into the next pass.
+/// Degenerate rect (non-positive w/h, review #3 + r3): a zero-area viewport
+/// must output ZERO — it is routed to a dedicated EMPTY-clipped band segment
+/// (`applyCameraViewportEmpty`), NOT a full-window fallback (which would draw
+/// the degenerate camera over the whole window — the wrong semantic). The NDC
+/// basis is reset (no meaningful basis for an empty viewport), and because the
+/// draws land in their own clipped view they cannot leak into the previous
+/// camera's segment either.
 pub fn applyCameraViewport(x: i32, y: i32, w: i32, h: i32) void {
     if (render_target.renderTargetActive()) return; // whole-frame post-fx (v1)
-    if (w <= 0 or h <= 0) return clearViewport();
+    if (w <= 0 or h <= 0) {
+        state.endViewport();
+        const fb = physicalFramebuffer();
+        render_target.applyCameraViewportEmpty(fb[0], fb[1]);
+        return;
+    }
     const xf: f32 = @floatFromInt(x);
     const yf: f32 = @floatFromInt(y);
     const wf: f32 = @floatFromInt(w);
@@ -252,6 +261,16 @@ pub fn applyCameraViewport(x: i32, y: i32, w: i32, h: i32) void {
     state.beginViewport(wf, hf);
     const r = state.designViewportToPhysical(xf, yf, wf, hf);
     render_target.applyCameraViewport(r[0], r[1], r[2], r[3]);
+}
+
+/// The current physical framebuffer size (fed each frame via `setScreenSize`)
+/// clamped to the u16 bgfx rects use: `@max(0, …)` floors negatives, and
+/// `std.math.cast` returns null on overflow, clamped to maxInt.
+fn physicalFramebuffer() [2]u16 {
+    return .{
+        std.math.cast(u16, @max(0, state.physicalWidth())) orelse std.math.maxInt(u16),
+        std.math.cast(u16, @max(0, state.physicalHeight())) orelse std.math.maxInt(u16),
+    };
 }
 
 /// Restore full-window rendering (`full_w`×`full_h` PHYSICAL framebuffer px) —
@@ -293,11 +312,8 @@ pub fn setViewport(x: i32, y: i32, w: i32, h: i32) void {
 /// hook. Uses the current physical framebuffer size (fed each frame via
 /// `setScreenSize`).
 pub fn clearViewport() void {
-    // `@max(0, …)` floors negatives to 0; `std.math.cast` returns null on u16
-    // overflow, clamped to maxInt. Both feed a u16 framebuffer rect.
-    const fwu = std.math.cast(u16, @max(0, state.physicalWidth())) orelse std.math.maxInt(u16);
-    const fhu = std.math.cast(u16, @max(0, state.physicalHeight())) orelse std.math.maxInt(u16);
-    clearCameraViewport(fwu, fhu);
+    const fb = physicalFramebuffer();
+    clearCameraViewport(fb[0], fb[1]);
 }
 // Re-export the post-fx value types so consumers (and the golden harness) can
 // build a `PostPass` without importing labelle-core directly.

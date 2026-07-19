@@ -169,6 +169,10 @@ var camera_band_engaged: bool = false;
 /// rect (x, y, w, h) and whether it is scissored (false = full-window segment).
 var camera_seg_rect: [4]u16 = .{ 0, 0, 0, 0 };
 var camera_seg_scissored: bool = false;
+/// True when the current segment is the degenerate EMPTY-clip segment (a
+/// zero-area camera viewport, review r3) — kept distinct from a normal rect so
+/// consecutive degenerate viewports collapse into one band view.
+var camera_seg_empty: bool = false;
 /// Warn once per process when a frame overflows the 32-segment band (the
 /// overflow segments share the last view — degraded rects, never a crash).
 var camera_band_overflow_warned: bool = false;
@@ -199,6 +203,7 @@ pub fn resetCameraFrame() void {
     camera_next_view = CAMERA_VIEW_BASE;
     camera_band_engaged = false;
     camera_seg_scissored = false;
+    camera_seg_empty = false;
     camera_seg_rect = .{ 0, 0, 0, 0 };
 }
 
@@ -250,7 +255,32 @@ fn openCameraSegment(x: u16, y: u16, w: u16, h: u16, scissored: bool) void {
     programs.setActiveView(v);
     camera_band_engaged = true;
     camera_seg_scissored = scissored;
+    camera_seg_empty = false;
     camera_seg_rect = .{ x, y, w, h };
+}
+
+/// Open a band segment that renders NOTHING — a degenerate (zero-area) camera
+/// viewport (labelle-bgfx#51, round-3 review). The view rect stays the full
+/// framebuffer (a VALID viewport — a 0-size bgfx view rect risks driver
+/// validation errors, notably on Metal), but an EMPTY, non-sentinel scissor
+/// `(1, 1, 0, 0)` clips every fragment: origin ≠ 0 so it is NOT bgfx's all-zero
+/// "scissor off" sentinel, and 0 area passes no pixels. So a degenerate camera's
+/// draws land in their OWN clipped-empty band view — they draw nothing AND
+/// cannot leak into the previous camera's segment (the round-2 full-window
+/// fallback was the wrong semantic: a zero-area viewport must output zero).
+/// Consecutive degenerate viewports collapse into one band view.
+pub fn applyCameraViewportEmpty(full_w: u16, full_h: u16) void {
+    if (camera_band_engaged and camera_seg_empty) return; // collapse consecutive
+    const v = nextCameraView();
+    bgfx.setViewFrameBuffer(v, camera_primary_fb);
+    bgfx.setViewClear(v, bgfx.ClearFlags_None, 0, 1.0, 0);
+    bgfx.setViewRect(v, 0, 0, full_w, full_h);
+    bgfx.setViewScissor(v, 1, 1, 0, 0); // empty, non-sentinel → clips all
+    programs.setActiveView(v);
+    camera_band_engaged = true;
+    camera_seg_scissored = true;
+    camera_seg_empty = true;
+    camera_seg_rect = .{ 1, 1, 0, 0 };
 }
 
 /// Apply a per-camera screen viewport in PHYSICAL framebuffer pixels (the
