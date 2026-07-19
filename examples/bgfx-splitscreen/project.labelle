@@ -1,0 +1,41 @@
+.{
+    .name = "example_bgfx_splitscreen",
+    .title = "LaBelle v2 — bgfx 2-camera split-screen",
+    .backend = .bgfx,
+    // Resolve the bgfx backend from THIS repo (the example lives inside
+    // labelle-bgfx) so codegen picks up the per-camera view-id routing
+    // (labelle-bgfx#51). `local:../..` is the repo root relative to this
+    // example dir (examples/bgfx-splitscreen) and resolves in both a plain
+    // checkout and a git worktree.
+    .backend_package = .{
+        .name = "bgfx",
+        .repo = "local:../..",
+        .version = "0.13.1",
+    },
+    .y_axis = .up,
+    .ecs = .mock,
+    // Split-screen pins: engine ≥ 2.6.0 carries the authored `Camera.viewport`
+    // seeding (#761 Phase 2, engine#770) + the tagged multi-camera seeding;
+    // gfx ≥ 1.26 has the tagged camera manager + per-layer camera binding
+    // (camera-bound layers RFC #723 Phase 1).
+    .core_version = "1.26.0",
+    .engine_version = "2.6.0",
+    .gfx_version = "1.28.1",
+    // Local dev checkouts, resolved as siblings of the main labelle-bgfx
+    // checkout (the standard monorepo dev layout).
+    .labelle_version = "local:../../../labelle-cli",
+    .assembler_version = "local:../../../labelle-assembler",
+    .states = .{ "playing" },
+    // Two world layers, one per camera tag: `p1_world` renders through the
+    // "main" camera (world layers bind to "main" implicitly), `p2_world`
+    // through the "p2" camera. Each camera authors its own half-screen
+    // viewport (see scenes/main.jsonc), so the bgfx backend routes each pass
+    // to its own view id (#51) and both halves render SIMULTANEOUSLY. The
+    // pinned `hud` screen layer draws full-window OVER both halves — the
+    // full-window segment path.
+    .layers = .{
+        .{ .name = "p1_world", .order = 0, .space = .world },
+        .{ .name = "p2_world", .order = 1, .space = .world, .camera = "p2" },
+        .{ .name = "hud", .order = 2, .space = .screen },
+    },
+}

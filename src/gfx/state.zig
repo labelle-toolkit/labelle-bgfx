@@ -33,6 +33,60 @@ var fit_scale_y: f32 = 1.0;
 var fit_active: bool = true;
 var active_camera: ?Camera2D = null;
 
+// ── Per-camera viewport NDC basis (N-camera split-screen, labelle-bgfx#51) ──
+// A split-screen camera renders into a SUB-RECT of the framebuffer (a bgfx
+// view rect, set by the camera-segment path). The gfx camera authors its
+// projection in that viewport's OWN design pixels — its `offset` is
+// `viewport_dims/2`, so a world point at the camera centre lands at
+// design (vp_w/2, vp_h/2). For that centre to map to the MIDDLE of the
+// sub-rect, NDC must normalize against the VIEWPORT dims, not the full design
+// canvas — otherwise the content lands at a fraction of the sub-rect and the
+// split looks wrong. When `active_vp` is set (bracketed by
+// `beginViewport`/`endViewport` around each camera pass) `toNdc`/`screenWidth`/
+// `fitScale*` switch to viewport-relative fill: NDC [-1,1] fills the sub-rect
+// (bgfx's `setViewRect` already positions + scales the square to the rect, whose
+// physical aspect equals the design viewport's — see `designViewportToPhysical`
+// — so no extra letterbox is applied inside it). `null` (the default, and the
+// only state on a viewport-less frame — every golden/probe) is byte-identical
+// to the pre-#51 full-canvas mapping.
+const ViewportBasis = struct { w: f32, h: f32 };
+var active_vp: ?ViewportBasis = null;
+
+/// Begin a per-camera viewport pass: NDC now fills a `w`×`h` (DESIGN-pixel)
+/// viewport. Bracketed by `endViewport`; nestless (each camera pass reopens).
+pub fn beginViewport(w: f32, h: f32) void {
+    if (w <= 0 or h <= 0) return;
+    active_vp = .{ .w = w, .h = h };
+}
+
+/// End a per-camera viewport pass — NDC returns to the full design canvas with
+/// its letterbox fit. Called by `clearViewport` and at frame start.
+pub fn endViewport() void {
+    active_vp = null;
+}
+
+/// Map a DESIGN-space viewport rect to the PHYSICAL framebuffer sub-rect bgfx's
+/// `setViewRect`/`setViewScissor` need (top-left origin, u16). Routes both
+/// corners through `designToPhysical` so the sub-rect sits inside the same
+/// letterboxed region the full canvas maps to — on HiDPI/Retina the design rect
+/// is scaled up (e.g. design 400 → physical 800), and under a pillarbox it is
+/// inset by the bars. Returns `.{ x, y, w, h }` clamped to u16.
+pub fn designViewportToPhysical(x: f32, y: f32, w: f32, h: f32) [4]u16 {
+    const tl = designToPhysical(.{ .x = x, .y = y });
+    const br = designToPhysical(.{ .x = x + w, .y = y + h });
+    const px0 = @min(tl.x, br.x);
+    const py0 = @min(tl.y, br.y);
+    const pw = @abs(br.x - tl.x);
+    const ph = @abs(br.y - tl.y);
+    return .{ toU16(px0), toU16(py0), toU16(pw), toU16(ph) };
+}
+
+fn toU16(v: f32) u16 {
+    if (v <= 0) return 0;
+    if (v >= @as(f32, std.math.maxInt(u16))) return std.math.maxInt(u16);
+    return @intFromFloat(v);
+}
+
 /// Toggle the aspect-fit. `false` for `screen_fill` layers (stretch to the
 /// full framebuffer), `true` for normal fitted layers. Backends that don't
 /// implement this make the gfx renderer fall back to treating `screen_fill`
@@ -140,24 +194,31 @@ pub fn transformY(y: f32) f32 {
 /// design canvas STRETCHES to fill the whole framebuffer — backdrops cover
 /// the pillarbox bars instead of leaving them as stripes. Mirrors sokol.
 pub fn toNdcX(px: f32) f32 {
+    // Split-screen viewport pass (#51): fill the sub-rect, normalizing by the
+    // viewport's own width so the camera's centre (design vp_w/2) → NDC 0.
+    if (active_vp) |vp| return (px / vp.w) * 2.0 - 1.0;
     const raw = (px / @as(f32, @floatFromInt(design_w))) * 2.0 - 1.0;
     return if (fit_active) raw * fit_scale_x else raw;
 }
 
 pub fn toNdcY(py: f32) f32 {
     // Flip Y: screen top=0 maps to NDC +1
+    if (active_vp) |vp| return 1.0 - (py / vp.h) * 2.0;
     const raw = 1.0 - (py / @as(f32, @floatFromInt(design_h))) * 2.0;
     return if (fit_active) raw * fit_scale_y else raw;
 }
 
 // Respect `fit_active` (like toNdcX/toNdcY): callers that scale sizes by the
 // fit (e.g. drawCircle radius, line thickness) must use 1.0 on `screen_fill`
-// layers, else shapes are mis-sized relative to their stretched positions.
+// layers, else shapes are mis-sized relative to their stretched positions. In a
+// viewport pass (#51) NDC fills the sub-rect, so the fit is 1.0 there too.
 pub fn fitScaleX() f32 {
+    if (active_vp != null) return 1.0;
     return if (fit_active) fit_scale_x else 1.0;
 }
 
 pub fn fitScaleY() f32 {
+    if (active_vp != null) return 1.0;
     return if (fit_active) fit_scale_y else 1.0;
 }
 
@@ -172,12 +233,16 @@ pub fn cameraZoom() f32 {
 }
 
 // Design-space dimensions — the denominators toNdc maps against. drawCircle
-// reads these for its per-axis NDC radius (then multiplies by fitScale*).
+// reads these for its per-axis NDC radius (then multiplies by fitScale*). In a
+// viewport pass (#51) these are the viewport's own dims so a circle's radius
+// scales to the sub-rect the same way toNdc places its centre.
 pub fn screenWidth() i32 {
+    if (active_vp) |vp| return @intFromFloat(vp.w);
     return design_w;
 }
 
 pub fn screenHeight() i32 {
+    if (active_vp) |vp| return @intFromFloat(vp.h);
     return design_h;
 }
 
@@ -208,6 +273,17 @@ pub fn setDesignSize(w: i32, h: i32) void {
     design_w = @max(1, w);
     design_h = @max(1, h);
     recomputeFitScale();
+}
+
+/// Physical framebuffer dimensions (the real surface size fed by
+/// `setScreenSize` each frame). Used by the viewport seam (`clearViewport`,
+/// labelle-bgfx#51) to restore a full-window rect in framebuffer pixels.
+pub fn physicalWidth() i32 {
+    return screen_w;
+}
+
+pub fn physicalHeight() i32 {
+    return screen_h;
 }
 
 /// Design (logical) canvas dimensions — parity with the sokol backend's
@@ -253,6 +329,59 @@ test "screenToDesign maps physical edges to design edges on HiDPI" {
     const c = screenToDesign(800, 600);
     try t.expectApproxEqAbs(@as(f32, 400), c.x, 1e-3);
     try t.expectApproxEqAbs(@as(f32, 300), c.y, 1e-3);
+}
+
+test "viewport NDC basis fills the sub-rect: camera centre → NDC 0 (#51)" {
+    const t = std.testing;
+    setDesignSize(800, 600);
+    setScreenSize(800, 600);
+    defer endViewport();
+
+    // Full-canvas mapping (no viewport): design centre 400 → NDC 0.
+    endViewport();
+    try t.expectApproxEqAbs(@as(f32, 0), toNdcX(400), 1e-4);
+
+    // A right-half viewport (design 400 wide). The gfx camera authors its
+    // projection so a camera-centred world point lands at design vp_w/2 = 200.
+    // With the viewport basis active that must map to NDC 0 — the middle of the
+    // sub-rect bgfx's setViewRect positions on screen — NOT NDC -0.5 (which the
+    // full-canvas 800-wide denominator would give, the split-screen bug).
+    beginViewport(400, 600);
+    try t.expectApproxEqAbs(@as(f32, 0), toNdcX(200), 1e-4); // centre → 0
+    try t.expectApproxEqAbs(@as(f32, -1), toNdcX(0), 1e-4); // left edge → -1
+    try t.expectApproxEqAbs(@as(f32, 1), toNdcX(400), 1e-4); // right edge → +1
+    // Y fills the viewport height too (top → +1, bottom → -1).
+    try t.expectApproxEqAbs(@as(f32, 1), toNdcY(0), 1e-4);
+    try t.expectApproxEqAbs(@as(f32, -1), toNdcY(600), 1e-4);
+    // The viewport basis fills (no letterbox shrink) — fit is 1.0.
+    try t.expectApproxEqAbs(@as(f32, 1), fitScaleX(), 1e-4);
+    try t.expectApproxEqAbs(@as(f32, 1), fitScaleY(), 1e-4);
+
+    // endViewport restores the full-canvas mapping exactly.
+    endViewport();
+    try t.expectApproxEqAbs(@as(f32, 0), toNdcX(400), 1e-4);
+}
+
+test "designViewportToPhysical scales a design viewport into the framebuffer (#51)" {
+    const t = std.testing;
+    // Non-HiDPI, matching surface: a design viewport maps 1:1 to physical.
+    setDesignSize(800, 600);
+    setScreenSize(800, 600);
+    const r = designViewportToPhysical(400, 0, 400, 600);
+    try t.expectEqual(@as(u16, 400), r[0]);
+    try t.expectEqual(@as(u16, 0), r[1]);
+    try t.expectEqual(@as(u16, 400), r[2]);
+    try t.expectEqual(@as(u16, 600), r[3]);
+
+    // HiDPI/Retina (2x, same aspect ⇒ no letterbox): the design viewport is
+    // scaled up to physical pixels, so the right-half design rect (400..800)
+    // becomes the right-half physical rect (800..1600).
+    setScreenSize(1600, 1200);
+    const r2 = designViewportToPhysical(400, 0, 400, 600);
+    try t.expectEqual(@as(u16, 800), r2[0]);
+    try t.expectEqual(@as(u16, 0), r2[1]);
+    try t.expectEqual(@as(u16, 800), r2[2]);
+    try t.expectEqual(@as(u16, 1200), r2[3]);
 }
 
 test "screenToDesign and designToPhysical round-trip (incl. letterbox)" {

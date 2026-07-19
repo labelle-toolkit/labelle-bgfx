@@ -73,8 +73,16 @@ const MAX_VIEW: u16 = 255;
 /// from dst identity — a monotonic transient band — makes v1.28.0's efficient
 /// 2-buffer model correct on bgfx with NO driver change.
 const POSTFX_VIEW_BASE: u16 = 224;
-/// Persistent render-target views live BELOW the post-fx band.
-const RT_VIEW_MAX: u16 = POSTFX_VIEW_BASE - 1; // 223 concurrent RTs — ample
+/// PER-FRAME TRANSIENT CAMERA-SEGMENT views (labelle-bgfx#51): the band right
+/// below the post-fx band. Each per-camera viewport pass of a frame (a
+/// `setViewport` scope from the gfx renderer's layer×camera loop) submits into
+/// its own view here, so N cameras render their own screen rects SIMULTANEOUSLY
+/// — with a single shared view, the last camera's rect won. See the
+/// "Per-camera viewport views" section below.
+const CAMERA_VIEW_BASE: u16 = 192;
+const CAMERA_VIEW_MAX: u16 = POSTFX_VIEW_BASE - 1; // 32 segment views per frame
+/// Persistent render-target views live BELOW the camera band.
+const RT_VIEW_MAX: u16 = CAMERA_VIEW_BASE - 1; // 191 concurrent RTs — ample
 var view_in_use = [_]bool{false} ** (MAX_VIEW + 1);
 
 /// First free render-target view id (1..RT_VIEW_MAX), or null when all are taken.
@@ -110,6 +118,196 @@ fn allocPostFxView() u16 {
     const v = postfx_next_view;
     if (postfx_next_view < MAX_VIEW) postfx_next_view += 1;
     return v;
+}
+
+// ── Per-camera viewport views (N-camera split-screen, labelle-bgfx#51) ──
+// bgfx view state (rect/scissor) is PER-VIEW, not per-draw, and a view's rect
+// is whatever was set LAST when the frame executes. All gfx draws used to share
+// the primary view, so with N active cameras (the gfx renderer's layer-outer /
+// camera-inner loop calling `setViewport` once per camera pass) only the LAST
+// camera's rect survived — every camera's sprites rendered into one rect.
+//
+// Fix: each viewport SEGMENT of a frame — a maximal run of draws under one
+// `setViewport` rect (or one full-window `clearViewport` stretch after the
+// band is engaged) — gets its OWN transient view from this band, carrying its
+// own rect + scissor. Segments are handed out monotonically, so bgfx's
+// ascending-id execution == submission order and the frame composites exactly
+// as the renderer emitted it (world halves, then pinned UI on top, then imgui).
+// Consecutive requests with the SAME state collapse into the current segment,
+// so a single-camera letterboxed frame costs exactly one band view.
+//
+// The band engages LAZILY: until the first real `applyCameraViewport` of a
+// frame, `clearCameraViewport` keeps the legacy behaviour (rect + scissor-off
+// on the PRIMARY view) — a game with no authored viewports (every golden/probe)
+// takes the primary-only path, byte-identical to the pre-#51 renderer.
+//
+// Ordering vs the other bands: with no live render target bgfx's default
+// ascending order runs PRIMARY (0, the frame clear) first, then the camera
+// band — clear first, segments over it, correct. With live targets
+// `sequenceViews` pins the same relative order explicitly (scene RT views →
+// post-fx band → primary → camera band).
+//
+// Post-fx interaction (v1, documented): whole-frame COLLAPSE. While a
+// render-target pass is open (`renderTargetActive()` — the post-fx driver
+// renders the whole scene into its design-sized ping-pong target) the gfx
+// facade's `applyCameraViewport`/`clearCameraViewport` are a NO-OP, so this
+// band never engages mid-RT-pass. The scene renders into the RT with the full
+// design canvas (a single fullscreen camera — the common post-fx case —
+// composes correctly), post-fx processes the whole RT, then composites to the
+// backbuffer. This avoids BOTH mis-mapping a physical rect into the RT's design
+// space AND reusing one RT view across N camera segments (round-1 review). True
+// per-camera post-fx (distinct RT-bound band views in target space, ordered
+// before the post-fx band) is the deliberate follow-up.
+
+/// Per-frame cursor for transient camera-segment views. Reset each frame by
+/// `resetCameraFrame` (called from `window.beginFrame`).
+var camera_next_view: u16 = CAMERA_VIEW_BASE;
+/// Whether any real viewport rect engaged the band THIS frame. Until then the
+/// full-window path stays on the primary view (legacy, golden-identical).
+var camera_band_engaged: bool = false;
+/// The current segment's state, for collapsing identical consecutive requests:
+/// rect (x, y, w, h) and whether it is scissored (false = full-window segment).
+var camera_seg_rect: [4]u16 = .{ 0, 0, 0, 0 };
+var camera_seg_scissored: bool = false;
+/// True when the current segment is the degenerate EMPTY-clip segment (a
+/// zero-area camera viewport, review r3) — kept distinct from a normal rect so
+/// consecutive degenerate viewports collapse into one band view.
+var camera_seg_empty: bool = false;
+/// Warn once per process when a frame overflows the 32-segment band (the
+/// overflow segments share the last view — degraded rects, never a crash).
+var camera_band_overflow_warned: bool = false;
+
+/// The framebuffer camera-segment views render into: INVALID = the backbuffer
+/// (the windowed default). `window.initHeadless` points this at its offscreen
+/// capture framebuffer so a surfaceless run composites camera segments into
+/// the SAME image the capture reads back; cleared on teardown.
+var camera_primary_fb: bgfx.FrameBufferHandle = .{ .idx = INVALID };
+
+/// Point the camera band (and nothing else) at `fb` instead of the backbuffer.
+/// Pass an INVALID handle to restore the backbuffer default.
+pub fn setCameraPassFramebuffer(fb: bgfx.FrameBufferHandle) void {
+    camera_primary_fb = fb;
+}
+
+/// Reset the per-frame camera-segment cursor and drop back to the primary view.
+/// Called once per frame from `window.beginFrame` (alongside `resetPostFxFrame`)
+/// so the band is reused frame-to-frame; also restores the active view when the
+/// previous frame ended inside a band segment (e.g. imgui drew into the last
+/// full-window segment). The active-view restore keys ONLY off the view id
+/// being in the band — not the engagement flag — so a stale band view can never
+/// leak into the new frame's primary-view draws (gemini review).
+pub fn resetCameraFrame() void {
+    if (programs.activeView() >= CAMERA_VIEW_BASE and programs.activeView() <= CAMERA_VIEW_MAX) {
+        programs.setActiveView(programs.PRIMARY_VIEW);
+    }
+    camera_next_view = CAMERA_VIEW_BASE;
+    camera_band_engaged = false;
+    camera_seg_scissored = false;
+    camera_seg_empty = false;
+    camera_seg_rect = .{ 0, 0, 0, 0 };
+}
+
+/// True while a render-target pass is open (post-fx scene capture / mirror). The
+/// gfx facade consults this to COLLAPSE per-camera viewports to whole-frame
+/// under post-fx (the documented v1) — see `gfx.applyCameraViewport`.
+pub fn renderTargetActive() bool {
+    return stack_depth > 0;
+}
+
+/// Hand out the next transient camera-segment view id for THIS frame.
+/// Monotonic within a frame (submit order == bgfx execution order); clamps at
+/// the band top — an absurd segment count reuses the last id (degraded rects
+/// for the overflow, never an out-of-band view id).
+fn nextCameraView() u16 {
+    const v = camera_next_view;
+    if (camera_next_view < CAMERA_VIEW_MAX) {
+        camera_next_view += 1;
+    } else if (!camera_band_overflow_warned) {
+        camera_band_overflow_warned = true;
+        std.log.warn(
+            "bgfx: >{d} viewport segments in one frame — overflow segments share the last view (labelle-bgfx#51)",
+            .{CAMERA_VIEW_MAX - CAMERA_VIEW_BASE + 1},
+        );
+    }
+    return v;
+}
+
+/// Open (or reuse) a band segment with the given rect/scissor state and route
+/// subsequent draws at it. Shared tail of `applyCameraViewport` /
+/// `clearCameraViewport`; `scissored` selects rect-scissor vs scissor-off.
+fn openCameraSegment(x: u16, y: u16, w: u16, h: u16, scissored: bool) void {
+    if (camera_band_engaged and camera_seg_scissored == scissored and
+        camera_seg_rect[0] == x and camera_seg_rect[1] == y and
+        camera_seg_rect[2] == w and camera_seg_rect[3] == h)
+    {
+        return; // identical consecutive request — stay in the current segment
+    }
+    const v = nextCameraView();
+    // Segments composite over the primary's frame clear — never clear here.
+    bgfx.setViewFrameBuffer(v, camera_primary_fb);
+    bgfx.setViewClear(v, bgfx.ClearFlags_None, 0, 1.0, 0);
+    bgfx.setViewRect(v, x, y, w, h);
+    if (scissored) {
+        bgfx.setViewScissor(v, x, y, w, h);
+    } else {
+        bgfx.setViewScissor(v, 0, 0, 0, 0); // bgfx's "scissor off" sentinel
+    }
+    programs.setActiveView(v);
+    camera_band_engaged = true;
+    camera_seg_scissored = scissored;
+    camera_seg_empty = false;
+    camera_seg_rect = .{ x, y, w, h };
+}
+
+/// Open a band segment that renders NOTHING — a degenerate (zero-area) camera
+/// viewport (labelle-bgfx#51, round-3 review). The view rect stays the full
+/// framebuffer (a VALID viewport — a 0-size bgfx view rect risks driver
+/// validation errors, notably on Metal), but an EMPTY, non-sentinel scissor
+/// `(1, 1, 0, 0)` clips every fragment: origin ≠ 0 so it is NOT bgfx's all-zero
+/// "scissor off" sentinel, and 0 area passes no pixels. So a degenerate camera's
+/// draws land in their OWN clipped-empty band view — they draw nothing AND
+/// cannot leak into the previous camera's segment (the round-2 full-window
+/// fallback was the wrong semantic: a zero-area viewport must output zero).
+/// Consecutive degenerate viewports collapse into one band view.
+pub fn applyCameraViewportEmpty(full_w: u16, full_h: u16) void {
+    if (camera_band_engaged and camera_seg_empty) return; // collapse consecutive
+    const v = nextCameraView();
+    bgfx.setViewFrameBuffer(v, camera_primary_fb);
+    bgfx.setViewClear(v, bgfx.ClearFlags_None, 0, 1.0, 0);
+    bgfx.setViewRect(v, 0, 0, full_w, full_h);
+    bgfx.setViewScissor(v, 1, 1, 0, 0); // empty, non-sentinel → clips all
+    programs.setActiveView(v);
+    camera_band_engaged = true;
+    camera_seg_scissored = true;
+    camera_seg_empty = true;
+    camera_seg_rect = .{ 1, 1, 0, 0 };
+}
+
+/// Apply a per-camera screen viewport in PHYSICAL framebuffer pixels (the
+/// backend half of the gfx renderer's `applyViewport`, labelle-bgfx#51). Routes
+/// subsequent draws into a band segment carrying this rect + scissor, so each
+/// camera of a split-screen frame renders into its own screen region
+/// simultaneously. Backbuffer-only: the RT-pass collapse (whole-frame post-fx)
+/// is decided one level up in `gfx.applyCameraViewport`, which no-ops when
+/// `renderTargetActive()`, so this never runs mid-RT-pass.
+pub fn applyCameraViewport(x: u16, y: u16, w: u16, h: u16) void {
+    openCameraSegment(x, y, w, h, true);
+}
+
+/// Restore full-window rendering (`full_w`×`full_h` = the framebuffer size) —
+/// the backend half of the gfx renderer's `clearViewport`. Before any camera
+/// rect engaged the band this frame, this keeps the LEGACY primary-view path
+/// (rect + scissor-off on view 0) so viewport-less games are byte-identical to
+/// the pre-#51 renderer; after engagement it opens a full-window band segment
+/// so pinned/UI passes keep executing in submission order over the camera rects.
+/// Backbuffer-only (see `applyCameraViewport`).
+pub fn clearCameraViewport(full_w: u16, full_h: u16) void {
+    if (!camera_band_engaged) {
+        bgfx.setViewRect(programs.PRIMARY_VIEW, 0, 0, full_w, full_h);
+        bgfx.setViewScissor(programs.PRIMARY_VIEW, 0, 0, 0, 0);
+        return;
+    }
+    openCameraSegment(0, 0, full_w, full_h, false);
 }
 
 /// Create an offscreen render target sized `w`×`h`. Returns an INVALID target
@@ -312,6 +510,15 @@ pub fn reset() void {
         bgfx.setViewFrameBuffer(id, .{ .idx = INVALID });
     }
     postfx_next_view = POSTFX_VIEW_BASE;
+    // And the camera band (#51): drop any headless-capture framebuffer binding
+    // (`setCameraPassFramebuffer`) so no stale handle survives into a restored
+    // context, and reset the per-frame segment state.
+    id = CAMERA_VIEW_BASE;
+    while (id <= CAMERA_VIEW_MAX) : (id += 1) {
+        bgfx.setViewFrameBuffer(id, .{ .idx = INVALID });
+    }
+    camera_primary_fb = .{ .idx = INVALID };
+    resetCameraFrame();
 }
 
 // ── Post-fx sub-surface (full-screen pass stack, labelle-gfx#305 P2 Slice B) ──
@@ -391,12 +598,16 @@ pub fn applyPostPass(pass: PostPass, src: RenderTargetId, dst: RenderTargetId) v
 ///      submits into a monotonic transient view here (`applyPostPass`), so this
 ///      band runs AFTER the scene targets and BEFORE the primary, and within it
 ///      pass order == id order == execution order (the #305 fix);
-///   3. the PRIMARY (0) — composites last;
-///   4. the free RT-band ids — inert (no draws), slot position irrelevant.
+///   3. the PRIMARY (0) — the frame clear + any pre-viewport draws;
+///   4. the CAMERA band (CAMERA_VIEW_BASE..CAMERA_VIEW_MAX), ascending — the
+///      per-camera viewport segments (#51) composite OVER the primary's clear
+///      into the backbuffer, in submission order (matching bgfx's default
+///      ascending order on the no-render-target path);
+///   5. the free RT-band ids — inert (no draws), slot position irrelevant.
 ///
 /// Only ever called once at least one target exists, so a game that uses no
-/// render targets keeps bgfx's untouched default order (primary first) — zero
-/// behavioural change on the common path.
+/// render targets keeps bgfx's untouched default order (primary first, camera
+/// band after by ascending id) — zero behavioural change on the common path.
 fn sequenceViews() void {
     var order: [MAX_VIEW + 1]bgfx.ViewId = undefined;
     var n: u16 = 0;
@@ -416,10 +627,16 @@ fn sequenceViews() void {
         order[n] = id;
         n += 1;
     }
-    // 3. PRIMARY composites last.
+    // 3. PRIMARY: the frame clear + pre-viewport draws.
     order[n] = programs.PRIMARY_VIEW; // 0
     n += 1;
-    // 4. free RT-band ids (inert).
+    // 4. the camera-segment band (#51), ascending — composites over the primary.
+    id = CAMERA_VIEW_BASE;
+    while (id <= CAMERA_VIEW_MAX) : (id += 1) {
+        order[n] = id;
+        n += 1;
+    }
+    // 5. free RT-band ids (inert).
     id = 1;
     while (id <= RT_VIEW_MAX) : (id += 1) {
         if (!view_in_use[id]) {
@@ -460,4 +677,53 @@ test "view-id allocation recycles, skips the primary, and reports exhaustion" {
     // Fully occupied ⇒ exhaustion is reported, not a collision.
     view_in_use = [_]bool{true} ** (MAX_VIEW + 1);
     try testing.expect(allocView() == null);
+}
+
+test "persistent RT views never collide with the camera or post-fx bands" {
+    // The three bands partition [0, MAX_VIEW]: primary (0), persistent RTs
+    // (1..RT_VIEW_MAX), camera segments (CAMERA_VIEW_BASE..CAMERA_VIEW_MAX,
+    // #51), post-fx passes (POSTFX_VIEW_BASE..MAX_VIEW). Pin the boundaries so
+    // a future band resize can't silently overlap them.
+    try testing.expect(RT_VIEW_MAX < CAMERA_VIEW_BASE);
+    try testing.expect(CAMERA_VIEW_MAX < POSTFX_VIEW_BASE);
+    try testing.expect(POSTFX_VIEW_BASE <= MAX_VIEW);
+
+    const saved = view_in_use;
+    defer view_in_use = saved;
+    view_in_use = [_]bool{false} ** (MAX_VIEW + 1);
+    // Even with every RT slot taken, allocView must stop BELOW the camera band.
+    var id: u16 = 1;
+    while (id <= RT_VIEW_MAX) : (id += 1) view_in_use[id] = true;
+    try testing.expect(allocView() == null);
+}
+
+test "camera-segment views are monotonic per frame, clamp at the band top, and reset (#51)" {
+    const saved_cursor = camera_next_view;
+    const saved_engaged = camera_band_engaged;
+    const saved_warned = camera_band_overflow_warned;
+    defer {
+        camera_next_view = saved_cursor;
+        camera_band_engaged = saved_engaged;
+        camera_band_overflow_warned = saved_warned;
+    }
+    camera_next_view = CAMERA_VIEW_BASE;
+    camera_band_engaged = false;
+    camera_band_overflow_warned = true; // silence the overflow warn in the test
+
+    // Monotonic within a frame — segment order == bgfx execution order.
+    const a = nextCameraView();
+    const b = nextCameraView();
+    try testing.expectEqual(CAMERA_VIEW_BASE, a);
+    try testing.expectEqual(CAMERA_VIEW_BASE + 1, b);
+
+    // Clamps at the band top: never a post-fx or RT id.
+    camera_next_view = CAMERA_VIEW_MAX;
+    try testing.expectEqual(CAMERA_VIEW_MAX, nextCameraView());
+    try testing.expectEqual(CAMERA_VIEW_MAX, nextCameraView()); // reuse, no overflow
+
+    // Frame reset returns the cursor to the base and disengages the band.
+    camera_band_engaged = true;
+    resetCameraFrame();
+    try testing.expectEqual(CAMERA_VIEW_BASE, camera_next_view);
+    try testing.expect(!camera_band_engaged);
 }
