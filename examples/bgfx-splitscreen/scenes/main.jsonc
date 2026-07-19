@@ -1,0 +1,99 @@
+{
+    // Main scene — 2-camera split-screen (labelle-bgfx#51).
+    //
+    // Two authored Camera entities: "main" (left half viewport) looks at the
+    // P1 world region around x=400; "p2" (right half viewport) looks at a
+    // DIFFERENT world region around x=2400. The `p1_world` layer renders
+    // through "main" (implicit), `p2_world` through "p2" (bound in
+    // project.labelle). With per-camera bgfx view ids (#51) both halves
+    // render simultaneously; before it, the last camera's rect won and both
+    // layers collapsed into one region. The pinned `hud` shape draws
+    // full-window over the seam.
+    "name": "main",
+    "children": [
+        // ── Cameras ─────────────────────────────────────────────────────
+        {
+            "name": "camera_p1",
+            "components": {
+                "Position": { "x": 400, "y": 300 },
+                "Camera": {
+                    "tag": "main",
+                    "viewport": { "x": 0, "y": 0, "width": 400, "height": 600 }
+                }
+            }
+        },
+        {
+            "name": "camera_p2",
+            "components": {
+                "Position": { "x": 2400, "y": 300 },
+                "Camera": {
+                    "tag": "p2",
+                    "viewport": { "x": 400, "y": 0, "width": 400, "height": 600 }
+                }
+            }
+        },
+        // ── P1 world (around x=400) — cool blue/green shapes ────────────
+        {
+            "name": "p1_block",
+            "components": {
+                "Position": { "x": 400, "y": 300 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 120, "height": 120 } },
+                    "color": { "r": 40, "g": 200, "b": 120, "a": 255 },
+                    "layer": "p1_world",
+                    "z_index": 1
+                }
+            }
+        },
+        {
+            "name": "p1_accent",
+            "components": {
+                "Position": { "x": 280, "y": 420 },
+                "Shape": {
+                    "shape": { "circle": { "radius": 40 } },
+                    "color": { "r": 60, "g": 120, "b": 220, "a": 255 },
+                    "layer": "p1_world",
+                    "z_index": 2
+                }
+            }
+        },
+        // ── P2 world (around x=2400) — warm red/orange shapes ───────────
+        {
+            "name": "p2_block",
+            "components": {
+                "Position": { "x": 2400, "y": 300 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 120, "height": 120 } },
+                    "color": { "r": 230, "g": 70, "b": 60, "a": 255 },
+                    "layer": "p2_world",
+                    "z_index": 1
+                }
+            }
+        },
+        {
+            "name": "p2_accent",
+            "components": {
+                "Position": { "x": 2520, "y": 180 },
+                "Shape": {
+                    "shape": { "circle": { "radius": 40 } },
+                    "color": { "r": 250, "g": 180, "b": 40, "a": 255 },
+                    "layer": "p2_world",
+                    "z_index": 2
+                }
+            }
+        },
+        // ── HUD — pinned screen layer, draws full-window over the seam ──
+        {
+            "name": "hud_seam_badge",
+            "components": {
+                "Position": { "x": 400, "y": 560 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 160, "height": 24 } },
+                    "color": { "r": 240, "g": 240, "b": 240, "a": 255 },
+                    "layer": "hud",
+                    "z_index": 10
+                }
+            }
+        }
+    ]
+}

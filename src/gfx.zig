@@ -15,6 +15,7 @@
 /// Submodules are private file-system neighbours. The public surface
 /// is consumed via `b.dependency("labelle_bgfx", ...).module("gfx")`
 /// which still points at this file.
+const std = @import("std");
 const types = @import("gfx/types.zig");
 const state = @import("gfx/state.zig");
 const programs = @import("gfx/programs.zig");
@@ -209,6 +210,79 @@ pub const postPassSupported = render_target.postPassSupported;
 // passes submit into is reused each frame and never exhausts. Zero-cost (a single
 // store) and a no-op semantically on frames with no post-fx.
 pub const resetPostFxFrame = render_target.resetPostFxFrame;
+
+// ── Per-camera viewport views (N-camera split-screen, labelle-bgfx#51) ──
+// The window contract's `setViewport`/`clearViewport` route here: each
+// per-camera viewport pass of a frame gets its OWN transient bgfx view
+// (rect + scissor), so N active cameras render their screen rects
+// simultaneously instead of sharing one view where the last rect won.
+// `resetCameraFrame` is called from `window.beginFrame`;
+// `setCameraPassFramebuffer` lets `window.initHeadless` retarget the band at
+// its offscreen capture framebuffer (INVALID handle = backbuffer default).
+
+/// Apply a per-camera screen viewport authored in DESIGN pixels (the engine's
+/// `Camera.viewport` space, #51). Two coupled effects:
+///   1. NDC basis: `state.beginViewport` makes the camera's projection fill
+///      this viewport (its centre → the middle of the sub-rect) instead of the
+///      full design canvas — the split-screen placement fix.
+///   2. bgfx view: the design rect is mapped to its PHYSICAL sub-rect
+///      (`designViewportToPhysical`, HiDPI + letterbox aware) and routed to a
+///      dedicated camera-segment view (rect + scissor), so N cameras compose
+///      simultaneously.
+pub fn applyCameraViewport(x: i32, y: i32, w: i32, h: i32) void {
+    if (w <= 0 or h <= 0) return;
+    const xf: f32 = @floatFromInt(x);
+    const yf: f32 = @floatFromInt(y);
+    const wf: f32 = @floatFromInt(w);
+    const hf: f32 = @floatFromInt(h);
+    state.beginViewport(wf, hf);
+    const r = state.designViewportToPhysical(xf, yf, wf, hf);
+    render_target.applyCameraViewport(r[0], r[1], r[2], r[3]);
+}
+
+/// Restore full-window rendering (`full_w`×`full_h` PHYSICAL framebuffer px) —
+/// clears the viewport NDC basis (pinned/UI draws return to the full design
+/// canvas + letterbox) and opens a full-window camera segment (or, before the
+/// band engaged this frame, keeps the legacy primary-view path).
+pub fn clearCameraViewport(full_w: u16, full_h: u16) void {
+    state.endViewport();
+    render_target.clearCameraViewport(full_w, full_h);
+}
+
+pub const resetCameraFrame = resetCameraFrameImpl;
+fn resetCameraFrameImpl() void {
+    state.endViewport();
+    render_target.resetCameraFrame();
+}
+pub const setCameraPassFramebuffer = render_target.setCameraPassFramebuffer;
+
+// ── OPTIONAL viewport hooks the gfx renderer probes on the DRAW backend ──
+// The gfx renderer's per-camera `applyViewport` calls `@hasDecl(BackendImpl,
+// "setViewport")` / `clearViewport` on ITS BackendImpl — which is THIS gfx
+// module (the draw backend, `core.assertBackend(@This())` above), the same
+// shape as `core.mock_backend`. (#50 mistakenly put them on the window module,
+// where the renderer never saw them, so per-camera viewports never engaged on
+// any backend.) `setViewport` takes DESIGN pixels (the engine's
+// `Camera.viewport` space); `clearViewport` restores the full physical
+// framebuffer, whose size is the per-frame `setScreenSize` value.
+
+/// Scope subsequent draws to a per-camera screen viewport (design px) — see
+/// `applyCameraViewport`. The bgfx impl of the renderer's optional
+/// `setViewport` hook, enabling N-camera split-screen (#51).
+pub fn setViewport(x: i32, y: i32, w: i32, h: i32) void {
+    applyCameraViewport(x, y, w, h);
+}
+
+/// Restore full-window rendering — the renderer's optional `clearViewport`
+/// hook. Uses the current physical framebuffer size (fed each frame via
+/// `setScreenSize`).
+pub fn clearViewport() void {
+    const fw = state.physicalWidth();
+    const fh = state.physicalHeight();
+    const fwu: u16 = if (fw <= 0) 0 else if (fw >= std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(fw);
+    const fhu: u16 = if (fh <= 0) 0 else if (fh >= std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(fh);
+    clearCameraViewport(fwu, fhu);
+}
 // Re-export the post-fx value types so consumers (and the golden harness) can
 // build a `PostPass` without importing labelle-core directly.
 pub const PostPass = core.backend_contract.PostPass;

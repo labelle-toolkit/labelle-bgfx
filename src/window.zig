@@ -536,6 +536,11 @@ pub fn initHeadless(w: i32, h: i32) bool {
     bgfx.setViewFrameBuffer(0, headless_fb);
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
     bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));
+    // Per-camera viewport segments (#51) default to the BACKBUFFER — which a
+    // surfaceless run doesn't have. Point the camera band at the offscreen
+    // capture framebuffer so a headless split-screen frame composites into the
+    // same image `captureHeadless` reads back.
+    gfx.setCameraPassFramebuffer(headless_fb);
     return true;
 }
 
@@ -1004,6 +1009,10 @@ pub fn beginFrame() void {
     // frame boundary, so each frame's post-fx passes reuse the same small view band
     // (submit order == bgfx execution order) and it never exhausts across frames.
     gfx.resetPostFxFrame();
+    // Same for the per-camera viewport segment band (#51): rewind the cursor and
+    // return draws to the primary view, so each frame's split-screen passes reuse
+    // the same band.
+    gfx.resetCameraFrame();
     bgfx.setViewRect(0, 0, 0, @intCast(screen_w), @intCast(screen_h));
     // Touch view 0 so bgfx ALWAYS clears + presents it, even on a frame
     // with zero draw calls. `setViewRect` alone does NOT do this — bgfx
@@ -1019,46 +1028,14 @@ pub fn beginFrame() void {
     bgfx.touch(0);
 }
 
-/// Clamp an `i32` screen coordinate into bgfx's `u16` viewport range so a
-/// negative or oversized rect can't underflow / wrap the cast.
-fn clampViewportDim(v: i32) u16 {
-    if (v <= 0) return 0;
-    if (v >= std.math.maxInt(u16)) return std.math.maxInt(u16);
-    return @intCast(v);
-}
-
-/// Apply a screen-space viewport to the main draw view (labelle-engine#761
-/// Phase 2/3). Sizes view 0 (`setViewRect`) and clips its draws to the rect
-/// (`setViewScissor`). Origin is top-left (bgfx convention), matching the
-/// engine's `Camera.viewport` / gfx `ScreenViewport`. This is the real
-/// backend hook the gfx renderer's per-camera `applyViewport` calls; a
-/// backend without it (older/stub) falls back to full-window rendering.
-///
-/// Scope note: all gfx draws currently submit to view 0, and this scopes
-/// that one view. So it delivers a SINGLE authored viewport correctly —
-/// letterbox / minimap / picture-in-picture / a single-camera viewport.
-/// TRUE simultaneous N-camera split-screen (each camera composited into its
-/// own rect in one frame) additionally requires the gfx renderer to submit
-/// each camera to its OWN bgfx view id; with a shared view 0 the last
-/// camera's rect wins. That per-camera-view refactor is the remaining
-/// split-screen piece (tracked on #761); the rect/scissor math here is what
-/// it will drive per view.
-pub fn setViewport(x: i32, y: i32, w: i32, h: i32) void {
-    const vx = clampViewportDim(x);
-    const vy = clampViewportDim(y);
-    const vw = clampViewportDim(w);
-    const vh = clampViewportDim(h);
-    bgfx.setViewRect(0, vx, vy, vw, vh);
-    bgfx.setViewScissor(0, vx, vy, vw, vh);
-}
-
-/// Restore full-window rendering — counterpart to `setViewport`. Resets view
-/// 0 to the whole framebuffer and disables the scissor (an all-zero rect is
-/// bgfx's "scissor off" sentinel).
-pub fn clearViewport() void {
-    bgfx.setViewRect(0, 0, 0, @intCast(screen_w), @intCast(screen_h));
-    bgfx.setViewScissor(0, 0, 0, 0, 0);
-}
+// ── Per-camera viewport (labelle-bgfx#51) — moved to the GFX backend ────
+// `setViewport`/`clearViewport` are OPTIONAL DRAW-backend hooks the gfx
+// renderer probes on its `BackendImpl` (the gfx module) — `@hasDecl(gfx,
+// "setViewport")`. They previously lived HERE (window.zig, added for #761
+// Phase 2 / bgfx#50), where the renderer could never see them — so per-camera
+// viewports (minimap / PiP / split-screen) silently never engaged on any
+// backend. They now live in `src/gfx.zig` (`gfx.setViewport`/`clearViewport`),
+// which forwards to the per-camera view-id band here in `render_target`.
 
 const INVALID_HANDLE: u16 = std.math.maxInt(u16);
 

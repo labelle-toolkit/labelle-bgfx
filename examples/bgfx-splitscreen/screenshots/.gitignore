@@ -1,0 +1,2 @@
+# Large raw captures — keep the small PNGs, ignore the TGAs.
+*.tga
