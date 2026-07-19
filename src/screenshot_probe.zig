@@ -66,6 +66,17 @@ pub fn main() !void {
     }
     std.debug.print("PROBE: headless init OK — renderer={s}\n", .{@tagName(bgfx.getRendererType())});
 
+    // Regression guard for #54: the generated desktop loop calls
+    // `setVsync(false)` right after a surfaceless init on `--uncapped` runs
+    // (`LABELLE_HEADLESS_UNCAPPED`), and the engine's vsync drain can call
+    // `setVsync(true)` later (FP Options → vsync). Both used to reach
+    // `bgfx.reset(w, h, ...)` with no backbuffer and trip bgfx's Debug assert
+    // "Running in headless mode, resolution of non-existing backbuffer can't
+    // be larger than 0x0!". They must be safe no-ops headless.
+    window.setVsync(false);
+    window.setVsync(true);
+    window.setVsync(false);
+
     // Render a known saturated RED frame through the REAL begin/end path — this
     // also exercises the headless-safe beginFrame (it must skip input polling
     // since GLFW was never initialized surfaceless). A couple frames so the clear
