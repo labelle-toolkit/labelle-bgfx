@@ -234,6 +234,10 @@ const AMOTION_EVENT_ACTION_MOVE: i32 = 2;
 const AMOTION_EVENT_ACTION_CANCEL: i32 = 3;
 const AMOTION_EVENT_ACTION_POINTER_DOWN: i32 = 5;
 const AMOTION_EVENT_ACTION_POINTER_UP: i32 = 6;
+// The lifting pointer's index for a POINTER_UP is packed into the high byte of
+// the raw (unmasked) action.
+const AMOTION_EVENT_ACTION_POINTER_INDEX_MASK: i32 = 0xff00;
+const AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT: u5 = 8;
 
 // ── NDK / glue functions we call ────────────────────────────────────
 // Declared `extern` so the linker resolves them from the glue
@@ -564,6 +568,30 @@ fn onInputEvent(app: *android_app, event: *AInputEvent) callconv(.c) c_int {
         const x = AMotionEvent_getX(event, 0);
         const y = AMotionEvent_getY(event, 0);
         input.setTouchPointer(0, x, y, AMotionEvent_getPointerId(event, 0));
+    }
+
+    // Feed the FULL multi-touch set for the camera's pinch-zoom / two-finger /
+    // one-finger-pan gestures (additive to the single-pointer mouse emulation
+    // below). On UP/CANCEL every finger is gone; on POINTER_UP the lifting
+    // pointer is still present in the event, so exclude it.
+    if (action == AMOTION_EVENT_ACTION_UP or action == AMOTION_EVENT_ACTION_CANCEL) {
+        input.setAndroidTouches(&.{}, &.{});
+    } else {
+        const up_index: i32 = if (action == AMOTION_EVENT_ACTION_POINTER_UP)
+            (AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT
+        else
+            -1;
+        var xs: [10]f32 = undefined;
+        var ys: [10]f32 = undefined;
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < count and n < xs.len) : (i += 1) {
+            if (@as(i32, @intCast(i)) == up_index) continue; // this finger is lifting
+            xs[n] = AMotionEvent_getX(event, i);
+            ys[n] = AMotionEvent_getY(event, i);
+            n += 1;
+        }
+        input.setAndroidTouches(xs[0..n], ys[0..n]);
     }
 
     // We model a single pointer (finger 0). Only the FIRST finger going
