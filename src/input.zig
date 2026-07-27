@@ -302,6 +302,15 @@ var pointer_down: bool = false;
 // for mouse button 0 from the raw down signal the glue pushes.
 var pointer_down_prev: bool = false;
 
+// Full Android multi-touch set (physical framebuffer px), fed by the
+// NativeActivity glue on every motion event with EVERY active pointer. The
+// single primary pointer above still drives mouse-emulated UI/hit-testing;
+// this is additive, and is what `getTouchCount`/`getTouchX`/`getTouchY` report
+// so the camera's two-finger pinch-zoom + one-finger pan work on touch (#302).
+var android_touch_count: usize = 0;
+var android_touch_x: [10]f32 = [_]f32{0} ** 10;
+var android_touch_y: [10]f32 = [_]f32{0} ** 10;
+
 var glfw_window: if (no_glfw) ?*anyopaque else ?*glfw.Window = null;
 
 /// Bind to a GLFW window for input polling. Android/wasm have no GLFW window;
@@ -1098,20 +1107,35 @@ pub fn getMouseWheelMove() f32 {
 // single primary pointer via the setters below; the getters then report
 // it as touch index 0 (multi-touch is a later phase).
 
+/// Replace the full Android multi-touch set (physical framebuffer px). Called
+/// by the NativeActivity glue on every motion event with every active pointer,
+/// so the camera's pinch/pan gestures see all fingers (#302).
+pub fn setAndroidTouches(xs: []const f32, ys: []const f32) void {
+    const n = @min(@min(xs.len, ys.len), android_touch_x.len);
+    for (0..n) |i| {
+        android_touch_x[i] = xs[i];
+        android_touch_y[i] = ys[i];
+    }
+    android_touch_count = n;
+}
+
 pub fn getTouchCount() u32 {
-    // Android NativeActivity glue OR wasm HTML5 touch callbacks feed the single
-    // primary pointer into `touch_active`/`touch_*`.
-    if (is_android or is_wasm) return if (touch_active) 1 else 0;
+    // Android reports the full multi-touch set; wasm HTML5 feeds the single
+    // primary pointer into `touch_active` (its pinch is handled separately).
+    if (is_android) return @intCast(android_touch_count);
+    if (is_wasm) return if (touch_active) 1 else 0;
     return 0; // GLFW desktop: no touch support
 }
 
 pub fn getTouchX(index: u32) f32 {
-    if ((is_android or is_wasm) and index == 0 and touch_active) return touch_x;
+    if (is_android) return if (index < android_touch_count) android_touch_x[index] else 0;
+    if (is_wasm and index == 0 and touch_active) return touch_x;
     return 0;
 }
 
 pub fn getTouchY(index: u32) f32 {
-    if ((is_android or is_wasm) and index == 0 and touch_active) return touch_y;
+    if (is_android) return if (index < android_touch_count) android_touch_y[index] else 0;
+    if (is_wasm and index == 0 and touch_active) return touch_y;
     return 0;
 }
 
@@ -1147,6 +1171,7 @@ pub fn setPointerDown(down: bool) void {
 /// goes false so `getTouchCount` reports 0.
 pub fn clearTouch() void {
     touch_active = false;
+    android_touch_count = 0;
 }
 
 // ── Android gamepad feed (called by the NativeActivity glue) ────────
