@@ -86,7 +86,10 @@ fn gameFrame() callconv(.c) void {
     // desktop template. `fixed_dt` (LABELLE_FIXED_DT, #59) overrides the
     // measurement with a pinned timestep so a run is reproducible
     // frame-for-frame; it is null unless the knob was set, so the measured
-    // branch — and the clock read it needs — stays the default.
+    // branch — and the clock read it needs — stays the default. The desktop
+    // template additionally has to reschedule its delayed `--screenshot` off
+    // the fixed timestep (#59); there is no screenshot plumbing in the browser
+    // (see the header note), so there is nothing here to make deterministic.
     const dt: f32 = fixed_dt orelse @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
 
     // Aspect-fit the design canvas (config) into the real canvas size, so

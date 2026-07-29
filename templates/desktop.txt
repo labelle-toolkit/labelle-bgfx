@@ -107,6 +107,25 @@ const BackendGfxType = @import("backend_gfx");
     // so `after_sec` is "seconds since the game entered its main loop".
     var screenshot_req: ?engine.ScreenshotRequest = engine.requestedScreenshot();
     const loop_start_ns: i128 = engine.nowNs();
+    // Deterministic capture point under a fixed timestep (labelle-bgfx#59).
+    // `loop_start_ns` above schedules the capture off WALL CLOCK, which is the
+    // right answer for a normal run but reintroduces exactly the drift #59
+    // removes: a fast machine simulates far more ticks than a slow one before
+    // `after_sec` expires, so per-tick state is reproducible yet the CAPTURED
+    // FRAME isn't, and the golden image still differs run to run. When (and
+    // only when) `fixed_dt` is set, translate the delay into a frame index up
+    // front — `window.captureFrameFor` owns the ceil rounding rule and its
+    // saturation for degenerate delays, and is unit-tested there. null on a
+    // normal run, on a run with no `--screenshot`, and on backends predating
+    // the helper, so the wall-clock gate below stays the default.
+    const capture_frame: ?u64 = if (comptime @hasDecl(window, "captureFrameFor")) blk: {
+        const fdt = fixed_dt orelse break :blk null;
+        const req = screenshot_req orelse break :blk null;
+        break :blk window.captureFrameFor(req.after_sec, fdt);
+    } else null;
+    // Frames simulated so far, 1-based, feeding `capture_frame`. Distinct from
+    // `headless_tick_count`, which only advances when `--ticks` is in play.
+    var frame_index: u64 = 0;
 
     while (!window.shouldQuit()) {
         // Honor `game.quit()` (e.g. the menu Exit button). The engine keeps
@@ -134,10 +153,17 @@ const BackendGfxType = @import("backend_gfx");
         // @max(target_fps, 1) guards a target_fps=0 (unlimited) config.
         // `fixed_dt` (LABELLE_FIXED_DT, #59) short-circuits all of that when the
         // caller has explicitly asked for a reproducible run; it is null on
-        // every normal run, so the measured branch stays the default. The clock
-        // is only read on that branch — `frameDuration` is pure measurement, so
-        // skipping it under a fixed timestep costs nothing.
+        // every normal run, so the measured branch stays the default. Skipping
+        // the clock read is safe even though `frameDuration` is NOT pure — it
+        // carries a `last_frame_ns` baseline across calls — because that
+        // baseline is read nowhere else and `fixed_dt` is constant for the whole
+        // process: the function is either called every frame or never, so there
+        // is no mixed mode that could leave a stale baseline and hand the sim a
+        // giant first delta.
         const dt: f32 = fixed_dt orelse @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
+        // Count the frame whose tick is about to run, so the capture gate below
+        // (which sits AFTER `g.tick`) sees a 1-based count of SIMULATED frames.
+        frame_index += 1;
         // Apply a pending fullscreen/windowed switch requested via
         // `game.setFullscreen`/`toggleFullscreen`. The engine owns the
         // desired flag; the backend owns the platform call. Gated on BOTH
@@ -184,9 +210,16 @@ const BackendGfxType = @import("backend_gfx");
         // carries the path safely into both branches without force-unwrapping.
         var capture_path: ?[:0]const u8 = null;
         if (screenshot_req) |req| {
-            const now_ns: i128 = engine.nowNs();
-            const elapsed_sec: f32 = @as(f32, @floatFromInt(now_ns - loop_start_ns)) / 1_000_000_000.0;
-            if (elapsed_sec >= req.after_sec) capture_path = req.path;
+            if (capture_frame) |target| {
+                // Fixed-timestep run (#59): fire on the frame the delay was
+                // translated into before the loop, so the captured world state
+                // is the same on every machine. No clock is consulted at all.
+                if (frame_index >= target) capture_path = req.path;
+            } else {
+                const now_ns: i128 = engine.nowNs();
+                const elapsed_sec: f32 = @as(f32, @floatFromInt(now_ns - loop_start_ns)) / 1_000_000_000.0;
+                if (elapsed_sec >= req.after_sec) capture_path = req.path;
+            }
         }
         if (comptime @hasDecl(window, "takeScreenshot")) {
             if (capture_path) |path| if (!headless_surfaceless) {
@@ -222,7 +255,11 @@ const BackendGfxType = @import("backend_gfx");
         // can't cut off a capture whose `--after` delay hasn't elapsed) or
         // mid-flush (so the async bgfx readback can flush to disk first).
         // Without that gate, `--ticks` + `--screenshot` together would exit
-        // before the file lands.
+        // before the file lands. Under a fixed timestep (#59) this gate needs
+        // NO change of its own: it keys off `screenshot_req`, which is cleared
+        // on the capture frame, and that frame is now deterministic — so the
+        // run length (max of `--ticks` and the capture frame, plus the fixed
+        // flush margin) is deterministic too, and the whole run reproduces.
         if (headless_max_ticks != 0) headless_tick_count += 1;
         if (screenshot_flush_left > 0) screenshot_flush_left -= 1;
         const screenshot_blocks_exit = screenshot_req != null or screenshot_flush_left > 0;
