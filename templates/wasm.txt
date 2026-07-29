@@ -68,13 +68,26 @@ pub const panic = std.debug.FullPanic(struct {
 {{hooks_init_block}}
 var g_allocator: std.mem.Allocator = undefined;
 
+// Fixed-timestep knob (`LABELLE_FIXED_DT`, labelle-bgfx#59). File scope
+// because `gameFrame` is an emscripten callback with no enclosing loop to
+// hoist a local into — `main` resolves it ONCE before handing the frame
+// callback to emscripten, so the frame path never pays for the lookup.
+// `null` (the default, and the only possible value on a backend predating
+// the helper) means "measure the real frame period", i.e. today's behaviour.
+// Under emscripten the env comes from `Module.ENV`/`ENV` in the JS shell, so
+// this is reachable from a browser harness that wants a deterministic run.
+var fixed_dt: ?f32 = null;
+
 fn gameFrame() callconv(.c) void {
     // Frame-rate-independent sim: derive dt from the real frame period
     // (`window.frameDuration` measures it with a monotonic clock). Clamp to 4
     // frames at target_fps so a stall / backgrounded tab can't explode physics.
     // @max(target_fps, 1) guards a target_fps=0 (unlimited) config. Mirrors the
-    // desktop template.
-    const dt: f32 = @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
+    // desktop template. `fixed_dt` (LABELLE_FIXED_DT, #59) overrides the
+    // measurement with a pinned timestep so a run is reproducible
+    // frame-for-frame; it is null unless the knob was set, so the measured
+    // branch — and the clock read it needs — stays the default.
+    const dt: f32 = fixed_dt orelse @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
 
     // Aspect-fit the design canvas (config) into the real canvas size, so
     // content renders correctly regardless of the browser canvas dimensions.
@@ -112,6 +125,12 @@ pub fn main() !void {
 {{hidden_setup}}    window.initWindow(screen_w, screen_h, screen_title);
     // Note: no `defer window.closeWindow()` — Emscripten keeps running after
     // main returns (the main-loop callback drives the app).
+
+    // Resolve the fixed-timestep knob once (see the `fixed_dt` declaration).
+    // @hasDecl-gated like every other backend helper touchpoint, so a game
+    // built against a bgfx backend without `fixedDt` still compiles and simply
+    // keeps `fixed_dt = null` (measured dt).
+    if (comptime @hasDecl(window, "fixedDt")) fixed_dt = window.fixedDt();
 
     g = AssembledGame.init(allocator);
 

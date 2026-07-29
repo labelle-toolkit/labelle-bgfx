@@ -44,6 +44,17 @@ const BackendGfxType = @import("backend_gfx");
     if (comptime @hasDecl(window, "isUncapped") and @hasDecl(window, "setVsync")) {
         if (window.isUncapped()) window.setVsync(false);
     }
+    // `LABELLE_FIXED_DT=<seconds>`: pin the sim timestep instead of measuring
+    // the frame period, so a run is reproducible frame-for-frame and
+    // tick-indexed golden snapshots can match run to run (labelle-bgfx#59).
+    // Read ONCE here, like `--ticks`/`--uncapped` above — it's a per-run knob,
+    // not something the frame path should getenv 60 times a second. Unset (the
+    // normal case) is `null` and the loop keeps the measured dt below, so this
+    // is purely additive. NOT gated on `isHeadless()` (unlike `--uncapped`):
+    // regenerating goldens locally happens in a normal window, and that run has
+    // to reproduce the headless one exactly. Gated on `@hasDecl` so games built
+    // against bgfx backends predating the helper still compile.
+    const fixed_dt: ?f32 = if (comptime @hasDecl(window, "fixedDt")) window.fixedDt() else null;
     var headless_tick_count: u64 = 0;
     // bgfx's `requestScreenShot` is async: the capture is fulfilled (and the
     // `.tga` flushed to disk) a few `bgfx.frame()` calls later by the
@@ -121,7 +132,12 @@ const BackendGfxType = @import("backend_gfx");
         // the sim ~3x too fast. Clamp to 4 frames at target_fps so a stall /
         // backgrounding can't explode physics. Mirrors the sokol template.
         // @max(target_fps, 1) guards a target_fps=0 (unlimited) config.
-        const dt: f32 = @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
+        // `fixed_dt` (LABELLE_FIXED_DT, #59) short-circuits all of that when the
+        // caller has explicitly asked for a reproducible run; it is null on
+        // every normal run, so the measured branch stays the default. The clock
+        // is only read on that branch — `frameDuration` is pure measurement, so
+        // skipping it under a fixed timestep costs nothing.
+        const dt: f32 = fixed_dt orelse @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
         // Apply a pending fullscreen/windowed switch requested via
         // `game.setFullscreen`/`toggleFullscreen`. The engine owns the
         // desired flag; the backend owns the platform call. Gated on BOTH

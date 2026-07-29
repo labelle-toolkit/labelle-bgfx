@@ -137,6 +137,12 @@ fn gameFrame() callconv(.c) void {
     // a fixed 0.016, so game speed doesn't drift if the device renders below
     // its target rate. Clamp to 4 frames at target_fps so a stall (app
     // backgrounded, GC pause) can't explode physics. Mirrors desktop.txt.
+    // No `LABELLE_FIXED_DT` override here (labelle-bgfx#59), unlike the desktop
+    // and wasm templates: an Android activity is launched by the system with no
+    // environment to inherit, so `window.fixedDt()` is hard-wired to null on
+    // this platform (same reason `envTruthy`/`headlessTicks` fold to their
+    // defaults there) — wiring it in would be provably dead code. Deterministic
+    // tick-indexed capture is a desktop/CI concern anyway.
     const dt: f32 = @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
     // Engine works in the DESIGN canvas (config height); the gfx backend
     // owns the design→surface aspect-fit below. Keep these consistent with

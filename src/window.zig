@@ -794,6 +794,45 @@ pub fn headlessTicks() u64 {
     return std.fmt.parseInt(u64, std.mem.span(raw), 10) catch 0;
 }
 
+/// Fixed simulation timestep in seconds (`LABELLE_FIXED_DT=0.0166667`), or
+/// `null` for "measure the real frame period" — today's default, which is
+/// what every normal run keeps (labelle-bgfx#59).
+///
+/// Why: the measured `dt` below is CORRECT for gameplay (see the
+/// `frameDuration` comment — a hardcoded 0.016 tied game speed to the frame
+/// rate), but it makes a run non-reproducible frame-for-frame: tick N covers
+/// a different slice of simulated time on every run, so anything that indexes
+/// state by tick (golden-snapshot regression testing, the capability
+/// `--headless` + `--screenshot` otherwise unlocks) can never match run to
+/// run. Pinning `dt` plus a bounded `--ticks` gives a run that is
+/// reproducible by construction.
+///
+/// Deliberately NOT gated on `isHeadless()`, unlike `isUncapped()`: a
+/// developer regenerating golden files locally has a window open, and a
+/// deterministic windowed run must reproduce the headless one exactly.
+///
+/// An absent, malformed, non-positive, or non-finite value all degrade to
+/// `null` (= today's behaviour) rather than crashing the game, the same way
+/// `headlessTicks` degrades a malformed count to 0. The optional means
+/// "unset" is representable without stealing a sentinel from the value space.
+pub fn fixedDt() ?f32 {
+    if (is_android) return null; // env vars are never set for an Android activity
+    const raw = getenv("LABELLE_FIXED_DT") orelse return null;
+    return parseFixedDt(std.mem.span(raw));
+}
+
+/// Pure half of `fixedDt` — split out so the accept/reject policy is testable
+/// without a process environment (the tests below drive it directly).
+fn parseFixedDt(raw: []const u8) ?f32 {
+    const secs = std.fmt.parseFloat(f32, raw) catch return null;
+    // `secs > 0` is already false for NaN, so this rejects NaN, 0 and
+    // negatives (all of which would freeze or reverse the sim); `isFinite`
+    // additionally rejects `inf`, which parses fine but would blow up physics
+    // on the first tick.
+    if (!(secs > 0.0) or !std.math.isFinite(secs)) return null;
+    return secs;
+}
+
 // ── Frame timing ───────────────────────────────────────────────────────
 // bgfx has no built-in frame timer (unlike sokol's `sapp.frameDuration`),
 // so we measure the real frame period with a monotonic clock. The
@@ -1159,6 +1198,37 @@ test "setVsync under a surfaceless run records the flag but never resets bgfx (#
     try testing.expect((current_reset & RESET_VSYNC) != 0);
     setVsync(false); // the `--uncapped` loop-setup call
     try testing.expect((current_reset & RESET_VSYNC) == 0);
+}
+
+test "parseFixedDt accepts a positive timestep and rejects everything else (#59)" {
+    // The accept path: the canonical 60 Hz value the issue quotes, plus a
+    // plain integer-ish and an exponent form (parseFloat handles all three).
+    try testing.expectApproxEqAbs(@as(f32, 0.0166667), parseFixedDt("0.0166667").?, 1e-7);
+    try testing.expectApproxEqAbs(@as(f32, 0.02), parseFixedDt(".02").?, 1e-7);
+    try testing.expectApproxEqAbs(@as(f32, 0.016), parseFixedDt("1.6e-2").?, 1e-7);
+
+    // Everything below must degrade to "unset" (= keep the measured default)
+    // rather than crash the game or hand the sim a timestep that freezes it
+    // (0), runs it backwards (negative), or explodes it (inf/NaN).
+    try testing.expect(parseFixedDt("") == null); // env var set but empty
+    try testing.expect(parseFixedDt("frames") == null); // not a number at all
+    try testing.expect(parseFixedDt("0.016x") == null); // trailing junk
+    try testing.expect(parseFixedDt("0") == null);
+    try testing.expect(parseFixedDt("0.0") == null);
+    try testing.expect(parseFixedDt("-0.016") == null);
+    try testing.expect(parseFixedDt("inf") == null);
+    try testing.expect(parseFixedDt("nan") == null);
+}
+
+test "fixedDt is null when LABELLE_FIXED_DT is unset — the default is untouched (#59)" {
+    // The whole point of #59 is that this is OPT-IN: with no env var set (the
+    // state of every test process here, and of every normal run) the accessor
+    // must report "unset" so the generated loop falls through to the measured
+    // frame period. Guard the assertion on the env var actually being absent
+    // so a developer who exports it in their shell doesn't get a bogus failure.
+    if (getenv("LABELLE_FIXED_DT") == null) {
+        try testing.expect(fixedDt() == null);
+    }
 }
 
 test "surfaceLost forgets the surface, surfaceRestored marks it live again" {
