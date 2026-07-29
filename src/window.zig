@@ -794,6 +794,86 @@ pub fn headlessTicks() u64 {
     return std.fmt.parseInt(u64, std.mem.span(raw), 10) catch 0;
 }
 
+/// Fixed simulation timestep in seconds (`LABELLE_FIXED_DT=0.0166667`), or
+/// `null` for "measure the real frame period" — today's default, which is
+/// what every normal run keeps (labelle-bgfx#59).
+///
+/// Why: the measured `dt` below is CORRECT for gameplay (see the
+/// `frameDuration` comment — a hardcoded 0.016 tied game speed to the frame
+/// rate), but it makes a run non-reproducible frame-for-frame: tick N covers
+/// a different slice of simulated time on every run, so anything that indexes
+/// state by tick (golden-snapshot regression testing, the capability
+/// `--headless` + `--screenshot` otherwise unlocks) can never match run to
+/// run. Pinning `dt` plus a bounded `--ticks` gives a run that is
+/// reproducible by construction.
+///
+/// Deliberately NOT gated on `isHeadless()`, unlike `isUncapped()`: a
+/// developer regenerating golden files locally has a window open, and a
+/// deterministic windowed run must reproduce the headless one exactly.
+///
+/// An absent, malformed, non-positive, or non-finite value all degrade to
+/// `null` (= today's behaviour) rather than crashing the game, the same way
+/// `headlessTicks` degrades a malformed count to 0. The optional means
+/// "unset" is representable without stealing a sentinel from the value space.
+pub fn fixedDt() ?f32 {
+    if (is_android) return null; // env vars are never set for an Android activity
+    const raw = getenv("LABELLE_FIXED_DT") orelse return null;
+    return parseFixedDt(std.mem.span(raw));
+}
+
+/// Pure half of `fixedDt` — split out so the accept/reject policy is testable
+/// without a process environment (the tests below drive it directly).
+fn parseFixedDt(raw: []const u8) ?f32 {
+    const secs = std.fmt.parseFloat(f32, raw) catch return null;
+    // `secs > 0` is already false for NaN, so this rejects NaN, 0 and
+    // negatives (all of which would freeze or reverse the sim); `isFinite`
+    // additionally rejects `inf`, which parses fine but would blow up physics
+    // on the first tick.
+    if (!(secs > 0.0) or !std.math.isFinite(secs)) return null;
+    return secs;
+}
+
+/// 1-based frame index on which a delayed screenshot (`--screenshot
+/// --after=<sec>`, labelle-cli#227) must fire when the run is on a FIXED
+/// timestep (labelle-bgfx#59).
+///
+/// Why this exists: pinning `dt` makes per-tick world state reproducible, but
+/// the generated loop's capture gate schedules off WALL CLOCK (`engine.nowNs`
+/// since the loop started). A fast machine therefore reaches a different tick
+/// than a slow one before the delay expires, so the captured image still
+/// differs run to run — deterministic state, non-deterministic capture point,
+/// and the golden-image regression testing #59 set out to unlock still
+/// doesn't work. Translating the delay into a frame index removes the last
+/// wall-clock dependency from the capture path. Only used when `fixedDt()`
+/// returned a value; the measured-dt default keeps the wall-clock gate.
+///
+/// Rounding is CEIL. `after_sec` rarely divides evenly by `dt`, and which
+/// frame lands in the golden has to be decided by a stated rule rather than
+/// by luck: ceil means "the first frame whose accumulated simulated time has
+/// REACHED after_sec", so the capture is never EARLIER than the instant asked
+/// for. The result is clamped to >= 1 because the caller tests it AFTER that
+/// frame's `g.tick`, so frame 1 has already simulated one `dt` — which also
+/// makes `--after=0` capture on frame 1, exactly like the wall-clock gate.
+///
+/// Degenerate inputs saturate to `maxInt(u64)` — "never fires" — which is
+/// precisely what the wall-clock gate does with them (`elapsed >= inf` and
+/// `elapsed >= nan` are both never true). Saturating also keeps the absurd
+/// cases away from `@intFromFloat`, whose out-of-range conversion is illegal
+/// behaviour in safe builds. `fixed_dt_sec` comes from `fixedDt()` and is
+/// therefore already positive and finite; the guard covers a direct caller.
+pub fn captureFrameFor(after_sec: f32, fixed_dt_sec: f32) u64 {
+    if (!std.math.isFinite(after_sec)) return std.math.maxInt(u64);
+    if (!(fixed_dt_sec > 0.0) or !std.math.isFinite(fixed_dt_sec)) return std.math.maxInt(u64);
+    // A negative delay is nonsense but harmless — floor it at 0 so it means
+    // "capture immediately" (frame 1) rather than producing a 0th frame.
+    const frames = @ceil(@max(after_sec, 0.0) / fixed_dt_sec);
+    // 1e18 is far past any real run and well inside f32's exactly-representable
+    // integer range; the negated comparison also catches a `frames` that came
+    // out infinite from a tiny `dt`.
+    if (!(frames < 1.0e18)) return std.math.maxInt(u64);
+    return @max(@as(u64, @intFromFloat(frames)), 1);
+}
+
 // ── Frame timing ───────────────────────────────────────────────────────
 // bgfx has no built-in frame timer (unlike sokol's `sapp.frameDuration`),
 // so we measure the real frame period with a monotonic clock. The
@@ -1159,6 +1239,71 @@ test "setVsync under a surfaceless run records the flag but never resets bgfx (#
     try testing.expect((current_reset & RESET_VSYNC) != 0);
     setVsync(false); // the `--uncapped` loop-setup call
     try testing.expect((current_reset & RESET_VSYNC) == 0);
+}
+
+test "parseFixedDt accepts a positive timestep and rejects everything else (#59)" {
+    // The accept path: the canonical 60 Hz value the issue quotes, plus a
+    // plain integer-ish and an exponent form (parseFloat handles all three).
+    try testing.expectApproxEqAbs(@as(f32, 0.0166667), parseFixedDt("0.0166667").?, 1e-7);
+    try testing.expectApproxEqAbs(@as(f32, 0.02), parseFixedDt(".02").?, 1e-7);
+    try testing.expectApproxEqAbs(@as(f32, 0.016), parseFixedDt("1.6e-2").?, 1e-7);
+
+    // Everything below must degrade to "unset" (= keep the measured default)
+    // rather than crash the game or hand the sim a timestep that freezes it
+    // (0), runs it backwards (negative), or explodes it (inf/NaN).
+    try testing.expect(parseFixedDt("") == null); // env var set but empty
+    try testing.expect(parseFixedDt("frames") == null); // not a number at all
+    try testing.expect(parseFixedDt("0.016x") == null); // trailing junk
+    try testing.expect(parseFixedDt("0") == null);
+    try testing.expect(parseFixedDt("0.0") == null);
+    try testing.expect(parseFixedDt("-0.016") == null);
+    try testing.expect(parseFixedDt("inf") == null);
+    try testing.expect(parseFixedDt("nan") == null);
+}
+
+test "fixedDt is null when LABELLE_FIXED_DT is unset — the default is untouched (#59)" {
+    // The whole point of #59 is that this is OPT-IN: with no env var set (the
+    // state of every test process here, and of every normal run) the accessor
+    // must report "unset" so the generated loop falls through to the measured
+    // frame period. Guard the assertion on the env var actually being absent
+    // so a developer who exports it in their shell doesn't get a bogus failure.
+    if (getenv("LABELLE_FIXED_DT") == null) {
+        try testing.expect(fixedDt() == null);
+    }
+}
+
+test "captureFrameFor pins the delayed-screenshot frame by ceil (#59)" {
+    const dt60: f32 = 0.0166667; // the value #59 quotes for 60 Hz
+
+    // The everyday cases: `--after=<sec>` at 60 Hz becomes the obvious frame.
+    // (1/0.0166667 is 59.99988, so ceil is what lands these on 60/30/120
+    // rather than one frame early — the whole reason the rule is ceil.)
+    try testing.expectEqual(@as(u64, 60), captureFrameFor(1.0, dt60));
+    try testing.expectEqual(@as(u64, 30), captureFrameFor(0.5, dt60));
+    try testing.expectEqual(@as(u64, 120), captureFrameFor(2.0, dt60));
+
+    // Ceil, stated: a delay that does NOT divide evenly rounds UP, so the
+    // capture is never earlier than the simulated instant that was asked for.
+    try testing.expectEqual(@as(u64, 3), captureFrameFor(0.05, 0.02)); // 2.5 → 3
+    // ...and one that divides exactly is NOT pushed to the next frame. Both
+    // operands are exact in binary, so this pins the boundary, not a rounding
+    // artefact.
+    try testing.expectEqual(@as(u64, 2), captureFrameFor(0.5, 0.25));
+
+    // Frames are 1-based (the loop tests this AFTER the frame's `g.tick`), so
+    // "no delay" is frame 1 — matching what the wall-clock gate does today.
+    // A negative delay is floored to the same thing rather than producing 0.
+    try testing.expectEqual(@as(u64, 1), captureFrameFor(0.0, dt60));
+    try testing.expectEqual(@as(u64, 1), captureFrameFor(-3.0, dt60));
+
+    // Degenerate inputs saturate to "never fires", which is exactly what the
+    // wall-clock gate does with them (`elapsed >= inf` / `>= nan` never trip)
+    // — and keeps them away from an out-of-range `@intFromFloat`.
+    const never = std.math.maxInt(u64);
+    try testing.expectEqual(never, captureFrameFor(std.math.inf(f32), dt60));
+    try testing.expectEqual(never, captureFrameFor(std.math.nan(f32), dt60));
+    try testing.expectEqual(never, captureFrameFor(1.0e30, 1.0e-6)); // 1e36 frames
+    try testing.expectEqual(never, captureFrameFor(1.0, 0.0)); // dt fixedDt() can't return
 }
 
 test "surfaceLost forgets the surface, surfaceRestored marks it live again" {
