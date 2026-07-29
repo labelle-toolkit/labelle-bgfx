@@ -159,10 +159,16 @@ jobs:
 
   # Prove the surfaceless render + capture path (labelle-bgfx#36) works with NO
   # display server and NO real GPU — the exact CI scenario `labelle run
-  # --headless --screenshot` targets. Runs the three on-demand probes on a bare
+  # --headless --screenshot` targets. Runs the on-demand probes on a bare
   # Ubuntu runner using Mesa **lavapipe** (a software Vulkan device) with DISPLAY
   # unset, and asserts each reports OK. `initHeadless` forces Vulkan, which
   # lavapipe provides headless (no VK_KHR_surface / swapchain needed).
+  #
+  # `surfaceless-scale-probe` (labelle-bgfx#61) is the one that covers SCALE and
+  # views this backend does not own. The other three render a tiny fixed scene
+  # and were all green while a real game reliably crashed under `initHeadless` —
+  # so "surfaceless works" was, until #61, only ever proved for a scene nothing
+  # like a game's.
   headless-linux:
     name: surfaceless probes (display-less, lavapipe)
     if: ${{ github.event_name == 'pull_request' }}
@@ -209,7 +215,7 @@ jobs:
         run: |
           set -uo pipefail
           fail=0
-          for step in headless-probe mirror-probe screenshot-probe; do
+          for step in headless-probe mirror-probe screenshot-probe surfaceless-scale-probe; do
             echo "::group::$step"
             # No `set -e`, so a non-zero build/run doesn't abort the loop — but
             # capture the exit code and FOLD it into `fail` (a probe that printed
@@ -218,7 +224,7 @@ jobs:
             out=$(zig build "$step" 2>&1); rc=$?
             echo "$out"
             if [ "$rc" -ne 0 ]; then echo "FAIL: $step exited non-zero ($rc)"; fail=1; fi
-            echo "$out" | grep -qE 'HEADLESS_OFFSCREEN_READBACK_OK|HEADLESS_MIRROR_OK|SCREENSHOT_TGA_OK' \
+            echo "$out" | grep -qE 'HEADLESS_OFFSCREEN_READBACK_OK|HEADLESS_MIRROR_OK|SCREENSHOT_TGA_OK|SURFACELESS_SCALE_OK' \
               || { echo "FAIL: $step did not report OK"; fail=1; }
             echo "::endgroup::"
           done

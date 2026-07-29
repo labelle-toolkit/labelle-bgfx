@@ -217,8 +217,9 @@ pub const resetPostFxFrame = render_target.resetPostFxFrame;
 // (rect + scissor), so N active cameras render their screen rects
 // simultaneously instead of sharing one view where the last rect won.
 // `resetCameraFrame` is called from `window.beginFrame`;
-// `setCameraPassFramebuffer` lets `window.initHeadless` retarget the band at
-// its offscreen capture framebuffer (INVALID handle = backbuffer default).
+// `setBackbufferSubstitute` (below) lets `window.initHeadless` retarget the band
+// — and every other view — at its offscreen capture framebuffer (INVALID handle
+// = the real backbuffer, the windowed default).
 
 /// Apply a per-camera screen viewport authored in DESIGN pixels (the engine's
 /// `Camera.viewport` space, #51). Two coupled effects:
@@ -289,7 +290,12 @@ fn resetCameraFrameImpl() void {
     state.endViewport();
     render_target.resetCameraFrame();
 }
-pub const setCameraPassFramebuffer = render_target.setCameraPassFramebuffer;
+/// Substitute a framebuffer for the (non-existent) backbuffer across the whole
+/// bgfx view range — `window.initHeadless`'s surfaceless wiring, labelle-bgfx#61.
+/// Supersedes the narrower `setCameraPassFramebuffer` this replaces, which bound
+/// only the per-camera viewport band (#51) and so left every OTHER unbound view
+/// — Dear ImGui's overlay view above all — pointing at nothing.
+pub const setBackbufferSubstitute = render_target.setBackbufferSubstitute;
 
 // ── OPTIONAL viewport hooks the gfx renderer probes on the DRAW backend ──
 // The gfx renderer's per-camera `applyViewport` calls `@hasDecl(BackendImpl,
@@ -355,6 +361,18 @@ pub const screenToWorld = state.screenToWorld;
 pub const worldToScreen = state.worldToScreen;
 
 // ── Tests ─────────────────────────────────────────────────────────────
+test {
+    // Pull the sub-modules' tests into this test binary. Zig only collects
+    // `test` blocks from a test artifact's ROOT source file unless an imported
+    // file is referenced from a test block like this — so `render_target.zig`'s
+    // view-band bookkeeping (the id ranges that must never collide, and #61's
+    // backbuffer-substitute teardown guard) and `programs.zig`'s were compiled
+    // and never executed. `state.zig` / `astc.zig` are deliberately absent: they
+    // are pure and already have their own host-run artifacts in build.zig.
+    _ = render_target;
+    _ = programs;
+}
+
 // drawMesh (labelle-gfx#290) touches bgfx transient buffers + submit, which
 // need a live device (GPU/window) — not available headless — so its runtime
 // behaviour is exercised on-device. What we CAN pin without a device is the

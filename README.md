@@ -88,3 +88,48 @@ on a machine with a Metal/Vulkan device:
 ```
 zig build material-golden-bless   # overwrites test/golden/material_flash_palette.tga
 ```
+
+## Headless runs (`LABELLE_HEADLESS=1`)
+
+`--headless` (and `--uncapped` / `--ticks`, which imply it) has two
+implementations, and the generated loop picks the first that works:
+
+1. **surfaceless** (`window.initHeadless`, #36) — bgfx comes up with `nwh = null`
+   and renders into an offscreen framebuffer. No window, **no display server**,
+   so it is the one that works on a bare CI box. Needs a Vulkan/Metal device.
+2. **invisible window** — an unmapped GLFW window with a real swapchain. Still
+   needs a display server; used when (1) is unavailable or declined.
+
+### Env knobs
+
+| variable | effect |
+|---|---|
+| `LABELLE_HEADLESS_SURFACELESS=0` | Skip the surfaceless attempt and go straight to the invisible window (#61). Also accepts `false` / `no` / `off` / empty. |
+| `LABELLE_BGFX_ASSERT=continue` | Log a failed bgfx debug assert and keep running instead of breaking. Default is to log **and** break — bgfx's own behaviour, minus the silence. |
+| `LABELLE_BGFX_TRACE=1` | Mirror bgfx's internal trace stream to stderr. Very chatty; off by default. |
+| `LABELLE_BGFX_RENDERER=vulkan\|opengl` | Force the desktop renderer (#30). |
+
+### If a headless run dies with no output
+
+It used to be possible for a bgfx assert to kill the process with
+`STATUS_BREAKPOINT` (`0x80000003`, shown by the shell as `-2147483645`) and
+**nothing on stdout or stderr**: bgfx's built-in callback routes its diagnostics
+through `OutputDebugString`/`syslog` — invisible without a debugger — and then
+calls `bx::debugBreak()`. Since #61 this backend installs its own callback
+(`src/bgfx_callback.zig`), so the assert's file, line and message land on stderr
+as `error(bgfx): FATAL …` first. If you see one, that message names the bug.
+
+### Surfaceless probes
+
+```
+zig build headless-probe            # bgfx inits + reads back with no window (#36)
+zig build mirror-probe              # render target → composite → capture (#36)
+zig build screenshot-probe          # captureHeadless writes a valid TGA (#36)
+zig build surfaceless-scale-probe   # 512 quads + a view this backend doesn't own (#61)
+```
+
+All four run surfaceless and are wired into the display-less CI job.
+`surfaceless-scale-probe` is the one that covers **scale** and **third-party
+views** (Dear ImGui's overlay submits on its own bgfx view): the other three
+render a small fixed scene and were green while a real game crashed two frames
+into gameplay.

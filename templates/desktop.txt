@@ -18,6 +18,12 @@ const BackendGfxType = @import("backend_gfx");
     // and we fall back to the invisible-window path below (an unmapped GLFW
     // window, which still needs a display server). Gated so older bgfx backends
     // without `initHeadless` still build (they take the fallback).
+    //
+    // ESCAPE HATCH (labelle-bgfx#61): `LABELLE_HEADLESS_SURFACELESS=0` makes
+    // `initHeadless` decline the attempt outright, so this same `if` routes the
+    // run down the invisible-window branch — the pre-0.9.0 headless behaviour.
+    // Nothing to do HERE for that: the knob is read inside the backend, so it
+    // works for games generated against an older template too.
     var headless_surfaceless = false;
     if (comptime @hasDecl(window, "isHeadless") and @hasDecl(window, "initHeadless")) {
         if (window.isHeadless()) headless_surfaceless = window.initHeadless(screen_w, screen_h);
