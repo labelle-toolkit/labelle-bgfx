@@ -39,7 +39,9 @@
 //!     WHY first.
 //!   * `LABELLE_BGFX_TRACE=1` — mirror bgfx's very chatty internal trace stream
 //!     (shader/uniform/texture creation, renderer selection …) to stderr. Off
-//!     by default: it is hundreds of lines per startup.
+//!     by default: it is hundreds of lines per startup. DEBUG BUILDS ONLY —
+//!     bgfx gates `BX_TRACE` on `BGFX_CONFIG_DEBUG`, so there is nothing to
+//!     mirror in ReleaseSafe/ReleaseFast (see `traceVargs`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -180,7 +182,21 @@ fn traceVargs(
     // which std.log adds too — trim it so the output isn't double-spaced.
     var len: usize = @min(@as(usize, @intCast(written)), buf.len - 1);
     while (len > 0 and (buf[len - 1] == '\n' or buf[len - 1] == '\r')) len -= 1;
-    log.debug("{s}:{d}: {s}", .{ std.mem.span(file_path), line, buf[0..len] });
+    // Deliberately NOT `log.debug`. The caller opted in through the environment,
+    // so a second, invisible severity filter on top of that opt-in serves no
+    // one: Zig's default log level drops `.debug` in ReleaseSafe and everything
+    // below `.err` in ReleaseFast, so a `std.log` route would swallow traces in
+    // any build where they DID reach us. Write straight to stderr instead.
+    //
+    // Note what this does NOT buy, so nobody re-litigates it: the knob is still
+    // Debug-only in practice, because bgfx itself elides its trace calls in
+    // release. `bgfx_p.h` defines `BGFX_CONFIG_DEBUG` as `BX_CONFIG_DEBUG` and
+    // gates `BX_TRACE` on it, so in ReleaseSafe/ReleaseFast this callback is
+    // never invoked at all — measured: 646 trace lines in Debug, 0 in either
+    // release mode, both AFTER this change. Making it work there would mean
+    // building bgfx with `BGFX_CONFIG_DEBUG=1`, which is a different decision
+    // with a real runtime cost.
+    std.debug.print("bgfx trace: {s}:{d}: {s}\n", .{ std.mem.span(file_path), line, buf[0..len] });
 }
 
 fn profilerBegin(
@@ -257,7 +273,15 @@ fn screenShot(
 
     // Append the extension bgfx's stub used to add. A path too long for the
     // buffer is reported rather than silently truncated into a wrong filename.
-    var path_buf: [1024:0]u8 = undefined;
+    //
+    // Sized to hold the LONGEST path the queue side can hand us plus `.tga`:
+    // `window.pending_screenshot_buf` is `[1024:0]u8`, so `file_path` can be up
+    // to 1023 bytes. An equally-sized buffer here would accept the request at
+    // `takeScreenshot` time and then refuse it at fulfilment for anything in
+    // 1020..1023 — a request that looks queued and never produces a file. The
+    // extra 4 bytes close that gap so every path the caller can queue is a path
+    // this callback can write.
+    var path_buf: [1024 + 4:0]u8 = undefined;
     const out_path = std.fmt.bufPrintZ(&path_buf, "{s}.tga", .{std.mem.span(file_path)}) catch {
         log.err("screenshot: path too long: {s}", .{std.mem.span(file_path)});
         return;
