@@ -72,18 +72,32 @@ fn readPixel(src: bgfx.TextureHandle, x: u16, y: u16) ?[4]u8 {
         null,
         0,
     );
-    defer bgfx.destroyTexture(rb);
+    // NOT `defer destroyTexture(rb)`: `readTexture` is ASYNC. If the readback
+    // never becomes ready below, bgfx may still be holding both the texture and
+    // the destination buffer for a write that lands later — so on that path we
+    // deliberately leak both rather than hand the GPU reclaimed memory. Same
+    // reasoning, and same deliberate leak, as `window.captureHeadless`'s
+    // "leaking buffers to avoid a use-after-free" branch. The probe is a
+    // short-lived process that is about to exit either way.
+    var readback_done = false;
+    defer if (readback_done) bgfx.destroyTexture(rb);
 
     bgfx.blit(0, rb, 0, 0, 0, 0, src, 0, 0, 0, 0, W, H, 1);
-    var pixels: [@as(usize, W) * @as(usize, H) * 4]u8 = undefined;
+    // File-scope, not a stack array, for the same reason: a late GPU write into
+    // a returned-from stack frame would corrupt whatever reused it.
     const ready = bgfx.readTexture(rb, &pixels, 0);
     var f = bgfx.frame(0);
     var guard: u32 = 0;
     while (f < ready and guard < 64) : (guard += 1) f = bgfx.frame(0);
     if (f < ready) return null; // never ready — pixels would be uninitialized
+    readback_done = true;
     const off = (@as(usize, y) * @as(usize, W) + @as(usize, x)) * 4;
     return .{ pixels[off], pixels[off + 1], pixels[off + 2], pixels[off + 3] };
 }
+
+/// Readback destination. File-scope so it outlives `readPixel` — see the
+/// use-after-free note there.
+var pixels: [@as(usize, W) * @as(usize, H) * 4]u8 = undefined;
 
 fn isRedish(p: [4]u8) bool {
     return p[0] > 0x80 and p[1] < 0x40 and p[2] < 0x40;

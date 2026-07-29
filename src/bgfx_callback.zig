@@ -368,6 +368,20 @@ var interface: CallbackInterface = .{ .vtable = &vtable };
 /// so a fatal is never silent on any target.
 pub fn install(init: *bgfx.Init) void {
     init.callback = @ptrCast(&interface);
+
+    // Resolve both environment knobs HERE, on the single thread that is about to
+    // call `bgfx.init`, rather than lazily on first use. `fatal` and
+    // `traceVargs` can be invoked from bgfx's render thread — and, with an
+    // encoder, from several API threads — so a lazy first-write to
+    // `assert_breaks` / `trace_enabled` would be an unsynchronised write racing
+    // concurrent reads. Both racers compute the same value, so it is benign in
+    // practice, but it is still a data race by the language model.
+    //
+    // Priming before `bgfx.init` removes it outright: bgfx spawns its threads
+    // during init, which gives the happens-before edge, and every later access
+    // is a read of an already-populated optional.
+    _ = assertBreaks();
+    _ = traceEnabled();
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
