@@ -5,6 +5,11 @@ const zbgfx = @import("zbgfx");
 const bgfx = zbgfx.bgfx;
 const gfx = @import("gfx");
 const platform = @import("platform.zig");
+/// bgfx's fatal/assert/trace callback (labelle-bgfx#61). Installed on EVERY
+/// `bgfx.init` below so a failed `BX_ASSERT` prints to stderr instead of
+/// `debugBreak()`ing the process with nothing on either stream — the symptom
+/// that made #61 undiagnosable.
+const bgfx_callback = @import("bgfx_callback.zig");
 /// labelle-core, for the comptime window-contract conformance gate below.
 const core = @import("labelle-core");
 
@@ -256,6 +261,7 @@ fn initWindowWasm(w: i32, h: i32) void {
     init.platformData.backBuffer = null;
     init.platformData.backBufferDS = null;
     init.platformData.type = .Default;
+    bgfx_callback.install(&init);
 
     _ = bgfx.init(&init);
 
@@ -293,6 +299,7 @@ fn initWindowAndroid(w: i32, h: i32) void {
     init.platformData.backBuffer = null;
     init.platformData.backBufferDS = null;
     init.platformData.type = .Default;
+    bgfx_callback.install(&init);
 
     _ = bgfx.init(&init);
 
@@ -408,6 +415,7 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     init.platformData.backBuffer = null;
     init.platformData.backBufferDS = null;
     init.platformData.type = .Default;
+    bgfx_callback.install(&init);
 
     if (!bgfx.init(&init)) {
         // The preferred renderer was unavailable. On Windows fall back to OpenGL
@@ -471,6 +479,28 @@ fn headlessRendererType() bgfx.RendererType {
 /// `shouldQuit` returns false while headless) and read the result back with
 /// `takeScreenshot`, which targets this framebuffer instead of a backbuffer.
 pub fn initHeadless(w: i32, h: i32) bool {
+    // ESCAPE HATCH (labelle-bgfx#61): `LABELLE_HEADLESS_SURFACELESS=0` declines
+    // the surfaceless path entirely, so the generated loop's existing
+    // `if (!initHeadless(...))` fallback takes the INVISIBLE-WINDOW branch —
+    // the pre-0.9.0 behaviour, which needs a display server but has a real
+    // swapchain and every windowed code path behind it.
+    //
+    // Why the knob lives HERE rather than in `templates/desktop.txt`: an
+    // already-generated game only picks up a new template by re-running the
+    // assembler, but it picks up a new BACKEND by bumping `backend_package`.
+    // Failing the attempt from inside `initHeadless` therefore gives the escape
+    // hatch to every game that consumes this release, template or not.
+    //
+    // Before #61 there was no way back at all: the fallback only fired when
+    // `initHeadless` RETURNED false, so a game that initialised surfaceless and
+    // then died mid-render (as #61's did) had no working configuration.
+    if (!surfacelessEnabled()) {
+        std.log.info(
+            "bgfx: LABELLE_HEADLESS_SURFACELESS opted out — using the invisible-window headless path",
+            .{},
+        );
+        return false;
+    }
     // Guard before the `@intCast(w/h)` below: a non-positive size is invalid for
     // a framebuffer and would panic the cast to u16 (safe builds) rather than
     // fail gracefully. bgfx also caps textures at 16384, but createFrameBuffer
@@ -499,6 +529,7 @@ pub fn initHeadless(w: i32, h: i32) bool {
     init.platformData.backBuffer = null;
     init.platformData.backBufferDS = null;
     init.platformData.type = .Default;
+    bgfx_callback.install(&init);
 
     if (!bgfx.init(&init)) {
         std.log.err("bgfx: headless init failed (no {s} device available?)", .{@tagName(init.type)});
@@ -533,15 +564,68 @@ pub fn initHeadless(w: i32, h: i32) bool {
     // (#54). With it, `setVsync(false)` is an early-return no-op.
     current_reset = bgfx.ResetFlags_None;
 
-    bgfx.setViewFrameBuffer(0, headless_fb);
+    // EVERY bgfx view — all 256 of them — defaults to the BACKBUFFER, and a
+    // surfaceless run has none. The first draw submitted into a view still on
+    // that default trips, in the Vulkan backend:
+    //
+    //     renderer_vk.cpp: BX_ASSERT(isValid(_fbh) || NULL != m_backBuffer.m_nwh
+    //                              , "Rendering to backbuffer in headless mode.")
+    //
+    // which `bx::debugBreak()`s the process. That is the labelle-bgfx#61 crash:
+    // a real game died ~2 frames into gameplay with `STATUS_BREAKPOINT` and a
+    // silent stderr, because its Dear ImGui overlay submits on its OWN
+    // dedicated view (200) that nothing here binds — the imgui bridge lives in
+    // labelle-imgui and has no idea a run may be surfaceless. It only draws
+    // once the overlay has content, which is exactly why the crash landed two
+    // frames into gameplay rather than at startup, and why the fixed-scene
+    // probes never caught it.
+    //
+    // So make the offscreen framebuffer this run's BACKBUFFER STAND-IN for the
+    // whole view range: any view this backend does not own — the imgui overlay,
+    // a plugin's own view — now lands in the captured image instead of asserting.
+    // This is a DEFAULT, not an override: every view this backend does own
+    // re-binds itself at use (`render_target.create`, `applyPostPass`,
+    // `openCameraSegment`), and a windowed run never calls this at all.
+    //
+    // It also subsumes the older, narrower #51 fix (point just the per-camera
+    // viewport band at the capture framebuffer) — `setBackbufferSubstitute`
+    // records the handle for the camera band AND sweeps the range.
+    gfx.setBackbufferSubstitute(headless_fb);
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
     bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));
-    // Per-camera viewport segments (#51) default to the BACKBUFFER — which a
-    // surfaceless run doesn't have. Point the camera band at the offscreen
-    // capture framebuffer so a headless split-screen frame composites into the
-    // same image `captureHeadless` reads back.
-    gfx.setCameraPassFramebuffer(headless_fb);
     return true;
+}
+
+/// Whether the TRUE-surfaceless headless path (`initHeadless`, #36) may be
+/// attempted at all, per `LABELLE_HEADLESS_SURFACELESS` (labelle-bgfx#61).
+///
+/// Default (unset) is `true` — surfaceless stays the preferred `--headless`
+/// path, since it is the only one that works with no display server. Setting
+/// the var to any falsy spelling (`0`, `false`, `no`, `off`, or empty) declines
+/// it, and the caller falls back to the invisible GLFW window.
+///
+/// Split out from `initHeadless` so the accept/reject policy is unit-testable
+/// (see `parseSurfacelessOptOut`) without a process environment or a GPU.
+pub fn surfacelessEnabled() bool {
+    if (is_android) return true; // env vars are never set for an Android activity
+    const raw = getenv("LABELLE_HEADLESS_SURFACELESS") orelse return true;
+    return !parseSurfacelessOptOut(std.mem.span(raw));
+}
+
+/// Pure half of `surfacelessEnabled`: true when `raw` spells "off".
+///
+/// The falsy set is deliberately generous. This knob is reached for by someone
+/// whose headless run is already broken, often from a CI YAML or a shell they
+/// don't control the conventions of; having `LABELLE_HEADLESS_SURFACELESS=false`
+/// silently mean "yes, stay surfaceless" would be a cruel second failure. An
+/// EMPTY value counts as off too, matching `envTruthy`'s "set but empty is not
+/// set" rule for the other `LABELLE_*` flags.
+fn parseSurfacelessOptOut(raw: []const u8) bool {
+    if (raw.len == 0) return true;
+    inline for (.{ "0", "false", "no", "off" }) |falsy| {
+        if (std.ascii.eqlIgnoreCase(raw, falsy)) return true;
+    }
+    return false;
 }
 
 /// The color attachment of the headless offscreen framebuffer (#36) — for a
@@ -1152,10 +1236,10 @@ pub fn endFrame() void {
 ///
 /// bgfx has no synchronous readback: `requestScreenShot` queues a capture
 /// that bgfx fulfils on the NEXT `bgfx.frame()` by invoking the active
-/// callback's `screenShot`. We pass `BGFX_INVALID_HANDLE` (the backbuffer)
-/// and rely on bgfx's BUILT-IN default callback (no custom callback is
-/// installed at init), which writes the captured pixels to `<path>.tga`
-/// via its embedded image writer.
+/// callback's `screenShot`. We pass `BGFX_INVALID_HANDLE` (the backbuffer);
+/// the capture is written to `<path>.tga` by `bgfx_callback.screenShot` — this
+/// backend's own callback since #61, which reproduces byte-for-byte what bgfx's
+/// built-in stub used to do here (`bimg::imageWriteTga` + the `.tga` suffix).
 ///
 /// IMPORTANT: the request must be queued before the frame swap that
 /// presents the content. The frame loop calls `takeScreenshot` after
@@ -1166,7 +1250,7 @@ pub fn endFrame() void {
 /// an empty, content-less frame and capture that instead — the cause of
 /// the initial blank-screenshot bug.)
 ///
-/// bgfx appends its own `.tga` extension, so a path like `/tmp/shot`
+/// The capture callback appends the `.tga` extension, so a path like `/tmp/shot`
 /// yields `/tmp/shot.tga`.
 ///
 /// The path is COPIED into a static buffer (consumed a frame later in
@@ -1200,6 +1284,16 @@ pub fn drawText(text: [:0]const u8, x: i32, y: i32, font_size: i32, r: u8, g: u8
 
 // ── Tests ────────────────────────────────────────────────────────────────
 const testing = std.testing;
+
+test {
+    // Pull the tests of the files this module owns into the same test binary.
+    // Zig only collects `test` blocks from a test artifact's ROOT source file
+    // unless an imported file is referenced from a test block like this — so
+    // without it, `bgfx_callback.zig`'s C-ABI assertions (the ones that pin the
+    // `screen_shot` arity a stale zbgfx binding got wrong, labelle-bgfx#61)
+    // would compile and never run.
+    _ = bgfx_callback;
+}
 
 test "window advertises the surface-loss capability via the paired contract hooks" {
     // The surface-loss capability (labelle-core #53) is a PAIRED unit: a backend
@@ -1239,6 +1333,30 @@ test "setVsync under a surfaceless run records the flag but never resets bgfx (#
     try testing.expect((current_reset & RESET_VSYNC) != 0);
     setVsync(false); // the `--uncapped` loop-setup call
     try testing.expect((current_reset & RESET_VSYNC) == 0);
+}
+
+test "the surfaceless opt-out recognises every falsy spelling and nothing else (#61)" {
+    // The escape hatch is only useful if it engages when someone reaches for it,
+    // so the falsy set is broad and case-insensitive — and an EMPTY value counts
+    // as off, matching `envTruthy`'s "set but empty is not set" rule.
+    inline for (.{ "0", "false", "FALSE", "no", "No", "off", "OFF", "" }) |off| {
+        try testing.expect(parseSurfacelessOptOut(off));
+    }
+    // Anything else keeps the surfaceless default — including the values a
+    // caller would use to ASK for it, which must never read as "off".
+    inline for (.{ "1", "true", "yes", "on", "00", "falsey", " 0" }) |on| {
+        try testing.expect(!parseSurfacelessOptOut(on));
+    }
+}
+
+test "an Android activity always keeps the surfaceless path (#61)" {
+    // `surfacelessEnabled` short-circuits on Android before touching libc
+    // `getenv`: an activity has no environment to read a `LABELLE_*` knob from,
+    // and the invisible-GLFW-window fallback the opt-out selects does not exist
+    // there at all (no zglfw in the Android graph). Pin the short-circuit so the
+    // escape hatch can never strand an Android build with no path to take.
+    if (is_android) try testing.expect(surfacelessEnabled());
+    try testing.expect(!is_android or surfacelessEnabled());
 }
 
 test "parseFixedDt accepts a positive timestep and rejects everything else (#59)" {

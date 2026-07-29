@@ -454,6 +454,36 @@ pub fn build(b: *std.Build) void {
     const probe_step = b.step("headless-probe", "Run the headless bgfx feasibility probe (#36)");
     probe_step.dependOn(&b.addRunArtifact(probe).step);
 
+    // ── Surfaceless scale + unbound-view probe (labelle-bgfx#61) ────
+    // `zig build surfaceless-scale-probe` — the probe that would have CAUGHT
+    // #61. The three probes above render a tiny fixed scene through view 0 and a
+    // render target, and were all green while a real game reliably died under
+    // `initHeadless`. This one adds the two properties they lack: a many-quad
+    // frame (transient buffer traffic at world scale) and a draw on a bgfx view
+    // this backend does not own — the imgui-overlay shape that was the actual
+    // root cause. Same on-demand wiring as its siblings: Vulkan/Metal + glfw, so
+    // not installed by a plain `zig build`.
+    const scprobe = b.addExecutable(.{
+        .name = "surfaceless_scale_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/surfaceless_scale_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    scprobe.root_module.addImport("zbgfx", zbgfx_mod);
+    scprobe.root_module.addImport("gfx", gfx_mod);
+    scprobe.root_module.addImport("window", window_mod);
+    scprobe.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| scprobe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        scprobe.root_module.linkSystemLibrary("gdi32", .{});
+        scprobe.root_module.linkSystemLibrary("user32", .{});
+    }
+    const scprobe_step = b.step("surfaceless-scale-probe", "Run the surfaceless scale + unbound-view probe (#61)");
+    scprobe_step.dependOn(&b.addRunArtifact(scprobe).step);
+
     // ── Material golden harness (labelle-gfx#305 Slice B, RFC §6) ────────────
     // `zig build material-golden`       — render the fixed flash + palette_swap
     //     scene headless and DIFF it against the committed golden TGA (CI gate).
@@ -683,6 +713,34 @@ pub fn build(b: *std.Build) void {
     // execute the produced binary.
     const window_tests = b.addTest(.{ .root_module = window_mod });
     test_step.dependOn(&window_tests.step);
+    // …and on a NATIVE build, actually RUN those tests (labelle-bgfx#61).
+    //
+    // Compile-checking alone shipped every `test` block in window.zig — and in
+    // the files it imports, now including `bgfx_callback.zig` — as dead weight:
+    // they type-checked and were never executed, so an assertion could be plain
+    // wrong and nothing would say so.
+    //
+    // This is a SECOND artifact rather than a run step on `window_tests` above,
+    // because executing means LINKING: the module carries no native artifacts of
+    // its own, so bgfx/glfw (+ the gdi32/user32 that bgfx's GL code pulls on
+    // Windows) have to be attached here exactly as the probes do. Keeping them
+    // off `window_tests` leaves the cross-compilation contract above untouched —
+    // a foreign target still only ever gets the link-free compile-check, which
+    // is the whole point of that step for `-Dtarget=aarch64-linux-android`.
+    //
+    // None of these tests touch GLFW or a GPU; they drive pure policy helpers
+    // and module globals. The linked libraries are a load-time requirement, not
+    // a runtime one — the same shape as the golden harnesses CI already runs.
+    if (target.query.isNative()) {
+        const window_run = b.addTest(.{ .root_module = window_mod });
+        window_run.root_module.linkLibrary(bgfx_artifact);
+        if (glfw_artifact) |a| window_run.root_module.linkLibrary(a);
+        if (target.result.os.tag == .windows) {
+            window_run.root_module.linkSystemLibrary("gdi32", .{});
+            window_run.root_module.linkSystemLibrary("user32", .{});
+        }
+        test_step.dependOn(&b.addRunArtifact(window_run).step);
+    }
 
     // ── Compile-check gfx.zig for the build target ──────────────────
     // gfx.zig imports only zbgfx (no zglfw), so it already compiled for
@@ -692,6 +750,20 @@ pub fn build(b: *std.Build) void {
     // (gfx/window/input) as required by phase 2.
     const gfx_tests = b.addTest(.{ .root_module = gfx_mod });
     test_step.dependOn(&gfx_tests.step);
+    // And RUN it natively, for the same reason (and with the same link-only-when-
+    // native shape) as `window_run` above: `gfx/render_target.zig`'s view-band
+    // bookkeeping tests — the ids that must never collide, and #61's
+    // backbuffer-substitute teardown guard — were compile-checked and never
+    // executed. gfx pulls no zglfw, so only the bgfx artifact is needed to link.
+    if (target.query.isNative()) {
+        const gfx_run = b.addTest(.{ .root_module = gfx_mod });
+        gfx_run.root_module.linkLibrary(bgfx_artifact);
+        if (target.result.os.tag == .windows) {
+            gfx_run.root_module.linkSystemLibrary("gdi32", .{});
+            gfx_run.root_module.linkSystemLibrary("user32", .{});
+        }
+        test_step.dependOn(&b.addRunArtifact(gfx_run).step);
+    }
 
     // ── Compile-check audio.zig for the build target (Android) ──────
     // On the host, the audio tests below RUN against the real miniaudio

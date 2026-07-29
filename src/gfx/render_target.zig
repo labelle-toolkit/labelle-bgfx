@@ -177,16 +177,42 @@ var camera_seg_empty: bool = false;
 /// overflow segments share the last view — degraded rects, never a crash).
 var camera_band_overflow_warned: bool = false;
 
-/// The framebuffer camera-segment views render into: INVALID = the backbuffer
-/// (the windowed default). `window.initHeadless` points this at its offscreen
-/// capture framebuffer so a surfaceless run composites camera segments into
-/// the SAME image the capture reads back; cleared on teardown.
-var camera_primary_fb: bgfx.FrameBufferHandle = .{ .idx = INVALID };
+/// The framebuffer that STANDS IN for the backbuffer on this run: INVALID means
+/// "bgfx's real backbuffer" (every windowed run), and `window.initHeadless`
+/// points it at the offscreen capture framebuffer so a surfaceless run
+/// composites into the SAME image the capture reads back; cleared on teardown.
+/// Consulted by every binding here that would otherwise mean "the backbuffer" —
+/// the camera-segment band and a destroyed target's freed view.
+var backbuffer_fb: bgfx.FrameBufferHandle = .{ .idx = INVALID };
 
-/// Point the camera band (and nothing else) at `fb` instead of the backbuffer.
-/// Pass an INVALID handle to restore the backbuffer default.
-pub fn setCameraPassFramebuffer(fb: bgfx.FrameBufferHandle) void {
-    camera_primary_fb = fb;
+/// Substitute `fb` for the backbuffer across the WHOLE bgfx view range, and
+/// record it as the default for the views this module binds later.
+///
+/// Called by `window.initHeadless` (labelle-bgfx#61). A surfaceless bgfx has no
+/// backbuffer, yet every one of bgfx's 256 views defaults to it — so ANY view
+/// that receives a draw without an explicit framebuffer binding trips the
+/// Vulkan backend's `"Rendering to backbuffer in headless mode."` assert and
+/// `debugBreak()`s the process. Views this backend owns rebind themselves at
+/// use; views it does NOT own — most importantly Dear ImGui's dedicated overlay
+/// view, which lives in the labelle-imgui bridge and knows nothing about
+/// surfaceless runs — would otherwise be left pointing at nothing. Sweeping the
+/// range makes "unbound" mean "the capture framebuffer" instead of "crash", for
+/// this backend's own views and any third-party one alike.
+///
+/// This SUBSUMES the narrower #51 binding it replaces (which pointed only the
+/// per-camera viewport band at the capture framebuffer).
+///
+/// Pass an INVALID handle to restore the real-backbuffer default (teardown).
+/// The sweep is deliberately one-directional: `reset` unbinds the specific
+/// bands it owns immediately before `bgfx.shutdown`, and re-pointing all 256
+/// views at a backbuffer that may not exist is exactly the state being avoided.
+pub fn setBackbufferSubstitute(fb: bgfx.FrameBufferHandle) void {
+    backbuffer_fb = fb;
+    if (fb.idx == INVALID) return;
+    var view: u16 = 0;
+    while (view <= MAX_VIEW) : (view += 1) {
+        bgfx.setViewFrameBuffer(view, fb);
+    }
 }
 
 /// Reset the per-frame camera-segment cursor and drop back to the primary view.
@@ -244,7 +270,7 @@ fn openCameraSegment(x: u16, y: u16, w: u16, h: u16, scissored: bool) void {
     }
     const v = nextCameraView();
     // Segments composite over the primary's frame clear — never clear here.
-    bgfx.setViewFrameBuffer(v, camera_primary_fb);
+    bgfx.setViewFrameBuffer(v, backbuffer_fb);
     bgfx.setViewClear(v, bgfx.ClearFlags_None, 0, 1.0, 0);
     bgfx.setViewRect(v, x, y, w, h);
     if (scissored) {
@@ -272,7 +298,7 @@ fn openCameraSegment(x: u16, y: u16, w: u16, h: u16, scissored: bool) void {
 pub fn applyCameraViewportEmpty(full_w: u16, full_h: u16) void {
     if (camera_band_engaged and camera_seg_empty) return; // collapse consecutive
     const v = nextCameraView();
-    bgfx.setViewFrameBuffer(v, camera_primary_fb);
+    bgfx.setViewFrameBuffer(v, backbuffer_fb);
     bgfx.setViewClear(v, bgfx.ClearFlags_None, 0, 1.0, 0);
     bgfx.setViewRect(v, 0, 0, full_w, full_h);
     bgfx.setViewScissor(v, 1, 1, 0, 0); // empty, non-sentinel → clips all
@@ -360,7 +386,12 @@ pub fn create(w: u16, h: u16) RenderTarget {
 /// view id can never draw into freed memory.
 pub fn destroy(rt: *RenderTarget) void {
     if (!rt.isValid()) return;
-    bgfx.setViewFrameBuffer(rt.view, .{ .idx = INVALID });
+    // Hand the freed view back to the run's BACKBUFFER STAND-IN, not to a hard
+    // INVALID (labelle-bgfx#61): on a surfaceless run INVALID means "the
+    // backbuffer that does not exist", so a recycled id that ever received a
+    // draw before `create` rebound it would assert inside bgfx. On a windowed
+    // run `backbuffer_fb` IS invalid, so this is byte-identical to the old line.
+    bgfx.setViewFrameBuffer(rt.view, backbuffer_fb);
     bgfx.destroyFrameBuffer(rt.fb);
     if (rt.view <= MAX_VIEW) view_in_use[rt.view] = false; // recycle the id
     // Re-sequence so the freed view drops out of the "render targets before
@@ -510,14 +541,17 @@ pub fn reset() void {
         bgfx.setViewFrameBuffer(id, .{ .idx = INVALID });
     }
     postfx_next_view = POSTFX_VIEW_BASE;
-    // And the camera band (#51): drop any headless-capture framebuffer binding
-    // (`setCameraPassFramebuffer`) so no stale handle survives into a restored
-    // context, and reset the per-frame segment state.
-    id = CAMERA_VIEW_BASE;
-    while (id <= CAMERA_VIEW_MAX) : (id += 1) {
+    // And every remaining view — the camera band (#51) plus, since #61, the
+    // whole range, because `setBackbufferSubstitute` bound ALL 256 views to the
+    // headless capture framebuffer that `window.teardownSurface` is about to
+    // destroy. Sweeping the lot is what guarantees no stale handle survives into
+    // a restored context (Android surface loss), and it is a handful of cheap
+    // state writes on a teardown path.
+    id = 0;
+    while (id <= MAX_VIEW) : (id += 1) {
         bgfx.setViewFrameBuffer(id, .{ .idx = INVALID });
     }
-    camera_primary_fb = .{ .idx = INVALID };
+    backbuffer_fb = .{ .idx = INVALID };
     resetCameraFrame();
 }
 
@@ -695,6 +729,22 @@ test "persistent RT views never collide with the camera or post-fx bands" {
     var id: u16 = 1;
     while (id <= RT_VIEW_MAX) : (id += 1) view_in_use[id] = true;
     try testing.expect(allocView() == null);
+}
+
+test "clearing the backbuffer substitute records the handle and issues no bgfx call (#61)" {
+    // Only the INVALID direction is host-testable: the SUBSTITUTE direction
+    // sweeps all 256 views through `bgfx.setViewFrameBuffer`, which needs a live
+    // device (`surfaceless-scale-probe` covers it on-device, and would fail
+    // without it — verified by reverting the sweep). What matters here is the
+    // early return: teardown passes INVALID, and if that fell through to the
+    // sweep it would re-point every view at a backbuffer a surfaceless run does
+    // not have — reintroducing the very state #61 is about — as well as crashing
+    // this host test outright.
+    const saved = backbuffer_fb;
+    defer backbuffer_fb = saved;
+    backbuffer_fb = .{ .idx = 7 };
+    setBackbufferSubstitute(.{ .idx = INVALID });
+    try testing.expectEqual(INVALID, backbuffer_fb.idx);
 }
 
 test "camera-segment views are monotonic per frame, clamp at the band top, and reset (#51)" {
