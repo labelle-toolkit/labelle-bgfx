@@ -50,46 +50,37 @@ const log = std.log.scoped(.bgfx);
 
 // ── C ABI: bgfx_callback_interface_t / bgfx_callback_vtbl_t ────────────
 //
-// Declared HERE rather than reused from `zbgfx.callbacks`, and that is not
-// stylistic: zbgfx's `CCallbackVtblT` is STALE against the bgfx it vendors. Its
-// `screen_shot` slot is missing bgfx's `_format` parameter —
+// Reused from `zbgfx.callbacks` rather than re-declared here. That was NOT
+// always safe: zbgfx's `CCallbackVtblT.screen_shot` used to omit bgfx's
+// `_format` parameter —
 //
-//   zbgfx:  screen_shot(this, filePath, width, height, pitch,         data, size, yflip)
+//   stale:  screen_shot(this, filePath, width, height, pitch,         data, size, yflip)
 //   bgfx:   screen_shot(this, filePath, width, height, pitch, FORMAT, data, size, yflip)
 //           (bgfx/c99/bgfx.h; the call site is CallbackC99::screenShot, bgfx.cpp)
 //
-// so every argument from `data` on is shifted one position. Building the vtable
-// from zbgfx's shape segfaults the RENDER THREAD the first time a `--screenshot`
-// is fulfilled — writing the pixels through what is really the texture-format
-// enum. This was found the hard way while wiring #61, so the definitions below
-// are transcribed from `bgfx/include/bgfx/c99/bgfx.h` directly and the test at
-// the bottom pins the arity that caught it.
-
-/// bgfx's `bgfx_callback_interface_t`: a struct whose single member is a
-/// pointer to the vtable. bgfx keeps the pointer we hand it for the lifetime of
-/// the context.
-const CallbackInterface = extern struct { vtable: *const CallbackVtbl };
+// which shifted every argument from `data` on by one and segfaulted the RENDER
+// THREAD the first time a `--screenshot` was fulfilled, writing pixels through
+// what was really the texture-format enum. Found the hard way while wiring #61,
+// and fixed in the fork this repo pins (`labelle-toolkit/zbgfx`, commit
+// 934372f) — so the local transcription that #61 shipped as a workaround is
+// gone and there is one definition again.
+//
+// The arity test at the bottom now guards the DEPENDENCY: it reads
+// `zbgfx.callbacks.CCallbackVtblT` directly, so a repin onto a revision where
+// that slot regresses fails the suite instead of the render thread.
+//
+// One spelling note: zbgfx types bgfx's `const void*` payloads as `[*c]u8`
+// rather than `?*const anyopaque`. Those are ABI-identical (both a bare
+// pointer), so the handlers below simply match zbgfx's spelling.
+const CallbackInterface = zbgfx.callbacks.CCallbackInterfaceT;
+const CallbackVtbl = zbgfx.callbacks.CCallbackVtblT;
 
 /// A C `va_list` as an opaque pointer-sized value. Zig 0.16 cannot express
 /// `std.builtin.VaList` portably on every target this backend builds for
 /// (notably x86_64-windows), and we never inspect it — it is only ever handed
-/// straight back to the C formatter below. Same trick zbgfx uses.
-const VaList = extern struct { _: *anyopaque };
-
-const CallbackVtbl = extern struct {
-    fatal: *const fn (*CallbackInterface, [*:0]const u8, u16, bgfx.Fatal, [*:0]const u8) callconv(.c) void,
-    trace_vargs: *const fn (*CallbackInterface, [*:0]const u8, u16, [*:0]const u8, VaList) callconv(.c) void,
-    profiler_begin: *const fn (*CallbackInterface, [*:0]const u8, u32, [*:0]const u8, u16) callconv(.c) void,
-    profiler_begin_literal: *const fn (*CallbackInterface, [*:0]const u8, u32, [*:0]const u8, u16) callconv(.c) void,
-    profiler_end: *const fn (*CallbackInterface) callconv(.c) void,
-    cache_read_size: *const fn (*CallbackInterface, u64) callconv(.c) u32,
-    cache_read: *const fn (*CallbackInterface, u64, ?*anyopaque, u32) callconv(.c) bool,
-    cache_write: *const fn (*CallbackInterface, u64, ?*const anyopaque, u32) callconv(.c) void,
-    screen_shot: *const fn (*CallbackInterface, [*:0]const u8, u32, u32, u32, bgfx.TextureFormat, ?*const anyopaque, u32, bool) callconv(.c) void,
-    capture_begin: *const fn (*CallbackInterface, u32, u32, u32, bgfx.TextureFormat, bool) callconv(.c) void,
-    capture_end: *const fn (*CallbackInterface) callconv(.c) void,
-    capture_frame: *const fn (*CallbackInterface, ?*const anyopaque, u32) callconv(.c) void,
-};
+/// straight back to the C formatter below. zbgfx uses the same trick, so this
+/// aliases theirs to keep `trace_vargs` assignable.
+const VaList = zbgfx.callbacks.VaList;
 
 /// libc `getenv` — Zig 0.16 dropped `std.posix.getenv`, and `window.zig`
 /// already reaches for libc the same way for its `LABELLE_*` knobs.
@@ -223,12 +214,12 @@ fn cacheReadSize(_this: *CallbackInterface, id: u64) callconv(.c) u32 {
     return 0;
 }
 
-fn cacheRead(_this: *CallbackInterface, id: u64, data: ?*anyopaque, size: u32) callconv(.c) bool {
+fn cacheRead(_this: *CallbackInterface, id: u64, data: [*c]u8, size: u32) callconv(.c) bool {
     _ = .{ _this, id, data, size };
     return false;
 }
 
-fn cacheWrite(_this: *CallbackInterface, id: u64, data: ?*const anyopaque, size: u32) callconv(.c) void {
+fn cacheWrite(_this: *CallbackInterface, id: u64, data: [*c]u8, size: u32) callconv(.c) void {
     _ = .{ _this, id, data, size };
 }
 
@@ -256,7 +247,7 @@ fn screenShot(
     height: u32,
     pitch: u32,
     format: bgfx.TextureFormat,
-    data: ?*const anyopaque,
+    data: [*c]u8,
     size: u32,
     yflip: bool,
 ) callconv(.c) void {
@@ -321,7 +312,7 @@ fn captureEnd(_this: *CallbackInterface) callconv(.c) void {
     _ = _this;
 }
 
-fn captureFrame(_this: *CallbackInterface, data: ?*const anyopaque, size: u32) callconv(.c) void {
+fn captureFrame(_this: *CallbackInterface, data: [*c]u8, size: u32) callconv(.c) void {
     _ = .{ _this, data, size };
 }
 
@@ -373,19 +364,28 @@ test "install points Init.callback at the interface, whose first word is the vta
     try testing.expectEqual(@as(usize, 0), @offsetOf(CallbackInterface, "vtable"));
 }
 
-test "screen_shot keeps bgfx's 9-argument shape, not zbgfx's stale 8" {
-    // The regression this pins COST an afternoon: `zbgfx.callbacks.CCallbackVtblT`
-    // omits bgfx's `_format` parameter, so a vtable built from it shifts `data`,
-    // `size` and `yflip` down one slot — and the first `--screenshot` segfaults
-    // the render thread writing pixels through a texture-format enum. Assert the
-    // arity and the position of `format`/`data` so a future "let's just reuse
-    // zbgfx's types" refactor fails HERE, in a host test, instead of there.
-    const params = @typeInfo(@typeInfo(@FieldType(CallbackVtbl, "screen_shot")).pointer.child).@"fn".params;
+test "the pinned zbgfx keeps bgfx's 9-argument screen_shot, not the stale 8" {
+    // The regression this pins COST an afternoon: `CCallbackVtblT.screen_shot`
+    // used to omit bgfx's `_format`, so a vtable built from it shifted `data`,
+    // `size` and `yflip` down one slot — and the first `--screenshot` segfaulted
+    // the render thread writing pixels through a texture-format enum. It is
+    // fixed in the pinned fork (labelle-toolkit/zbgfx 934372f), and this test
+    // exists so a REPIN onto a revision that regresses it fails here, in a host
+    // test, instead of on the render thread.
+    //
+    // Read through `zbgfx.callbacks` explicitly, not the local alias: the point
+    // is to assert something about the DEPENDENCY, and going through the alias
+    // would keep passing if someone quietly re-introduced a local transcription.
+    const params = @typeInfo(@typeInfo(@FieldType(zbgfx.callbacks.CCallbackVtblT, "screen_shot")).pointer.child).@"fn".params;
     try testing.expectEqual(@as(usize, 9), params.len);
     try testing.expectEqual(bgfx.TextureFormat, params[5].type.?);
-    try testing.expectEqual(?*const anyopaque, params[6].type.?);
     try testing.expectEqual(u32, params[7].type.?);
     try testing.expectEqual(bool, params[8].type.?);
+    // `params[6]` is the pixel payload. bgfx types it `const void*`; zbgfx
+    // spells that `[*c]u8`. Assert it is still a POINTER rather than pinning the
+    // spelling, so an upstream tidy-up to `?*const anyopaque` does not fail a
+    // test whose real subject is the argument ORDER.
+    try testing.expect(@typeInfo(params[6].type.?) == .pointer);
 }
 
 test "the assert policy defaults to breaking and only 'continue' opts out" {
