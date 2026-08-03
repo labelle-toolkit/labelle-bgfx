@@ -49,6 +49,25 @@ const core = @import("labelle-core");
 /// `android_gamepad` state module's check.
 pub const is_android = builtin.target.abi == .android or builtin.target.abi == .androideabi;
 
+comptime {
+    // The JNI glue this backend links unconditionally
+    // (`android_gamepad_jni.c`) references core's exported hotplug
+    // callbacks (`labelle_android_on_device_added` / `_removed`). Those
+    // exports live in core's `gamepad_source/android.zig`, which Zig only
+    // analyzes — and therefore only EMITS — when something references it.
+    // The engine references `core.gamepad_source` only when a game flow
+    // listens for gamepad events (`uses_os_gamepad_source`), so a
+    // gamepad-less game never touches it: the exports vanish while the C
+    // reference stays, and `dlopen("libgame.so")` dies at NativeActivity
+    // startup with "cannot locate symbol". CI cannot catch this — a
+    // shared-lib link allows undefined symbols; it only fails at load
+    // time on a device. Since this backend is what links the referencing
+    // C, it must also guarantee the referents exist.
+    if (is_android) {
+        _ = core.gamepad_source.platform;
+    }
+}
+
 // JNI detection glue (shared `../android_gamepad/src/android_gamepad_jni.c`).
 // The C signatures are:
 //   void labelle_android_gamepad_init(const void *activity_ptr);
