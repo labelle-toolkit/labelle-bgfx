@@ -159,6 +159,21 @@ pub const unloadTexture = texture.unloadTexture;
 pub const createDynamicTexture = texture.createDynamicTexture;
 pub const updateTexture = texture.updateTexture;
 pub const drawTexturePro = texture.drawTexturePro;
+// Overlay seam: the raw backend handle behind a pool id, as a plain
+// integer. Lets code that draws OUTSIDE this pipeline sample a texture
+// the game already loaded — concretely, the ImGui bridge, which owns its
+// own draw list and shader and so cannot go through `drawTexturePro`.
+// Without this the only textures an overlay can show are ones it created
+// itself, which rules out the sprite atlas entirely.
+//
+// Returned as `u16` rather than a `bgfx.TextureHandle` so callers need no
+// zbgfx import to hold the value; consumers re-wrap it on their side.
+// `invalid_texture_handle` comes back for an out-of-range or unloaded id,
+// so callers can skip the draw instead of binding garbage.
+pub const invalid_texture_handle: u16 = std.math.maxInt(u16);
+pub fn nativeTextureHandle(id: u32) u16 {
+    return texture.handleForId(id).idx;
+}
 // Material seam (labelle-gfx#305 Slice B). Optional `@hasDecl`-gated contract
 // decls: `core.Backend(Impl).drawTextureProMaterial` dispatches here for a
 // supported non-`none` effect, and `materialSupported` is the fine-grained gate.
