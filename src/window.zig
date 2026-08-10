@@ -13,6 +13,23 @@ const bgfx_callback = @import("bgfx_callback.zig");
 /// labelle-core, for the comptime window-contract conformance gate below.
 const core = @import("labelle-core");
 
+/// When true the labelle-imgui bgfx bridge is linked into the final game
+/// exe, so its exports are defined and we may call them. OFF by default —
+/// a non-imgui build must not reference them or it fails to link with an
+/// undefined symbol. Mirrors the identical gate in `input.zig`.
+const gui_enabled = @import("build_options").gui_enabled;
+
+/// labelle-imgui bgfx-bridge device-loss notification. The bridge owns GPU
+/// objects (its program, sampler uniform, and the font-atlas texture) that
+/// `bgfx.shutdown` destroys out from under it; without this call it keeps
+/// `initialized = true` and a stale `TexID`, so ImGui never re-requests the
+/// upload and every glyph samples a dead handle (garbled text after an
+/// Android background/resume). Declared inside the comptime gate so a
+/// non-imgui build never references the (then-undefined) symbol.
+const imgui = if (gui_enabled) struct {
+    extern fn imgui_bridge_invalidate_textures() void;
+} else struct {};
+
 /// Android has no GLFW (zglfw is desktop-only). The Android windowing
 /// path is fed an `ANativeWindow*` by the NativeActivity glue at runtime
 /// (phase 3, #302) via `setAndroidNativeWindow`; on desktop we keep the
@@ -762,6 +779,18 @@ pub fn captureHeadless(path: [:0]const u8) bool {
 /// but the engine state survives for a later restore.
 pub fn teardownSurface() void {
     gfx.shutdownPrograms();
+    // The imgui bridge owns GPU objects too, and `shutdownPrograms` only
+    // covers OUR programs — so tell the bridge to drop its program, sampler
+    // uniform and font-atlas texture while this context is still current.
+    // This is what makes the Android surface-restore path whole: the engine
+    // rebuilds its sprite catalog via `surface_restored_fn`, but nothing
+    // told ImGui its atlas had died, so text came back garbled while every
+    // sprite rendered correctly (flying-platform-labelle#737).
+    //
+    // Invalidate, not shut down: the ImGui context (and any font the host
+    // added to the atlas) survives, and the bridge's lazy re-init rebuilds
+    // the rest on the next render.
+    if (comptime gui_enabled) imgui.imgui_bridge_invalidate_textures();
     // Free + forget any pooled render targets before the context dies, so their
     // framebuffers don't leak and no stale id survives into a restored context
     // (Android surface loss; labelle-bgfx#41 review).
