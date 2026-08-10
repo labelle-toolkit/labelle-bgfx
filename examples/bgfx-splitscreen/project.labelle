@@ -20,7 +20,7 @@
     // (camera-bound layers RFC #723 Phase 1).
     .core_version = "1.26.0",
     .engine_version = "2.6.0",
-    .gfx_version = "1.28.1",
+    .gfx_version = "1.29.0",
     // Local dev checkouts, resolved as siblings of the main labelle-bgfx
     // checkout (the standard monorepo dev layout).
     .labelle_version = "local:../../../labelle-cli",
