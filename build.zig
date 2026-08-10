@@ -206,7 +206,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     if (zglfw_mod) |m| input_mod.addImport("zglfw", m);
-    input_mod.addImport("build_options", input_opts.createModule());
+    // ONE module instance, shared with `window_mod` below: two
+    // `createModule()` calls on the same `Options` root the same generated
+    // file in two modules, which Zig rejects ("file exists in modules
+    // 'build_options' and 'build_options0'").
+    const input_opts_mod = input_opts.createModule();
+    input_mod.addImport("build_options", input_opts_mod);
     if (sdl_gp_mod) |m| input_mod.addImport("sdl_gamepad", m);
 
     // Link SDL2 for the shared desktop gamepad source — DESKTOP targets only,
@@ -362,6 +367,10 @@ pub fn build(b: *std.Build) void {
     // closeWindow() calls gfx.shutdownPrograms() to release the sprite
     // program/uniform/textures before bgfx.shutdown() (#384).
     window_mod.addImport("gfx", gfx_mod);
+    // Same options module input.zig gets (shared instance, see above), for
+    // window.zig's `gui_enabled` gate on the imgui bridge's device-loss
+    // notification in `teardownSurface`.
+    window_mod.addImport("build_options", input_opts_mod);
 
     // ── Re-export native artifacts so consumers can link them ───────
     // bgfx is always re-exported. glfw is desktop-only (Android has no
@@ -1066,7 +1075,10 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .target = target,
         .optimize = optimize,
     });
-    input_mod.addImport("build_options", input_opts.createModule());
+    // One instance, shared with `window_mod` below (see the desktop/android
+    // path for why a second `createModule()` fails).
+    const input_opts_mod = input_opts.createModule();
+    input_mod.addImport("build_options", input_opts_mod);
     input_mod.addImport("labelle-core", core_mod);
     const android_gp_dep = b.dependency("labelle_android_gamepad", .{ .target = target, .optimize = optimize });
     input_mod.addImport("android_gamepad", android_gp_dep.module("android_gamepad"));
@@ -1098,6 +1110,10 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     window_mod.addImport("input", input_mod);
     window_mod.addImport("labelle-core", core_mod);
     window_mod.addImport("gfx", gfx_mod);
+    // `gui_enabled` for window.zig's imgui device-loss gate. Always false in
+    // practice here (imgui-on-wasm isn't wired yet), so the call is
+    // comptime-eliminated — but the option must resolve for the graph to build.
+    window_mod.addImport("build_options", input_opts_mod);
 
     // ── Self-contained wasm/WebGL example → static lib → emcc link ───
     // Built directly by the backend (no assembler/engine) so the whole wasm
