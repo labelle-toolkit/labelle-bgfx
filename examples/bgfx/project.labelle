@@ -23,7 +23,7 @@
     //   was a no-op through `labelle run`. See labelle-gfx#309 / the README.
     .core_version = "1.26.0",
     .engine_version = "2.4.0",
-    .gfx_version = "1.28.1",
+    .gfx_version = "1.29.0",
     // Local dev checkouts, resolved as siblings of the main labelle-bgfx
     // checkout (the standard monorepo dev layout). Keep them on their
     // respective mains: cli >= 1.55.x, assembler >= 0.80.0 (the version that

@@ -70,7 +70,7 @@ labelle run --headless --screenshot=$(pwd)/screenshots/with_postfx --ticks=30
 ```
 
 Pins (see `project.labelle` / `labelle.lock`): core **1.26.0**, engine **2.4.0**,
-gfx **1.28.0**, assembler **>= 0.80.0**, backend (this repo) **>= 0.11.0**.
+gfx **1.29.0**, assembler **>= 0.80.0**, backend (this repo) **>= 0.11.0**.
 
 ## Note on the engine render path (gfx wiring)
 
@@ -81,8 +81,9 @@ retained engine's *standalone* `render()`, which that camera-aware path does
 **not** call — so through `labelle run` the stack was a no-op (before/after
 captures were pixel-identical). **gfx 1.28.1** (labelle-gfx#309) wraps
 `renderWithLayerHooks`' layer loop with `post_fx.begin/resolve` (a small,
-behavior-preserving change — no-op when the stack is empty); this example pins
-that version, and the screenshots here were produced with it. The runtime API,
+behavior-preserving change — no-op when the stack is empty); the screenshots
+here were produced with that version, and the example has since moved to
+**1.29.0** (gfx-owned texture keys, engine#813) which carries it. The runtime API,
 assembler codegen, shaders, and headless driver seam are otherwise exercised
 end-to-end — see the bgfx repo's `zig build post-fx-golden` and
 `post-fx-integration-golden` CI steps for the headless driver goldens.
