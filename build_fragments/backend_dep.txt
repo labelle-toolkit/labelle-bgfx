@@ -6,6 +6,20 @@
     const bgfx_artifact = backend_dep.artifact("bgfx");
     const glfw_artifact = backend_dep.artifact("glfw");
 
+    // Unify the app core onto the backend's `gfx` module. Without this the
+    // app's `labelle-core` and the backend dependency's are SEPARATE module
+    // instances, and Zig treats their enums as distinct nominal types even
+    // though the source is identical. The documented flow
+    //
+    //     const backend_id = game.nativeTextureId(handle) orelse return;
+    //     const handle = backend_gfx.nativeTextureHandle(backend_id);
+    //
+    // would then fail to compile in a generated game with a
+    // `BackendTextureId` vs `BackendTextureId` mismatch — the same diamond
+    // that bit `backend_input` (labelle-assembler#271), now reachable through
+    // `gfx` because the texture ids became nominal types (labelle-gfx#328).
+    overrideImport(backend_gfx, "labelle-core", core_mod);
+
     // Unify the app core onto the transitive `sdl_gamepad` desktop gamepad
     // source — same diamond as `.backend_raylib`/`.backend_sokol` (see the note
     // there). bgfx desktop reads gamepads through GLFW by default (#315), but

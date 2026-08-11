@@ -2,7 +2,19 @@
 /// State-free, side-effect-free; safe for every other gfx submodule
 /// to import without creating cycles.
 
-pub const Texture = struct { id: u32, width: i32, height: i32 };
+const core = @import("labelle-core");
+
+/// A texture this backend owns. `id` is THIS BACKEND's identifier — an index
+/// into `texture.texture_handles` — and is deliberately NOT the engine-facing
+/// `TextureId` that labelle-gfx's registry hands out. Those two numbering
+/// spaces are independent, and conflating them (both were `u32`) is how
+/// gfx v1.29.0 silently blanked a downstream menu: a game passed an engine
+/// handle to `nativeTextureHandle`, which indexes the table below
+/// (labelle-gfx#326 / RFC-TEXTURE-ID-TYPING, labelle-gfx#328).
+///
+/// Resolve an engine handle with `RetainedEngine.nativeTextureId` before
+/// calling anything here.
+pub const Texture = struct { id: core.BackendTextureId, width: i32, height: i32 };
 
 pub const Color = struct {
     r: u8,

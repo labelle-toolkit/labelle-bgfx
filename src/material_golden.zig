@@ -293,7 +293,7 @@ fn renderScene() void {
             origin,
             0,
             gfx.white,
-            .{ .effect = .palette_swap, .uniforms = .{ .aux_texture = lut.id, .aux_count = 4 } },
+            .{ .effect = .palette_swap, .uniforms = .{ .aux_texture = lut.id.toInt(), .aux_count = 4 } },
         );
 
         // Col 3: dissolve — the solid sprite burned away by the built-in
