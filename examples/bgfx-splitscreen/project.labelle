@@ -18,9 +18,9 @@
     // seeding (#761 Phase 2, engine#770) + the tagged multi-camera seeding;
     // gfx ≥ 1.26 has the tagged camera manager + per-layer camera binding
     // (camera-bound layers RFC #723 Phase 1).
-    .core_version = "1.26.0",
-    .engine_version = "2.6.0",
-    .gfx_version = "1.29.0",
+    .core_version = "1.28.0",
+    .engine_version = "2.11.0",
+    .gfx_version = "1.30.0",
     // Local dev checkouts, resolved as siblings of the main labelle-bgfx
     // checkout (the standard monorepo dev layout).
     .labelle_version = "local:../../../labelle-cli",
