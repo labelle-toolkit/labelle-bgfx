@@ -5,7 +5,7 @@
 const std = @import("std");
 const bgfx = @import("zbgfx").bgfx;
 const core = @import("labelle-core");
-const shaders_data = @import("../shaders.zig");
+const shaders_data = @import("shaders");
 const texture_mod = @import("texture.zig");
 const font_mod = @import("font.zig");
 

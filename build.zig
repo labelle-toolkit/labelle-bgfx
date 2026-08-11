@@ -140,7 +140,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const shaders_mod = b.createModule(.{
+        .root_source_file = b.path("src/shaders.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     gfx_mod.addImport("zbgfx", zbgfx_mod);
+    gfx_mod.addImport("shaders", shaders_mod);
     // `@cInclude("stb_shim.h")` in gfx/texture.zig needs src/ on the
     // include path to find stb_shim.h → stb_image.h.
     gfx_mod.addIncludePath(b.path("src"));
@@ -757,6 +763,35 @@ pub fn build(b: *std.Build) void {
     // forced it. Add an explicit compile-check so `zig build test
     // -Dtarget=aarch64-linux-android` covers all three Android modules
     // (gfx/window/input) as required by phase 2.
+    // Give `gfx/texture.zig` a test root of its OWN (#73). `gfx_tests` below
+    // roots at `src/gfx.zig`, and Zig only analyses what is reachable from a
+    // root — so that file's function BODIES were never compiled and its inline
+    // tests were never collected. A change retyping `Texture.id` passed the
+    // entire suite while every assignment in the file was wrong (#72).
+    //
+    // Mirrors the `state_run` / `astc_run` / `yuv_run` treatment, but this file
+    // is not standalone: it needs the same imports, include path and C source
+    // as `gfx_mod`, since it reaches zbgfx, labelle-core, its siblings and
+    // stb_image. Compile-only — these functions need a live bgfx context, so
+    // there is nothing meaningful to execute.
+    const texture_mod = b.createModule(.{
+        .root_source_file = b.path("src/gfx/texture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    texture_mod.addImport("zbgfx", zbgfx_mod);
+    texture_mod.addImport("labelle-core", core_mod);
+    // `gfx/programs.zig` reached `../shaders.zig` by PATH, which no module
+    // rooted inside `src/gfx/` can resolve — a path import may not escape its
+    // module root. Promoted to a named module, the toolkit's standard fix for
+    // a file reached by more than one root.
+    texture_mod.addImport("shaders", shaders_mod);
+    texture_mod.addIncludePath(b.path("src"));
+    texture_mod.addCSourceFile(.{ .file = b.path("src/stb_image_impl.c"), .flags = &.{} });
+    const texture_tests = b.addTest(.{ .root_module = texture_mod });
+    test_step.dependOn(&texture_tests.step);
+
     const gfx_tests = b.addTest(.{ .root_module = gfx_mod });
     test_step.dependOn(&gfx_tests.step);
     // And RUN it natively, for the same reason (and with the same link-only-when-
