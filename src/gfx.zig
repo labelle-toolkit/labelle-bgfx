@@ -471,13 +471,34 @@ test "compile probe: the texture surface is analysed" {
         // here rather than in a consumer's build.
         // `Player.init` builds a `types.Texture` with a sentinel id — a site
         // no texture-surface probe reaches, and the one codex caught on #72.
-        // `VideoPlayer` is a `pub const` alias, so the alias alone does not
-        // analyse the body; the call does.
-        // `Player` is generic over the decoder, so instantiate it with the
-        // desktop decoder to analyse the body.
-        if (!is_wasm) {
-            var p = try VideoPlayer(DesktopVideoDecoder).init(undefined, undefined, 0);
-            p.deinit();
-        }
+        // `VideoPlayer` is a `pub const` alias to a GENERIC, so the alias
+        // alone does not analyse the body; instantiating it does.
+        //
+        // Instantiated with a STUB decoder, not `DesktopVideoDecoder`:
+        // referencing the real one pulls `video/desktop.zig` into analysis,
+        // which activates its ffmpeg-dependent tests and fails the macOS
+        // runner. The stub compiles the same `Player.init` body without
+        // dragging in a decoder's test surface.
+        const StubDecoder = struct {
+            // `decodeFramePlanes` is deliberately ABSENT: `Player` gates the
+            // GPU plane path on `@hasDecl`, so omitting it keeps the stub to
+            // the minimum contract while still compiling `init`.
+            pub fn width(_: *@This()) u32 {
+                return 0;
+            }
+            pub fn height(_: *@This()) u32 {
+                return 0;
+            }
+            pub fn deinit(_: *@This()) void {}
+            pub fn decodeFrame(_: *@This(), _: []u8) ?f64 {
+                return null;
+            }
+            pub fn eof(_: *@This()) bool {
+                return true;
+            }
+            pub fn replay(_: *@This()) !void {}
+        };
+        var p = try VideoPlayer(StubDecoder).init(undefined, .{}, 0);
+        p.deinit();
     }
 }
