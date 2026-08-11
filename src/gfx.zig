@@ -171,7 +171,19 @@ pub const drawTexturePro = texture.drawTexturePro;
 // `invalid_texture_handle` comes back for an out-of-range or unloaded id,
 // so callers can skip the draw instead of binding garbage.
 pub const invalid_texture_handle: u16 = std.math.maxInt(u16);
-pub fn nativeTextureHandle(id: u32) u16 {
+/// Hand a caller this backend's raw bgfx handle for a texture it already
+/// owns — the accessor the ImGui bridge uses to draw a game-loaded atlas
+/// (bgfx#67).
+///
+/// Takes a `BackendTextureId`, NOT the engine-facing `TextureId` that
+/// `game.loadTextureFromMemory` returns. Those were both `u32` until
+/// labelle-gfx#328, and handing over the wrong one compiled, ran, and
+/// silently returned an invalid handle — a downstream UI kit lost its whole
+/// atlas that way (labelle-gfx#326). Resolve first:
+///
+///     const backend_id = game.nativeTextureId(engine_handle) orelse return;
+///     const handle = backend_gfx.nativeTextureHandle(backend_id);
+pub fn nativeTextureHandle(id: core.BackendTextureId) u16 {
     return texture.handleForId(id).idx;
 }
 // Material seam (labelle-gfx#305 Slice B). Optional `@hasDecl`-gated contract
@@ -410,5 +422,26 @@ test "drawMesh satisfies the optional textured-mesh capability" {
         if (params[5].type.? != core.BlendMode) {
             @compileError("drawMesh's last param must be core.BlendMode");
         }
+    }
+}
+
+// Compile probe for the texture surface (labelle-gfx#328 P3).
+//
+// `gfx_tests` roots at THIS file, and Zig only analyses what is reachable —
+// so `gfx/texture.zig`'s function BODIES were never compiled by `zig build
+// test`, and neither are its inline tests (imported files' tests are not
+// collected). A type change to `Texture.id` passed the whole suite while
+// every assignment in that file was wrong.
+//
+// The runtime-false guard forces analysis without executing anything: these
+// need a live bgfx context, which unit tests do not have.
+test "compile probe: the texture surface is analysed" {
+    var never = false;
+    _ = &never;
+    if (never) {
+        const t = try texture.uploadTexture(undefined);
+        texture.unloadTexture(t);
+        _ = nativeTextureHandle(t.id);
+        _ = texture.handleForId(t.id);
     }
 }

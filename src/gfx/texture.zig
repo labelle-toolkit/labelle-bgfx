@@ -46,9 +46,16 @@ var texture_pixel_data: [MAX_TEXTURES]?[]u8 = [_]?[]u8{null} ** MAX_TEXTURES;
 /// bind a `Texture` returned by `uploadTexture`/`createTexture2D` — e.g. a Spine
 /// atlas page — through the sprite pipeline). Returns an invalid handle for
 /// out-of-range / unloaded ids so callers can skip the submit.
-pub fn handleForId(id: u32) bgfx.TextureHandle {
-    if (id >= MAX_TEXTURES) return .{ .idx = std.math.maxInt(u16) };
-    return texture_handles[id];
+/// Resolve THIS BACKEND's texture id to its bgfx handle. Takes a
+/// `BackendTextureId`, never the engine-facing `TextureId` that
+/// labelle-gfx's registry hands out — those are different numbering spaces,
+/// and passing the wrong one used to compile and silently return an invalid
+/// handle (labelle-gfx#326). Resolve with `RetainedEngine.nativeTextureId`
+/// first.
+pub fn handleForId(id: core.BackendTextureId) bgfx.TextureHandle {
+    const slot = id.toInt();
+    if (slot >= MAX_TEXTURES) return .{ .idx = std.math.maxInt(u16) };
+    return texture_handles[slot];
 }
 
 /// Find a free texture slot by scanning for invalid handles (supports reuse after unload).
@@ -211,7 +218,7 @@ pub fn uploadTexture(decoded: DecodedImage) !Texture {
     // already taken its own copy, so we leave the slot null here.
     texture_pixel_data[id] = null;
 
-    return .{ .id = id, .width = @intCast(decoded.width), .height = @intCast(decoded.height) };
+    return .{ .id = @enumFromInt(id), .width = @intCast(decoded.width), .height = @intCast(decoded.height) };
 }
 
 // ── Dynamic textures (runtime-updated pixels) ───────────────────────────────
@@ -247,7 +254,7 @@ pub fn createDynamicTexture(width: u32, height: u32) !Texture {
 
     texture_handles[id] = handle;
     texture_pixel_data[id] = null;
-    return .{ .id = id, .width = @intCast(width), .height = @intCast(height) };
+    return .{ .id = @enumFromInt(id), .width = @intCast(width), .height = @intCast(height) };
 }
 
 /// Re-upload a full RGBA8 frame to a dynamic texture created by
@@ -256,8 +263,8 @@ pub fn createDynamicTexture(width: u32, height: u32) !Texture {
 /// No-ops on a bad id/handle or a size mismatch so a malformed frame can't
 /// scribble past the texture.
 pub fn updateTexture(texture: Texture, pixels: []const u8) void {
-    if (texture.id >= MAX_TEXTURES) return;
-    const handle = texture_handles[texture.id];
+    if (texture.id.toInt() >= MAX_TEXTURES) return;
+    const handle = texture_handles[texture.id.toInt()];
     if (handle.idx == std.math.maxInt(u16)) return;
 
     const w: u16 = std.math.cast(u16, texture.width) orelse return;
@@ -348,19 +355,19 @@ pub fn uploadCompressed(data: []const u8) !Texture {
     if (handle.idx == std.math.maxInt(u16)) return error.LoadFailed;
     texture_handles[id] = handle;
     texture_pixel_data[id] = null;
-    return .{ .id = id, .width = @intCast(info.width), .height = @intCast(info.height) };
+    return .{ .id = @enumFromInt(id), .width = @intCast(info.width), .height = @intCast(info.height) };
 }
 
 pub fn unloadTexture(texture: Texture) void {
-    if (texture.id < MAX_TEXTURES) {
-        const handle = texture_handles[texture.id];
+    if (texture.id.toInt() < MAX_TEXTURES) {
+        const handle = texture_handles[texture.id.toInt()];
         if (handle.idx != std.math.maxInt(u16)) {
             bgfx.destroyTexture(handle);
-            texture_handles[texture.id] = .{ .idx = std.math.maxInt(u16) };
+            texture_handles[texture.id.toInt()] = .{ .idx = std.math.maxInt(u16) };
         }
-        if (texture_pixel_data[texture.id]) |px| {
+        if (texture_pixel_data[texture.id.toInt()]) |px| {
             std.heap.page_allocator.free(px);
-            texture_pixel_data[texture.id] = null;
+            texture_pixel_data[texture.id.toInt()] = null;
         }
     }
 }
@@ -451,8 +458,8 @@ fn buildQuadVertices(tex_w: u32, tex_h: u32, source: Rectangle, dest: Rectangle,
 }
 
 pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, origin: Vector2, rotation: f32, tint: Color) void {
-    if (texture.id >= MAX_TEXTURES) return;
-    const handle = texture_handles[texture.id];
+    if (texture.id.toInt() >= MAX_TEXTURES) return;
+    const handle = texture_handles[texture.id.toInt()];
     if (handle.idx == std.math.maxInt(u16)) return;
 
     const vertices = buildQuadVertices(@intCast(texture.width), @intCast(texture.height), source, dest, origin, rotation, tint.toAbgr());
@@ -494,8 +501,8 @@ pub fn drawTextureProMaterial(
     tint: Color,
     material: Material,
 ) void {
-    if (texture.id >= MAX_TEXTURES) return;
-    const handle = texture_handles[texture.id];
+    if (texture.id.toInt() >= MAX_TEXTURES) return;
+    const handle = texture_handles[texture.id.toInt()];
     if (handle.idx == std.math.maxInt(u16)) return;
 
     // Per-effect runtime gate: `materialSupported` says bgfx IMPLEMENTS this
@@ -654,7 +661,7 @@ fn createPlaneR8(w: u32, h: u32) !Texture {
     if (handle.idx == std.math.maxInt(u16)) return error.LoadFailed;
     texture_handles[id] = handle;
     texture_pixel_data[id] = null;
-    return .{ .id = id, .width = @intCast(w), .height = @intCast(h) };
+    return .{ .id = @enumFromInt(id), .width = @intCast(w), .height = @intCast(h) };
 }
 
 /// Create the Y (full-res) + U/V (half-res) R8 plane textures for a `width`×
@@ -683,8 +690,8 @@ pub fn updatePlaneTextures(pt: PlaneTextures, y_pixels: []const u8, u_pixels: []
 }
 
 fn updatePlaneR8(t: Texture, pixels: []const u8) void {
-    if (t.id >= MAX_TEXTURES) return;
-    const handle = texture_handles[t.id];
+    if (t.id.toInt() >= MAX_TEXTURES) return;
+    const handle = texture_handles[t.id.toInt()];
     if (handle.idx == std.math.maxInt(u16)) return;
     const w: u16 = std.math.cast(u16, t.width) orelse return;
     const h: u16 = std.math.cast(u16, t.height) orelse return;
@@ -705,10 +712,10 @@ pub fn unloadPlaneTextures(pt: PlaneTextures) void {
 /// the three plane textures to the `s_texY/U/V` samplers and submits with the
 /// `yuv_program` (GPU YUV→RGB). `source` is in luma (full-res) pixels.
 pub fn drawPlanesPro(pt: PlaneTextures, source: Rectangle, dest: Rectangle, origin: Vector2, rotation: f32, tint: Color) void {
-    if (pt.y.id >= MAX_TEXTURES or pt.u.id >= MAX_TEXTURES or pt.v.id >= MAX_TEXTURES) return;
-    const yh = texture_handles[pt.y.id];
-    const uh = texture_handles[pt.u.id];
-    const vh = texture_handles[pt.v.id];
+    if (pt.y.id.toInt() >= MAX_TEXTURES or pt.u.id.toInt() >= MAX_TEXTURES or pt.v.id.toInt() >= MAX_TEXTURES) return;
+    const yh = texture_handles[pt.y.id.toInt()];
+    const uh = texture_handles[pt.u.id.toInt()];
+    const vh = texture_handles[pt.v.id.toInt()];
     if (yh.idx == std.math.maxInt(u16) or uh.idx == std.math.maxInt(u16) or vh.idx == std.math.maxInt(u16)) return;
 
     const vertices = buildQuadVertices(pt.width, pt.height, source, dest, origin, rotation, tint.toAbgr());
