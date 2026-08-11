@@ -606,8 +606,12 @@ pub fn applyPostPass(pass: PostPass, src: RenderTargetId, dst: RenderTargetId) v
     // Resolve the LUT strip for color_grade (a plain texture-pool handle). A
     // zero/dead handle degrades to a passthrough blit rather than a black quad.
     if (pass.kind == .color_grade) {
+        // `MaterialUniforms.aux_texture` / `PostPassUniforms.aux_texture` are
+        // still bare `u32` in the core contract, and they carry a BACKEND
+        // texture id (this is fed straight to `handleForId`). Retag at the
+        // boundary until that surface is typed too — see labelle-gfx#328.
         const lut_id = pass.uniforms.aux_texture;
-        const lut = texture.handleForId(lut_id);
+        const lut = texture.handleForId(@enumFromInt(lut_id));
         if (lut_id == 0 or lut.idx == INVALID) {
             programs.submitFullscreenBlit(s.color);
             return;

@@ -443,5 +443,26 @@ test "compile probe: the texture surface is analysed" {
         texture.unloadTexture(t);
         _ = nativeTextureHandle(t.id);
         _ = texture.handleForId(t.id);
+
+        // Every remaining public path that touches a texture id. Listing them
+        // is not belt-and-braces: CI caught typed-id errors in
+        // `material_golden.zig` and `render_target.zig` that this suite passed
+        // over, because Zig never analysed those bodies (CodeRabbit on #72).
+        _ = try texture.loadTexture(undefined);
+        _ = try texture.createDynamicTexture(undefined, undefined);
+        texture.updateTexture(t, undefined);
+        _ = texture.isCompressed(undefined);
+        _ = texture.compressedDims(undefined);
+        _ = try texture.uploadCompressed(undefined);
+        texture.drawTexturePro(t, undefined, undefined, undefined, 0, undefined);
+        _ = texture.materialSupported(undefined);
+        texture.drawTextureProMaterial(t, undefined, undefined, undefined, 0, undefined, undefined);
+        texture.drawExternalTexture(undefined, 0, 0, undefined, undefined, undefined, 0, undefined);
+        _ = texture.yuvProgramReady();
+        _ = try texture.createPlaneTextures(undefined, undefined);
+        texture.updatePlaneTextures(undefined, undefined, undefined, undefined);
+        texture.unloadPlaneTextures(undefined);
+        texture.drawPlanesPro(undefined, undefined, undefined, undefined, 0, undefined);
+        texture.destroyAllTextures();
     }
 }
