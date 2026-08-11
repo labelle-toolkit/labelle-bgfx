@@ -69,8 +69,13 @@ labelle run --headless --screenshot=$(pwd)/screenshots/with_postfx --ticks=30
 # writes screenshots/with_postfx.tga (bgfx captures TGA; convert to PNG as desired)
 ```
 
-Pins (see `project.labelle` / `labelle.lock`): core **1.26.0**, engine **2.4.0**,
-gfx **1.29.0**, assembler **>= 0.80.0**, backend (this repo) **>= 0.11.0**.
+Pins (see `project.labelle` / `labelle.lock`): core **1.28.0**, engine **2.11.0**,
+gfx **1.30.0**, assembler **>= 0.80.0**, backend (this repo) **>= 0.15.0**.
+
+gfx **1.30.0** and core **1.28.0** are FLOORS, not preferences: this backend's
+`Texture.id` is a `core.BackendTextureId` (labelle-gfx#328), a type core only
+gained in 1.28.0, and gfx only tolerates a typed backend id as of 1.30.0.
+Older sets fail to compile.
 
 ## Note on the engine render path (gfx wiring)
 
@@ -83,7 +88,7 @@ captures were pixel-identical). **gfx 1.28.1** (labelle-gfx#309) wraps
 `renderWithLayerHooks`' layer loop with `post_fx.begin/resolve` (a small,
 behavior-preserving change — no-op when the stack is empty); the screenshots
 here were produced with that version, and the example has since moved to
-**1.29.0** (gfx-owned texture keys, engine#813) which carries it. The runtime API,
+**1.30.0** (typed texture ids, labelle-gfx#328) which carries it. The runtime API,
 assembler codegen, shaders, and headless driver seam are otherwise exercised
 end-to-end — see the bgfx repo's `zig build post-fx-golden` and
 `post-fx-integration-golden` CI steps for the headless driver goldens.
