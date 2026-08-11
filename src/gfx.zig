@@ -464,5 +464,20 @@ test "compile probe: the texture surface is analysed" {
         texture.unloadPlaneTextures(undefined);
         texture.drawPlanesPro(undefined, undefined, undefined, undefined, 0, undefined);
         texture.destroyAllTextures();
+
+        // The video path constructs a `types.Texture` directly with a
+        // sentinel id — a site no texture-surface probe reaches, and the one
+        // codex caught on #72. Reference it so a future field change breaks
+        // here rather than in a consumer's build.
+        // `Player.init` builds a `types.Texture` with a sentinel id — a site
+        // no texture-surface probe reaches, and the one codex caught on #72.
+        // `VideoPlayer` is a `pub const` alias, so the alias alone does not
+        // analyse the body; the call does.
+        // `Player` is generic over the decoder, so instantiate it with the
+        // desktop decoder to analyse the body.
+        if (!is_wasm) {
+            var p = try VideoPlayer(DesktopVideoDecoder).init(undefined, undefined, 0);
+            p.deinit();
+        }
     }
 }

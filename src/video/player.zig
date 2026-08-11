@@ -171,7 +171,10 @@ pub fn Player(comptime Decoder: type) type {
                 allocator.free(g.v);
             };
 
-            var tex: types.Texture = .{ .id = std.math.maxInt(u32), .width = @intCast(w), .height = @intCast(h) };
+            // `.none` is the reserved invalid `BackendTextureId` — this
+            // placeholder is replaced below on the CPU path and left as the
+            // sentinel on the GPU path (#328 phase 3).
+            var tex: types.Texture = .{ .id = .none, .width = @intCast(w), .height = @intCast(h) };
             var pixels: []u8 = &.{};
             if (gpu == null) {
                 tex = try texture.createDynamicTexture(w, h);
