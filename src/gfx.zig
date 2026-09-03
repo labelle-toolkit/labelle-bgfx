@@ -154,6 +154,22 @@ pub const loadTexture = texture.loadTexture;
 pub const decodeImage = texture.decodeImage;
 pub const uploadTexture = texture.uploadTexture;
 pub const unloadTexture = texture.unloadTexture;
+// Point/nearest sampling seam (labelle-bgfx#77). Additive and
+// default-preserving: `uploadTexture` and friends keep bgfx's default bilinear
+// filter unless a caller asks otherwise, so no existing game changes.
+//
+// Two ways to ask, both `@hasDecl`-discoverable the way the material and ASTC
+// capabilities are:
+//   * `uploadTextureFiltered(decoded, .point)` — per texture, no global state.
+//     This is the decl a `filter` field on core's texture-load seam should
+//     dispatch to.
+//   * `setTextureFilter(.point)` — the filter for subsequent unqualified
+//     creations. Reaches the paths whose signatures core fixes (`loadTexture`,
+//     `uploadCompressed`) without changing them.
+pub const TextureFilter = texture.TextureFilter;
+pub const uploadTextureFiltered = texture.uploadTextureFiltered;
+pub const setTextureFilter = texture.setTextureFilter;
+pub const textureFilter = texture.textureFilter;
 // Dynamic textures: create-blank + per-frame re-upload. The "display half" of
 // in-engine video (#549) — a decoder feeds RGBA frames into `updateTexture`.
 pub const createDynamicTexture = texture.createDynamicTexture;
@@ -449,6 +465,7 @@ test "compile probe: the texture surface is analysed" {
         // `material_golden.zig` and `render_target.zig` that this suite passed
         // over, because Zig never analysed those bodies (CodeRabbit on #72).
         _ = try texture.loadTexture(undefined);
+        _ = try texture.uploadTextureFiltered(undefined, .point);
         _ = try texture.createDynamicTexture(undefined, undefined);
         texture.updateTexture(t, undefined);
         _ = texture.isCompressed(undefined);
@@ -501,4 +518,41 @@ test "compile probe: the texture surface is analysed" {
         var p = try VideoPlayer(StubDecoder).init(undefined, .{}, 0);
         p.deinit();
     }
+}
+
+// Sampler-filter seam (labelle-bgfx#77).
+//
+// The flag word `uploadTexture` hands bgfx is the whole feature, and it is a
+// pure function of the filter — no device needed — so unlike the rest of the
+// texture surface this IS assertable in a unit test. `gfx_run` executes this
+// file's tests on the host (build.zig), which is why the test lives here and
+// not in `gfx/texture.zig`: tests in imported files are not collected.
+test "point sampling adds the nearest-filter bits, linear stays bgfx-default" {
+    const bgfx = @import("zbgfx").bgfx;
+    const clamp: u64 = bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp;
+
+    // `.linear` must be byte-identical to the pre-#77 flag word — this is the
+    // default-preserving half of the change, and the assertion that catches a
+    // future refactor silently flipping every game to point sampling.
+    try std.testing.expectEqual(clamp, texture.samplerFlags(.linear));
+
+    // `.point` keeps the clamp bits and adds min+mag point, the same pair
+    // `gfx/font.zig` has always used for the font atlas.
+    const point = texture.samplerFlags(.point);
+    try std.testing.expectEqual(
+        clamp | bgfx.SamplerFlags_MinPoint | bgfx.SamplerFlags_MagPoint,
+        point,
+    );
+    try std.testing.expect(point & clamp == clamp);
+}
+
+test "the default filter is linear, and setTextureFilter drives it" {
+    // Uploads with no explicit filter must keep bgfx's default (bilinear):
+    // existing games must not change appearance.
+    try std.testing.expectEqual(TextureFilter.linear, textureFilter());
+
+    setTextureFilter(.point);
+    try std.testing.expectEqual(TextureFilter.point, textureFilter());
+    setTextureFilter(.linear);
+    try std.testing.expectEqual(TextureFilter.linear, textureFilter());
 }

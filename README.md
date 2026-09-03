@@ -89,6 +89,31 @@ on a machine with a Metal/Vulkan device:
 zig build material-golden-bless   # overwrites test/golden/material_flash_palette.tga
 ```
 
+## Texture filtering seam (point/nearest sampling, #77)
+
+Game textures upload with `SamplerFlags_UClamp | SamplerFlags_VClamp` and no
+filter bits, which leaves bgfx on its default **bilinear** filter. That is
+wrong for pixel art: a 16 px tile drawn at 2x out of a tightly packed atlas
+blends its atlas neighbours along every edge, painting a seam grid over the
+map. The fix is one flag pair — `SamplerFlags_MinPoint | SamplerFlags_MagPoint`,
+the same ones `src/gfx/font.zig` has always used for the font atlas.
+
+`src/gfx.zig` exposes that choice as `TextureFilter` (`.linear` / `.point`),
+in two shapes:
+
+| decl | scope |
+|------|-------|
+| `uploadTextureFiltered(decoded, .point)` | one texture, no global state |
+| `setTextureFilter(.point)` / `textureFilter()` | the filter for subsequent unqualified creations — reaches `loadTexture` and `uploadCompressed`, whose signatures core's contract fixes |
+
+**The default is `.linear`**, i.e. byte-identical sampler flags to before this
+seam existed, so no existing game changes appearance. Only the two immutable
+upload paths (`uploadTexture` / `uploadCompressed`) consult the filter; the
+dynamic/YUV plane textures are the video sink and stay bilinear.
+
+Reaching this from game code (`.filter = .point` on an atlas resource) needs a
+matching field on labelle-core's texture-load seam — see #77.
+
 ## Headless runs (`LABELLE_HEADLESS=1`)
 
 `--headless` (and `--uncapped` / `--ticks`, which imply it) has two
