@@ -124,27 +124,72 @@ jobs:
           set -euo pipefail
           pin="${LABELLE_CLI_TAG#v}"
           echo "pinned labelle-cli: $pin ($LABELLE_CLI_TAG)"
-          fail=0
+          skew=0
+          bad=0
+          seen=0
           for lock in labelle-bgfx/examples/*/labelle.lock; do
+            # An unmatched glob leaves the literal pattern here, and a lock
+            # can be unreadable. Say so ourselves instead of letting a tool's
+            # own error status abort the job with no explanation.
+            if [ ! -f "$lock" ] || [ ! -r "$lock" ]; then
+              echo "  BAD   $lock is not a readable file"
+              bad=1
+              continue
+            fi
+            seen=$((seen + 1))
             # First non-comment .cli_version — the top-level one in any lock
             # labelle-cli wrote (it stamps that field before .resolved).
-            lockv=$(grep -v '^[[:space:]]*//' "$lock" \
-              | sed -n 's/^[[:space:]]*\.cli_version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
-              | head -1)
+            #
+            # One awk, deliberately not `grep | sed | head`: awk stops at the
+            # first match by itself, so there is no `head` closing the pipe
+            # early (SIGPIPE) on a lock with many .cli_version lines, and no
+            # `grep` exit-1 on a comment-only or empty lock. Either of those
+            # would trip `pipefail` and abort the job *before* the empty and
+            # malformed handling below — losing the actionable message that
+            # is this whole step's reason to exist.
+            lockv=$(awk -F'"' '
+              /^[ \t]*\/\// { next }
+              /^[ \t]*\.cli_version[ \t]*=[ \t]*"[^"]*"/ { print $2; exit }
+            ' "$lock")
             if [ -z "$lockv" ]; then
               echo "  skip  $lock (no cli_version)"
               continue
             fi
+            # Guard the version compare: `sort -V` will happily order junk,
+            # which would report a bogus skew instead of a bogus lock.
+            case "$lockv" in
+              ''|*[!0-9.]*|.*|*.|*..*)
+                echo "  BAD   $lock  cli_version \"$lockv\" is not a version number"
+                bad=1
+                continue
+                ;;
+            esac
             if [ "$lockv" = "$pin" ]; then
               echo "  ok    $lock  lock $lockv == pin $pin"
             elif [ "$(printf '%s\n%s\n' "$pin" "$lockv" | sort -V | tail -1)" = "$pin" ]; then
               echo "  ok    $lock  lock $lockv <  pin $pin"
             else
               echo "  FAIL  $lock  lock $lockv >  pin $pin"
-              fail=1
+              skew=1
             fi
           done
-          if [ "$fail" -ne 0 ]; then
+          if [ "$seen" -eq 0 ]; then
+            echo
+            echo "The preflight examined no labelle.lock at all — labelle-bgfx/examples/*/labelle.lock"
+            echo "matched nothing. A preflight that silently covers zero locks is worse than none."
+            echo "Fix: check the checkout path and that examples/*/labelle.lock are committed."
+            bad=1
+          fi
+          if [ "$bad" -ne 0 ]; then
+            echo
+            echo "An example's labelle.lock could not be read, or its .cli_version is not a"
+            echo "version number. Locks are written by labelle-cli — a lock that does not"
+            echo "parse means it was hand-edited or truncated."
+            echo "Fix: re-run \`labelle generate\` in that example with the pinned CLI and"
+            echo "     commit the regenerated lock."
+            exit 1
+          fi
+          if [ "$skew" -ne 0 ]; then
             echo
             echo "An example's labelle.lock was written by a labelle-cli NEWER than the one"
             echo "this job pins. An older CLI can silently mis-build a newer project, so the"
