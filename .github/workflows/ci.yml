@@ -78,6 +78,36 @@ jobs:
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # ── Toolchain pins (labelle-bgfx#79) ────────────────────────────────
+    # These two tags are the single source of truth for the toolchain this
+    # job builds from source. They were floating `ref: main`, which broke
+    # every PR: `zig build` in labelle-cli takes its version string from
+    # build.zig.zon, and that field has been frozen at 1.55.1 for many
+    # releases — only labelle-cli's release workflow stamps the real number
+    # via `-Dversion=<tag>`. So a from-source CLI built off main (v1.61.2
+    # CODE) introduced itself as v1.55.1, the examples' labelle.lock says
+    # it was written by a newer CLI, and the CLI's stale-binary guard
+    # (labelle-cli#353) correctly refused to build.
+    #
+    # The guard is right; the version the binary reported was the lie. So:
+    # check the CLI out at a TAG and stamp that tag with `-Dversion` — the
+    # same thing labelle-cli's own release.yml does — and the binary
+    # reports what it actually is. NEVER LABELLE_ALLOW_OLDER_CLI=1: that
+    # silences a guard that exists to stop a stale CLI silently mis-building
+    # a newer project (skipped unknown fields -> mangled atlases).
+    #
+    # Invariant, enforced by the preflight step below: the CLI this job
+    # builds is never older than the labelle.lock of any example in this
+    # repo. Bump LABELLE_CLI_TAG and the examples' locks together (run
+    # `labelle generate` with the new CLI, commit the lock).
+    #
+    # LABELLE_ASSEMBLER_TAG is the assembler release the pinned CLI pairs
+    # with (src/cli/assembler.zig DEFAULT_ASSEMBLER_VERSION at that tag) —
+    # pinned for the same reason, so this job is reproducible rather than
+    # dependent on whatever landed on someone else's main this morning.
+    env:
+      LABELLE_CLI_TAG: v1.61.2
+      LABELLE_ASSEMBLER_TAG: v0.99.1
     steps:
       - name: Checkout labelle-bgfx
         uses: actions/checkout@v4
@@ -85,22 +115,112 @@ jobs:
           path: labelle-bgfx
           persist-credentials: false
 
-      - name: Checkout labelle-assembler (main)
+      # Fail in seconds, with an actionable message, rather than 20 minutes
+      # in with the CLI's guard message — and cover EVERY example's lock,
+      # including the two this job does not build, so the skew cannot land
+      # on main unnoticed and surface later.
+      - name: Preflight — pinned CLI is not older than any example lock
+        run: |
+          set -euo pipefail
+          pin="${LABELLE_CLI_TAG#v}"
+          echo "pinned labelle-cli: $pin ($LABELLE_CLI_TAG)"
+          skew=0
+          bad=0
+          seen=0
+          for lock in labelle-bgfx/examples/*/labelle.lock; do
+            # An unmatched glob leaves the literal pattern here, and a lock
+            # can be unreadable. Say so ourselves instead of letting a tool's
+            # own error status abort the job with no explanation.
+            if [ ! -f "$lock" ] || [ ! -r "$lock" ]; then
+              echo "  BAD   $lock is not a readable file"
+              bad=1
+              continue
+            fi
+            seen=$((seen + 1))
+            # First non-comment .cli_version — the top-level one in any lock
+            # labelle-cli wrote (it stamps that field before .resolved).
+            #
+            # One awk, deliberately not `grep | sed | head`: awk stops at the
+            # first match by itself, so there is no `head` closing the pipe
+            # early (SIGPIPE) on a lock with many .cli_version lines, and no
+            # `grep` exit-1 on a comment-only or empty lock. Either of those
+            # would trip `pipefail` and abort the job *before* the empty and
+            # malformed handling below — losing the actionable message that
+            # is this whole step's reason to exist.
+            lockv=$(awk -F'"' '
+              /^[ \t]*\/\// { next }
+              /^[ \t]*\.cli_version[ \t]*=[ \t]*"[^"]*"/ { print $2; exit }
+            ' "$lock")
+            if [ -z "$lockv" ]; then
+              echo "  skip  $lock (no cli_version)"
+              continue
+            fi
+            # Guard the version compare: `sort -V` will happily order junk,
+            # which would report a bogus skew instead of a bogus lock.
+            case "$lockv" in
+              ''|*[!0-9.]*|.*|*.|*..*)
+                echo "  BAD   $lock  cli_version \"$lockv\" is not a version number"
+                bad=1
+                continue
+                ;;
+            esac
+            if [ "$lockv" = "$pin" ]; then
+              echo "  ok    $lock  lock $lockv == pin $pin"
+            elif [ "$(printf '%s\n%s\n' "$pin" "$lockv" | sort -V | tail -1)" = "$pin" ]; then
+              echo "  ok    $lock  lock $lockv <  pin $pin"
+            else
+              echo "  FAIL  $lock  lock $lockv >  pin $pin"
+              skew=1
+            fi
+          done
+          if [ "$seen" -eq 0 ]; then
+            echo
+            echo "The preflight examined no labelle.lock at all — labelle-bgfx/examples/*/labelle.lock"
+            echo "matched nothing. A preflight that silently covers zero locks is worse than none."
+            echo "Fix: check the checkout path and that examples/*/labelle.lock are committed."
+            bad=1
+          fi
+          if [ "$bad" -ne 0 ]; then
+            echo
+            echo "An example's labelle.lock could not be read, or its .cli_version is not a"
+            echo "version number. Locks are written by labelle-cli — a lock that does not"
+            echo "parse means it was hand-edited or truncated."
+            echo "Fix: re-run \`labelle generate\` in that example with the pinned CLI and"
+            echo "     commit the regenerated lock."
+            exit 1
+          fi
+          if [ "$skew" -ne 0 ]; then
+            echo
+            echo "An example's labelle.lock was written by a labelle-cli NEWER than the one"
+            echo "this job pins. An older CLI can silently mis-build a newer project, so the"
+            echo "CLI would refuse (labelle-cli#353) — correctly."
+            echo "Fix: raise LABELLE_CLI_TAG in .github/workflows/ci.yml to a release >= the"
+            echo "     lock version above, and keep the two in step from now on."
+            echo "Do NOT set LABELLE_ALLOW_OLDER_CLI=1."
+            exit 1
+          fi
+
+      - name: Checkout labelle-assembler (${{ env.LABELLE_ASSEMBLER_TAG }})
         uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-assembler
-          ref: main
+          ref: ${{ env.LABELLE_ASSEMBLER_TAG }}
           path: labelle-assembler
           persist-credentials: false
 
-      - name: Checkout labelle-cli (main)
+      - name: Checkout labelle-cli (${{ env.LABELLE_CLI_TAG }})
         uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-cli
-          ref: main
+          ref: ${{ env.LABELLE_CLI_TAG }}
           path: labelle-cli
           persist-credentials: false
 
+      # labelle-gui is NOT version-pinned on purpose: it is checked out only
+      # so the labelle-cli build can resolve `flow_codegen` as a relative
+      # path-dep (an in-tree sub-package, not its own release train), which
+      # is how labelle-cli's own CI does it. It carries no version contract
+      # with the lock, so it cannot cause the skew this job hit.
       - name: Checkout labelle-gui for the labelle-cli build
         uses: actions/checkout@v4
         with:
@@ -126,15 +246,23 @@ jobs:
           path: |
             ~/.cache/zig
             labelle-bgfx/examples/bgfx-android/.labelle/bgfx_android/.zig-cache
-          key: bgfx-android-${{ hashFiles('labelle-bgfx/examples/bgfx-android/project.labelle', 'labelle-bgfx/build.zig.zon') }}
+          key: bgfx-android-${{ env.LABELLE_CLI_TAG }}-${{ env.LABELLE_ASSEMBLER_TAG }}-${{ hashFiles('labelle-bgfx/examples/bgfx-android/project.labelle', 'labelle-bgfx/build.zig.zon') }}
           restore-keys: |
             bgfx-android-
 
       - name: Build labelle-assembler
         run: cd labelle-assembler && zig build
 
-      - name: Build labelle-cli
-        run: cd labelle-cli && zig build
+      # `-Dversion` is labelle-cli's documented tag-stamp option (its
+      # release.yml passes the same thing). Without it the binary inherits
+      # build.zig.zon's frozen 1.55.1 and lies about what it is; with it,
+      # the stale-CLI guard compares the truth against the lock.
+      - name: Build labelle-cli (version-stamped from the pinned tag)
+        run: |
+          set -euo pipefail
+          cd labelle-cli
+          zig build -Dversion="${LABELLE_CLI_TAG#v}"
+          ./zig-out/bin/labelle version
 
       - name: Generate + cross-build libgame.so (aarch64-linux-android)
         env:
