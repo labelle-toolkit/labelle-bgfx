@@ -25,6 +25,7 @@
 /// what opts this backend in to the font traits (the contract
 /// `@hasDecl`-guards every one of them).
 const std = @import("std");
+const builtin = @import("builtin");
 const bgfx = @import("zbgfx").bgfx;
 const types = @import("types.zig");
 const state = @import("state.zig");
@@ -259,6 +260,12 @@ fn ensureFontAtlas() void {
 /// flag. Called from `programs.shutdownPrograms` on backend
 /// teardown — pre-split this was inline in `shutdownPrograms`.
 pub fn destroyFontAtlas() void {
+    // Teardown takes the whole bgfx context with it, so every catalog
+    // atlas texture dies here whether or not the catalog unloads its
+    // fonts individually. Drop the retained metrics with them, so a
+    // re-init (Android surface loss) starts from an empty registry
+    // rather than resolving handles onto destroyed textures.
+    releaseAllCatalogFonts();
     if (font_texture.idx != std.math.maxInt(u16)) {
         bgfx.destroyTexture(font_texture);
         font_texture = .{ .idx = std.math.maxInt(u16) };
@@ -721,7 +728,7 @@ pub fn uploadFontAtlas(decoded: DecodedFont) !FontAtlas {
     const handle = bgfx.createTexture2D(w, h, false, 1, .RGBA8, 0, mem, 0);
     if (handle.idx == std.math.maxInt(u16)) return error.FontUploadFailed;
 
-    return .{
+    const atlas: FontAtlas = .{
         .texture = handle,
         .width = decoded.width,
         .height = decoded.height,
@@ -730,14 +737,234 @@ pub fn uploadFontAtlas(decoded: DecodedFont) !FontAtlas {
         .line_gap = decoded.line_gap,
         .line_height = decoded.line_height,
     };
+
+    // Take the backend's own copy of the glyph metrics BEFORE returning:
+    // the loader contract has the caller free every `DecodedFont` slice
+    // the moment this function comes back, so this is the last instant
+    // they are readable. Without the copy a registered handle could
+    // resolve an atlas but never a face, and the draw would still fall
+    // back to the built-in font (see `retainFontMetrics`).
+    retainFontMetrics(atlas, decoded);
+    return atlas;
 }
 
 /// Counterpart to `uploadFontAtlas`. Idempotent on an invalid handle so
 /// the catalog's discard path can call it unconditionally.
+///
+/// Releases the retained metrics too: `uploadFontAtlas` is where the
+/// backend-owned copy is acquired, so its counterpart is where it is
+/// freed. Deliberately NOT `unregisterCatalogFont` — that one only
+/// drops a *name* for the face (and is never called at all by a caller
+/// that does not use the catalog registry, nor on the adapter's discard
+/// path), whereas this is called on every atlas that ever reached the
+/// GPU. The assembler calls `unregisterCatalogFont` strictly before
+/// this, so no draw can resolve a handle to metrics that are about to
+/// be freed.
 pub fn unloadFontAtlas(atlas: FontAtlas) void {
+    releaseFontMetrics(atlas);
     if (atlas.texture.idx != std.math.maxInt(u16)) {
         bgfx.destroyTexture(atlas.texture);
     }
+}
+
+// ── Catalog font registry (labelle-bgfx#85, labelle-assembler#703) ────
+//
+// The link that turns a declared `.font` resource into real glyphs.
+//
+// Two facts shape this table:
+//
+//   1. `registerCatalogFont(handle, atlas)` is the ONLY place the
+//      backend learns the id a game will draw with — the assembler's
+//      generated `FontBackendAdapter` mints it and hands it over right
+//      after `uploadFontAtlas` returns. It carries the atlas, and
+//      nothing else.
+//   2. Laying text out needs the glyph metrics, and those are visible
+//      to this backend only inside `uploadFontAtlas`, one call earlier,
+//      because the caller frees them immediately afterwards.
+//
+// So the registry is filled in two steps against ONE table: the upload
+// deposits the metric copies keyed by the bgfx texture index (unique
+// among live textures, and carried inside the `FontAtlas` the adapter
+// hands back), and the registration then stamps the catalog handle onto
+// that same entry. `fontFaceForHandle` reads it.
+//
+// Bounded and allocation-free for the table itself, in the shape
+// `texture.zig` already uses for its handle pool: a fixed array of
+// optional slots, linear scan. Only the metric copies are allocated.
+
+/// Live catalog fonts this backend can resolve at once. A game with
+/// more than this many simultaneously loaded faces gets the built-in
+/// face for the overflow — a missing improvement, never wrong glyphs.
+pub const MAX_CATALOG_FONTS = 64;
+
+/// Allocator for the retained metric copies. A `var` purely so the
+/// tests can substitute a leak-checking allocator; production always
+/// uses `page_allocator`, the same one `texture.zig` retains its
+/// decoded pixels with.
+pub var metrics_allocator: std.mem.Allocator = std.heap.page_allocator;
+
+/// One retained face. `handle` is null between the upload and the
+/// registration — and stays null forever for a caller that never
+/// registers (a backend driven without the assembler's catalog), which
+/// is exactly the pre-#85 behaviour.
+const CatalogFontSlot = struct {
+    /// Key deposited by `uploadFontAtlas`: the bgfx texture index.
+    texture_idx: u16,
+    /// The catalog handle, packed index-low / generation-high.
+    handle: ?FontHandle,
+    atlas: FontAtlas,
+    /// Owned copies (`metrics_allocator`) of the decoded metrics.
+    glyphs: []Glyph,
+    codepoint_index: []CodepointEntry,
+    kerning: []KernPair,
+};
+
+var catalog_fonts: [MAX_CATALOG_FONTS]?CatalogFontSlot =
+    [_]?CatalogFontSlot{null} ** MAX_CATALOG_FONTS;
+
+/// Copy `decoded`'s metrics into a free slot, keyed by the uploaded
+/// atlas's texture index.
+///
+/// Silent no-op when the table is full or a copy cannot be allocated:
+/// the font simply stays unresolvable and its text renders in the
+/// built-in face, which is the same degradation as an unknown handle.
+///
+/// `pub` only so `src/font_tests.zig` can drive the registry without a
+/// GPU — it touches no bgfx state. Production callers go through
+/// `uploadFontAtlas`.
+pub fn retainFontMetrics(atlas: FontAtlas, decoded: DecodedFont) void {
+    if (atlas.texture.idx == std.math.maxInt(u16)) return;
+
+    // A bgfx texture index is recycled after a destroy. If a previous
+    // occupant of this index was never unloaded through
+    // `unloadFontAtlas`, its entry would shadow the new one, so drop it.
+    releaseSlotAt(findSlotByTexture(atlas.texture.idx));
+
+    const free_idx = findFreeSlot() orelse {
+        // Guarded: Zig's test runner attributes log output during a test
+        // to that test and fails the step, and the full-table case is
+        // deliberately exercised by `src/font_tests.zig`. Same
+        // `is_test` guard the toolkit already uses for leaf diagnostics.
+        if (!builtin.is_test) {
+            std.log.warn("bgfx: catalog font registry full ({d}); font falls back to the built-in face", .{MAX_CATALOG_FONTS});
+        }
+        return;
+    };
+
+    const a = metrics_allocator;
+    const glyphs = a.dupe(Glyph, decoded.glyphs) catch return;
+    const index = a.dupe(CodepointEntry, decoded.codepoint_index) catch {
+        a.free(glyphs);
+        return;
+    };
+    const kerning = a.dupe(KernPair, decoded.kerning) catch {
+        a.free(glyphs);
+        a.free(index);
+        return;
+    };
+
+    catalog_fonts[free_idx] = .{
+        .texture_idx = atlas.texture.idx,
+        .handle = null,
+        .atlas = atlas,
+        .glyphs = glyphs,
+        .codepoint_index = index,
+        .kerning = kerning,
+    };
+}
+
+/// Free the retained metrics for `atlas`, if any, and clear its slot
+/// (handle mapping included). Idempotent. `pub` for the same
+/// test-without-a-GPU reason as `retainFontMetrics`; production callers
+/// go through `unloadFontAtlas`.
+pub fn releaseFontMetrics(atlas: FontAtlas) void {
+    if (atlas.texture.idx == std.math.maxInt(u16)) return;
+    releaseSlotAt(findSlotByTexture(atlas.texture.idx));
+}
+
+/// Drop every retained face. Called from `destroyFontAtlas` on backend
+/// teardown (including Android surface loss), where the bgfx context —
+/// and with it every atlas texture — goes away without the catalog
+/// necessarily unloading each font first.
+pub fn releaseAllCatalogFonts() void {
+    for (0..MAX_CATALOG_FONTS) |i| releaseSlotAt(i);
+}
+
+fn releaseSlotAt(maybe_idx: ?usize) void {
+    const idx = maybe_idx orelse return;
+    const slot = catalog_fonts[idx] orelse return;
+    metrics_allocator.free(slot.glyphs);
+    metrics_allocator.free(slot.codepoint_index);
+    metrics_allocator.free(slot.kerning);
+    catalog_fonts[idx] = null;
+}
+
+fn findSlotByTexture(texture_idx: u16) ?usize {
+    for (catalog_fonts, 0..) |maybe, i| {
+        const slot = maybe orelse continue;
+        if (slot.texture_idx == texture_idx) return i;
+    }
+    return null;
+}
+
+fn findSlotByHandle(handle: FontHandle) ?usize {
+    for (catalog_fonts, 0..) |maybe, i| {
+        const slot = maybe orelse continue;
+        const h = slot.handle orelse continue;
+        if (h == handle) return i;
+    }
+    return null;
+}
+
+fn findFreeSlot() ?usize {
+    for (catalog_fonts, 0..) |maybe, i| {
+        if (maybe == null) return i;
+    }
+    return null;
+}
+
+/// Bind the catalog's font id to the atlas this backend just uploaded.
+///
+/// `handle` is the engine's `FontId` packed INDEX-LOW / GENERATION-HIGH
+/// (labelle-engine `atlas_mixin.packFontId`) — byte-identical to the
+/// `u32` that later arrives at `drawTextWithFont`. The whole 32 bits are
+/// the key: the low 16 alone are a slot index the catalog RECYCLES, so
+/// two different faces share it across an unload/reload and differ only
+/// in the generation. Keying on the truncated index would let a stale
+/// draw call resolve its successor's face — silently the wrong glyphs,
+/// which is the failure this registry exists to avoid. Keying on the
+/// full packed value makes a stale handle simply miss and fall back.
+///
+/// Paired with `unregisterCatalogFont`; the assembler `@hasDecl`-gates
+/// both together, so neither is useful alone.
+pub fn registerCatalogFont(handle: FontHandle, atlas: FontAtlas) void {
+    // Re-registering a handle that is already bound (the catalog should
+    // never do it, but the seam must not corrupt the table if it does):
+    // last registration wins, so drop the old binding first. The old
+    // slot keeps its metrics — it is still a live atlas, owned by
+    // whoever uploaded it, and `unloadFontAtlas` remains its release.
+    if (findSlotByHandle(handle)) |stale| {
+        if (catalog_fonts[stale]) |*slot| slot.handle = null;
+    }
+
+    const idx = findSlotByTexture(atlas.texture.idx) orelse return;
+    if (catalog_fonts[idx]) |*slot| {
+        slot.handle = handle;
+        slot.atlas = atlas;
+    }
+}
+
+/// Drop the catalog handle's binding. The assembler calls this strictly
+/// BEFORE `unloadFontAtlas`, so the face stops resolving before its
+/// texture is destroyed and no draw can land on a dead atlas.
+///
+/// Unknown handles are a no-op: the seam is called unconditionally on
+/// the catalog's unload path, including for fonts this backend never
+/// managed to retain. Metrics are freed by `unloadFontAtlas`, not here
+/// — see its doc comment.
+pub fn unregisterCatalogFont(handle: FontHandle) void {
+    const idx = findSlotByHandle(handle) orelse return;
+    if (catalog_fonts[idx]) |*slot| slot.handle = null;
 }
 
 // ── Baked-font drawing ────────────────────────────────────────────────
@@ -747,9 +974,11 @@ pub fn unloadFontAtlas(atlas: FontAtlas) void {
 // at the backend root, which is where `core.hasFontAwareText` probes.
 
 /// A baked face as the draw path needs it: the GPU atlas plus the
-/// borrowed metric slices from the `DecodedFont` it came from. The
-/// slices are borrowed, never owned — whoever holds the decoded font
-/// (today: the engine's asset catalog) keeps them alive.
+/// metric slices from the `DecodedFont` it came from. The slices are
+/// borrowed by the face, never owned by it. For a face that came out of
+/// `fontFaceForHandle` they point at the catalog registry's own copies,
+/// which live until `unloadFontAtlas`; a caller building a face by hand
+/// keeps its own slices alive.
 pub const FontFace = struct {
     atlas: FontAtlas,
     glyphs: []const Glyph,
@@ -934,33 +1163,26 @@ pub const FontHandle = u32;
 /// Resolve a `FontHandle` to the face to draw with, or null to fall
 /// back to the built-in 8x8 font.
 ///
-/// This is a SEAM WITH NO REGISTRATIONS YET, and that is deliberate —
-/// see labelle-bgfx#85. Nothing currently hands this backend a handle
-/// it can resolve:
+/// Reads the catalog registry above. A handle resolves only if the
+/// assembler both registered it (`registerCatalogFont`) and has not
+/// unregistered it since — so an unknown, stale, or never-registered
+/// handle returns null and the draw degrades to the built-in face,
+/// which is what a backend wired without the catalog seam does for
+/// every handle. Never wrong glyphs; either the real face or the
+/// fallback.
 ///
-///   * `uploadFontAtlas` returns a `FontAtlas` STRUCT, not an id. The
-///     id a game eventually holds is minted by the assembler-generated
-///     `FontBackendAdapter`, which picks a slot in its OWN table
-///     (`engine.FontId{ .index = idx, .generation = 1 }`) and keeps the
-///     backend's `FontAtlas` there opaquely. This backend never sees
-///     that number, and the two numbering spaces are independent —
-///     exactly the trap labelle-gfx#326 hit with texture ids, where two
-///     `u32` spaces were conflated and a menu silently blanked.
-///   * The glyph metrics needed to lay text out are freed by the caller
-///     right after `uploadFontAtlas` returns (the contract's ownership
-///     rule), so retaining them is a separate backend-side decision
-///     that only pays off once the id linkage exists.
-///
-/// Rather than GUESS that the adapter's slot index equals one this
-/// backend could mint — true today only because both are first-free
-/// allocators driven by the same call sequence, and silently wrong the
-/// moment either changes — the lookup returns null and the draw
-/// degrades to the built-in face. A missing improvement, never wrong
-/// glyphs. When the propagation lands, this function is the one place
-/// that changes.
+/// This backend does NOT mint or guess ids: the numbering space belongs
+/// to whoever registered, exactly so the two-`u32`-spaces trap of
+/// labelle-gfx#326 cannot reappear here.
 pub fn fontFaceForHandle(handle: FontHandle) ?FontFace {
-    _ = handle;
-    return null;
+    const idx = findSlotByHandle(handle) orelse return null;
+    const slot = catalog_fonts[idx] orelse return null;
+    return .{
+        .atlas = slot.atlas,
+        .glyphs = slot.glyphs,
+        .codepoint_index = slot.codepoint_index,
+        .kerning = slot.kerning,
+    };
 }
 
 /// Font-aware text draw — the optional seam from labelle-core#75.
