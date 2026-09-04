@@ -299,20 +299,325 @@ test "the backend root binds core's font-aware text draw" {
     }
 }
 
-test "an unresolvable handle degrades to the built-in face" {
-    // `fontFaceForHandle` is a seam with no registrations yet: nothing
-    // hands this backend a handle in its own numbering space (see
-    // labelle-bgfx#85). Every handle therefore misses, and the draw
-    // falls back to the built-in font — a missing improvement, never
-    // wrong glyphs. This test pins that the miss is a FALLBACK and not
-    // a crash or a blank, and will need updating (not deleting) when
-    // the propagation lands.
+test "an unregistered handle degrades to the built-in face" {
+    // The registry (labelle-bgfx#85) resolves only handles the catalog
+    // actually registered. Everything else — a never-registered id, a
+    // stale one, `FontId.invalid` — misses, and the draw falls back to
+    // the built-in font. A missing improvement, never wrong glyphs.
+    resetRegistry();
+
     try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(1));
     try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(0));
     try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(std.math.maxInt(u32)));
 
     // …and a null face is exactly what routes to the built-in font.
     try testing.expect(font.usesBuiltinFace(font.fontFaceForHandle(1)));
+}
+
+// ── The catalog font registry (labelle-bgfx#85, assembler#703) ────────
+//
+// The final link: the assembler's `FontBackendAdapter` mints a
+// `FontId`, packs it index-low / generation-high, and hands it here with
+// the `FontAtlas` this backend returned from `uploadFontAtlas`. Without
+// this table `drawTextWithFont` can only ever draw the built-in 8x8
+// face, however correct everything upstream is.
+//
+// These tests drive `retainFontMetrics` / `registerCatalogFont` /
+// `unregisterCatalogFont` / `releaseFontMetrics` directly, which is the
+// same call order `uploadFontAtlas` → register → unregister →
+// `unloadFontAtlas` produces, minus the bgfx calls those two wrap. They
+// run `testing.allocator` through `font.metrics_allocator`, so a
+// retained copy that is never released fails the test as a leak.
+
+/// The engine's `atlas_mixin.packFontId`, transcribed. THE contract:
+/// registering under any other arithmetic keys the table on a number
+/// the draw call never produces, and the failure is silent.
+fn packFontId(index: u16, generation: u16) u32 {
+    return @as(u32, index) | (@as(u32, generation) << 16);
+}
+
+fn resetRegistry() void {
+    font.metrics_allocator = testing.allocator;
+    font.releaseAllCatalogFonts();
+}
+
+/// A decoded font whose metrics are distinguishable per `advance`, so a
+/// resolved face can be told apart from another registration's.
+fn fakeDecoded(advance: f32) font.DecodedFont {
+    const S = struct {
+        var bitmap = [_]u8{0} ** 4;
+        var glyphs: [2]font.Glyph = undefined;
+        const index = [_]font.CodepointEntry{
+            .{ .codepoint = ' ', .glyph_index = 0 },
+            .{ .codepoint = 'A', .glyph_index = 1 },
+        };
+        const kerning = [_]font.KernPair{.{ .first = 'A', .second = 'A', .advance = -1 }};
+    };
+    S.glyphs = .{
+        .{ .u0 = 0, .v0 = 0, .u1 = 0, .v1 = 0, .xoff = 0, .yoff = 0, .advance = 8 },
+        .{ .u0 = 0, .v0 = 0, .u1 = 10, .v1 = 10, .xoff = 1, .yoff = -10, .advance = advance },
+    };
+    return .{
+        .bitmap = &S.bitmap,
+        .width = 2,
+        .height = 2,
+        .glyphs = &S.glyphs,
+        .codepoint_index = &S.index,
+        .ascent = 16,
+        .descent = -4,
+        .line_gap = 0,
+        .line_height = 20,
+        .kerning = &S.kerning,
+    };
+}
+
+fn fakeAtlas(texture_idx: u16) font.FontAtlas {
+    return .{
+        .texture = .{ .idx = texture_idx },
+        .width = 100,
+        .height = 50,
+        .ascent = 16,
+        .descent = -4,
+        .line_gap = 0,
+        .line_height = 20,
+    };
+}
+
+test "a registered handle resolves to its real face" {
+    resetRegistry();
+
+    const atlas = fakeAtlas(7);
+    font.retainFontMetrics(atlas, fakeDecoded(12));
+    defer font.releaseFontMetrics(atlas);
+
+    const handle = packFontId(0, 1); // the catalog's first font
+    font.registerCatalogFont(handle, atlas);
+
+    const face = font.fontFaceForHandle(handle) orelse return error.TestUnexpectedResult;
+    // The atlas came back intact…
+    try testing.expectEqual(@as(u16, 7), face.atlas.texture.idx);
+    try testing.expectEqual(@as(u32, 100), face.atlas.width);
+    // …and so did the metrics, which is the half that would otherwise
+    // have been freed by the caller the moment `uploadFontAtlas`
+    // returned. They are a COPY, not the caller's slices.
+    try testing.expectEqual(@as(usize, 2), face.glyphs.len);
+    try testing.expectEqual(@as(f32, 12), face.glyphs[1].advance);
+    try testing.expectEqual(@as(usize, 1), face.kerning.len);
+    try testing.expectEqual(@as(?u32, 1), font.glyphIndexFor(face.codepoint_index, 'A'));
+    try testing.expect(face.glyphs.ptr != fakeDecoded(12).glyphs.ptr);
+
+    // And this face draws as itself, not as the 8x8 fallback.
+    try testing.expect(!font.usesBuiltinFace(face));
+
+    // It lays out: 'A' advances 12 at scale 1 (ascent - descent == 20).
+    try testing.expectApproxEqAbs(@as(f32, 12), font.measureText(face, "A", 20), 0.001);
+}
+
+test "the FULL packed handle is the key, not the truncated slot index" {
+    // The catalog RECYCLES its slot index across an unload/reload, so
+    // two different faces differ only in the generation. Keying on
+    // `@truncate(handle)` would let a stale draw resolve its
+    // successor's face — silently the wrong glyphs, exactly what this
+    // registry exists to prevent.
+    resetRegistry();
+
+    const first = fakeAtlas(7);
+    font.retainFontMetrics(first, fakeDecoded(12));
+    const h1 = packFontId(0, 1);
+    font.registerCatalogFont(h1, first);
+
+    // The bare index is NOT a key: 0 is `FontId.invalid`'s packing.
+    try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(0));
+    try testing.expect(font.fontFaceForHandle(h1) != null);
+
+    // Reload: unregister-then-unload (the assembler's order), then the
+    // same slot index comes back at generation 2.
+    font.unregisterCatalogFont(h1);
+    font.releaseFontMetrics(first);
+
+    const second = fakeAtlas(9);
+    font.retainFontMetrics(second, fakeDecoded(20));
+    defer font.releaseFontMetrics(second);
+    const h2 = packFontId(0, 2);
+    font.registerCatalogFont(h2, second);
+
+    // The stale handle misses; the live one resolves the NEW face.
+    try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(h1));
+    const face = font.fontFaceForHandle(h2) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u16, 9), face.atlas.texture.idx);
+    try testing.expectEqual(@as(f32, 20), face.glyphs[1].advance);
+}
+
+test "unregisterCatalogFont stops resolution before the atlas is destroyed" {
+    // The assembler calls unregister STRICTLY BEFORE `unloadFontAtlas`,
+    // so there is no window in which a draw resolves a handle to an
+    // atlas whose texture is already gone.
+    resetRegistry();
+
+    const atlas = fakeAtlas(3);
+    font.retainFontMetrics(atlas, fakeDecoded(12));
+    const handle = packFontId(2, 1);
+    font.registerCatalogFont(handle, atlas);
+    try testing.expect(font.fontFaceForHandle(handle) != null);
+
+    font.unregisterCatalogFont(handle);
+    try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(handle));
+    try testing.expect(font.usesBuiltinFace(font.fontFaceForHandle(handle)));
+
+    // The metrics outlive the unregister — they belong to the atlas,
+    // and `unloadFontAtlas` (here its bgfx-free half) is what frees
+    // them. `testing.allocator` fails this test if they do not.
+    font.releaseFontMetrics(atlas);
+}
+
+test "unregistering an unknown handle is a no-op" {
+    resetRegistry();
+
+    const atlas = fakeAtlas(4);
+    font.retainFontMetrics(atlas, fakeDecoded(12));
+    defer font.releaseFontMetrics(atlas);
+    const handle = packFontId(1, 1);
+    font.registerCatalogFont(handle, atlas);
+
+    // Never registered, already unregistered, and `FontId.invalid` —
+    // all reachable, since the catalog's unload path calls this
+    // unconditionally, including for fonts this backend never retained.
+    font.unregisterCatalogFont(packFontId(9, 9));
+    font.unregisterCatalogFont(0);
+    font.unregisterCatalogFont(std.math.maxInt(u32));
+
+    // The live registration is untouched.
+    try testing.expect(font.fontFaceForHandle(handle) != null);
+
+    font.unregisterCatalogFont(handle);
+    font.unregisterCatalogFont(handle); // twice is fine too
+    try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(handle));
+}
+
+test "registering over an occupied handle rebinds it, last one wins" {
+    // The catalog should never reuse a live handle for a second atlas,
+    // but the seam must not end up with two entries answering to one
+    // key — an ambiguous lookup is exactly the silent-wrong-glyphs
+    // failure mode.
+    resetRegistry();
+
+    const old = fakeAtlas(11);
+    const new = fakeAtlas(12);
+    font.retainFontMetrics(old, fakeDecoded(12));
+    font.retainFontMetrics(new, fakeDecoded(20));
+    defer font.releaseFontMetrics(old);
+    defer font.releaseFontMetrics(new);
+
+    const handle = packFontId(5, 1);
+    font.registerCatalogFont(handle, old);
+    font.registerCatalogFont(handle, new);
+
+    const face = font.fontFaceForHandle(handle) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u16, 12), face.atlas.texture.idx);
+    try testing.expectEqual(@as(f32, 20), face.glyphs[1].advance);
+
+    // One unregister clears the key completely — the displaced entry
+    // did not stay bound underneath it.
+    font.unregisterCatalogFont(handle);
+    try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(handle));
+}
+
+test "registering an atlas whose metrics were never retained is a no-op" {
+    // What a full table (or a failed metrics copy) looks like from the
+    // register side: no entry to stamp, so the handle stays
+    // unresolvable and the text renders in the built-in face.
+    resetRegistry();
+
+    const handle = packFontId(6, 1);
+    font.registerCatalogFont(handle, fakeAtlas(20));
+    try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(handle));
+
+    // An invalid atlas handle (a failed upload) retains nothing either.
+    const dead = fakeAtlas(std.math.maxInt(u16));
+    font.retainFontMetrics(dead, fakeDecoded(12));
+    font.registerCatalogFont(handle, dead);
+    try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(handle));
+}
+
+test "a full registry declines the overflow and keeps the rest resolvable" {
+    resetRegistry();
+    defer font.releaseAllCatalogFonts();
+
+    for (0..font.MAX_CATALOG_FONTS) |i| {
+        const idx: u16 = @intCast(i);
+        const atlas = fakeAtlas(idx);
+        font.retainFontMetrics(atlas, fakeDecoded(12));
+        font.registerCatalogFont(packFontId(idx, 1), atlas);
+    }
+    // Every one of them resolves.
+    for (0..font.MAX_CATALOG_FONTS) |i| {
+        const idx: u16 = @intCast(i);
+        try testing.expect(font.fontFaceForHandle(packFontId(idx, 1)) != null);
+    }
+
+    // One more than the table holds: retained nothing, so it is not
+    // registrable — and, crucially, it evicts nothing.
+    const overflow = fakeAtlas(font.MAX_CATALOG_FONTS);
+    font.retainFontMetrics(overflow, fakeDecoded(20));
+    const overflow_handle = packFontId(font.MAX_CATALOG_FONTS, 1);
+    font.registerCatalogFont(overflow_handle, overflow);
+
+    try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(overflow_handle));
+    try testing.expect(font.usesBuiltinFace(font.fontFaceForHandle(overflow_handle)));
+    try testing.expect(font.fontFaceForHandle(packFontId(0, 1)) != null);
+    try testing.expect(font.fontFaceForHandle(packFontId(font.MAX_CATALOG_FONTS - 1, 1)) != null);
+
+    // A slot freed by an unload makes room again.
+    font.unregisterCatalogFont(packFontId(0, 1));
+    font.releaseFontMetrics(fakeAtlas(0));
+    font.retainFontMetrics(overflow, fakeDecoded(20));
+    font.registerCatalogFont(overflow_handle, overflow);
+    try testing.expect(font.fontFaceForHandle(overflow_handle) != null);
+}
+
+test "releaseAllCatalogFonts empties the registry on teardown" {
+    // `destroyFontAtlas` (backend teardown, Android surface loss) takes
+    // the bgfx context with it, so every registered atlas texture dies
+    // whether or not the catalog unloaded its fonts one by one. The
+    // registry must not survive that pointing at destroyed textures —
+    // and must not leak the retained metrics either.
+    resetRegistry();
+
+    const atlas = fakeAtlas(31);
+    font.retainFontMetrics(atlas, fakeDecoded(12));
+    const handle = packFontId(4, 1);
+    font.registerCatalogFont(handle, atlas);
+    try testing.expect(font.fontFaceForHandle(handle) != null);
+
+    font.releaseAllCatalogFonts();
+    try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(handle));
+
+    // Idempotent: a second teardown (or an `unloadFontAtlas` arriving
+    // after one) must not double-free.
+    font.releaseAllCatalogFonts();
+    font.releaseFontMetrics(atlas);
+}
+
+test "the register/unregister seam is bound on the backend root" {
+    // THE POINT OF THIS TEST: the assembler `@hasDecl`-gates
+    // `registerCatalogFont` and `unregisterCatalogFont` TOGETHER on the
+    // backend root (labelle-assembler#703). A rename, a wrong arity, or
+    // declaring only one of them does not fail to compile — the seam
+    // just goes comptime-false and every font silently renders in the
+    // 8x8 face, which is precisely the bug being closed here.
+    try testing.expect(@hasDecl(gfx, "registerCatalogFont"));
+    try testing.expect(@hasDecl(gfx, "unregisterCatalogFont"));
+
+    const reg = @typeInfo(@TypeOf(gfx.registerCatalogFont)).@"fn";
+    try testing.expectEqual(@as(usize, 2), reg.params.len);
+    try testing.expectEqual(u32, reg.params[0].type.?);
+    try testing.expectEqual(gfx.FontAtlas, reg.params[1].type.?);
+    try testing.expectEqual(void, reg.return_type.?);
+
+    const unreg = @typeInfo(@TypeOf(gfx.unregisterCatalogFont)).@"fn";
+    try testing.expectEqual(@as(usize, 1), unreg.params.len);
+    try testing.expectEqual(u32, unreg.params[0].type.?);
+    try testing.expectEqual(void, unreg.return_type.?);
 }
 
 // ── Real TTF bake ─────────────────────────────────────────────────────

@@ -425,6 +425,22 @@ pub const decodeFont = font.decodeFont;
 pub const uploadFontAtlas = font.uploadFontAtlas;
 pub const unloadFontAtlas = font.unloadFontAtlas;
 
+// ── Catalog font registry (labelle-bgfx#85, labelle-assembler#703) ────
+//
+// The assembler's generated `FontBackendAdapter` mints the `FontId` a
+// game draws with; this pair is how that number reaches the backend, so
+// `drawTextWithFont` can resolve it to the atlas it uploaded instead of
+// silently falling back to the built-in 8x8 face.
+//
+// BOTH decls are required together — the adapter `@hasDecl`-gates them
+// as ONE seam, and a backend declaring only one leaves the whole thing
+// comptime-dead (deliberately: registering without unregistering would
+// resolve a destroyed atlas after a scene unload). Declaring them here,
+// at the backend ROOT, is what the adapter probes; on `gfx/font.zig`
+// alone they would never be seen.
+pub const registerCatalogFont = font.registerCatalogFont;
+pub const unregisterCatalogFont = font.unregisterCatalogFont;
+
 // ── Utility functions (Backend contract) ──────────────────────────────
 
 pub const beginMode2D = state.beginMode2D;
