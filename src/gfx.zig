@@ -393,6 +393,18 @@ pub const VideoBackend = if (is_wasm) struct {} else @import("video/backend.zig"
 
 pub const drawText = font.drawText;
 
+// Optional font-aware text draw (labelle-core#75). This decl name is
+// exactly what `core.hasFontAwareText` — and the `Backend(Impl)`
+// wrapper's `@hasDecl(Impl, "drawTextWithFont")` — probes for; a
+// backend that omits it degrades to the plain `drawText` above. `null`
+// means "use the built-in font", which is what `Game.fontId` returns
+// while a lazily-declared font is still baking.
+//
+// `src/font_tests.zig` asserts this binds, because a misspelled or
+// mis-arity decl fails the probe SILENTLY and reads as success.
+pub const drawTextWithFont = font.drawTextWithFont;
+pub const FontHandle = font.FontHandle;
+
 // ── Font atlas surface (labelle-gfx#258, labelle-engine#448) ───────────
 //
 // These are the decls the contract `@hasDecl`-probes: declaring
@@ -402,11 +414,6 @@ pub const drawText = font.drawText;
 // declared `.font` resource instead of returning
 // `error.FontBackendNotImplemented`.
 //
-// The font-aware DRAW decl is deliberately absent: its name and
-// signature are still being settled in labelle-core, and a guessed name
-// would fail the `@hasDecl` probe silently. The implementation is
-// already in `gfx/font.zig` (`drawTextMaybeFace`), so binding it is a
-// one-line addition here once core publishes the signature.
 pub const CodepointRange = font.CodepointRange;
 pub const Glyph = font.Glyph;
 pub const CodepointEntry = font.CodepointEntry;

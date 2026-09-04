@@ -251,14 +251,68 @@ test "a null or invalid face falls back to the built-in font" {
     try testing.expect(font.usesBuiltinFace(face));
 }
 
-test "the internal draw paths are analyzed" {
-    // `drawTextFace` / `drawTextMaybeFace` are private and, until core
-    // publishes the public font-aware draw decl, have no in-tree
-    // caller — and Zig never analyzes an unreferenced private
-    // function. Reference them here so a type error in either one
-    // fails the build instead of hiding until the decl lands.
+test "the module-internal draw paths are analyzed" {
+    // `drawTextFace` / `drawTextMaybeFace` are reached only through
+    // `drawTextWithFont`'s non-null arm, which nothing exercises until
+    // a handle can be resolved. Reference them so a type error in
+    // either one fails the build rather than waiting for that.
     _ = &font.drawTextFace;
     _ = &font.drawTextMaybeFace;
+}
+
+// ── The font-aware draw seam (labelle-core#75) ────────────────────────
+
+const gfx = @import("gfx.zig");
+const core = @import("labelle-core");
+
+test "the backend root binds core's font-aware text draw" {
+    // THE POINT OF THIS TEST: the seam is `@hasDecl`-gated, so a
+    // misspelled name or a wrong arity does not fail to compile — it
+    // fails to BIND, silently, and every text draw quietly keeps going
+    // through the plain `drawText` while the code reads as though the
+    // font arrived. Pin the decl on the root namespace the contract
+    // actually probes (`gfx.zig`, i.e. `BackendGfx`), not on
+    // `gfx/font.zig`.
+    try testing.expect(@hasDecl(gfx, "drawTextWithFont"));
+
+    // Pin the exact shape: `fn ([:0]const u8, f32, f32, f32, Color,
+    // ?FontHandle) void`. An arity or type drift here is the same
+    // silent-unbind failure as a rename.
+    const info = @typeInfo(@TypeOf(gfx.drawTextWithFont)).@"fn";
+    try testing.expectEqual(@as(usize, 6), info.params.len);
+    try testing.expectEqual([:0]const u8, info.params[0].type.?);
+    try testing.expectEqual(f32, info.params[1].type.?);
+    try testing.expectEqual(f32, info.params[2].type.?);
+    try testing.expectEqual(f32, info.params[3].type.?);
+    try testing.expectEqual(?u32, info.params[5].type.?);
+    try testing.expectEqual(void, info.return_type.?);
+
+    // `FontHandle` is core#75's plain `u32` straight-through handle.
+    try testing.expectEqual(u32, gfx.FontHandle);
+
+    // And the capability gate itself, when the pinned core is new
+    // enough to have it. Guarded because this backend still builds
+    // against core pins that predate core#76 — the decl above binds
+    // either way, since `FontHandle` is just `u32`.
+    if (@hasDecl(core.backend_contract, "hasFontAwareText")) {
+        try testing.expect(core.backend_contract.hasFontAwareText(gfx));
+    }
+}
+
+test "an unresolvable handle degrades to the built-in face" {
+    // `fontFaceForHandle` is a seam with no registrations yet: nothing
+    // hands this backend a handle in its own numbering space (see
+    // labelle-bgfx#85). Every handle therefore misses, and the draw
+    // falls back to the built-in font — a missing improvement, never
+    // wrong glyphs. This test pins that the miss is a FALLBACK and not
+    // a crash or a blank, and will need updating (not deleting) when
+    // the propagation lands.
+    try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(1));
+    try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(0));
+    try testing.expectEqual(@as(?font.FontFace, null), font.fontFaceForHandle(std.math.maxInt(u32)));
+
+    // …and a null face is exactly what routes to the built-in font.
+    try testing.expect(font.usesBuiltinFace(font.fontFaceForHandle(1)));
 }
 
 // ── Real TTF bake ─────────────────────────────────────────────────────

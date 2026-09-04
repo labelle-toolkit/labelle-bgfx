@@ -742,15 +742,9 @@ pub fn unloadFontAtlas(atlas: FontAtlas) void {
 
 // ── Baked-font drawing ────────────────────────────────────────────────
 //
-// NOTE (pending public decl): the font-aware draw decl's exact name and
-// signature are being settled in labelle-core — an optional,
-// `@hasDecl`-guarded draw taking a nullable font id, modelled on
-// `drawTextureProMaterial` / `Gui.labelWidgetWithFont`. Until that
-// lands, the path below is INTERNAL to this file and is deliberately
-// NOT re-exported from `gfx.zig`: a guessed decl name would fail the
-// contract's `@hasDecl` check silently and look like it worked. Once
-// core publishes the signature, the export is a one-line addition in
-// `gfx.zig` over this same implementation.
+// The public entry point is `drawTextWithFont`, the optional
+// `@hasDecl`-gated font-aware draw from labelle-core#75 — re-exported
+// at the backend root, which is where `core.hasFontAwareText` probes.
 
 /// A baked face as the draw path needs it: the GPU atlas plus the
 /// borrowed metric slices from the `DecodedFont` it came from. The
@@ -893,7 +887,7 @@ pub fn measureText(face: FontFace, text: []const u8, size: f32) f32 {
 }
 
 /// Submit `text` through the sprite pipeline using a baked face.
-/// Internal until core publishes the public decl (see the NOTE above).
+/// Module-internal: `gfx.zig` exports `drawTextWithFont`, not this.
 pub fn drawTextFace(face: FontFace, text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void {
     if (face.atlas.texture.idx == std.math.maxInt(u16)) return;
 
@@ -930,6 +924,67 @@ pub fn drawTextFace(face: FontFace, text: [:0]const u8, x: f32, y: f32, size: f3
     );
 }
 
+/// The opaque font handle the draw seam transports (labelle-core#75's
+/// `FontHandle`). Spelled `u32` here rather than `core.FontHandle` on
+/// purpose: `FontHandle` only exists in core >= the release carrying
+/// core#76, and this backend still builds against older pins. The two
+/// are the same type, so the decl binds either way.
+pub const FontHandle = u32;
+
+/// Resolve a `FontHandle` to the face to draw with, or null to fall
+/// back to the built-in 8x8 font.
+///
+/// This is a SEAM WITH NO REGISTRATIONS YET, and that is deliberate —
+/// see labelle-bgfx#85. Nothing currently hands this backend a handle
+/// it can resolve:
+///
+///   * `uploadFontAtlas` returns a `FontAtlas` STRUCT, not an id. The
+///     id a game eventually holds is minted by the assembler-generated
+///     `FontBackendAdapter`, which picks a slot in its OWN table
+///     (`engine.FontId{ .index = idx, .generation = 1 }`) and keeps the
+///     backend's `FontAtlas` there opaquely. This backend never sees
+///     that number, and the two numbering spaces are independent —
+///     exactly the trap labelle-gfx#326 hit with texture ids, where two
+///     `u32` spaces were conflated and a menu silently blanked.
+///   * The glyph metrics needed to lay text out are freed by the caller
+///     right after `uploadFontAtlas` returns (the contract's ownership
+///     rule), so retaining them is a separate backend-side decision
+///     that only pays off once the id linkage exists.
+///
+/// Rather than GUESS that the adapter's slot index equals one this
+/// backend could mint — true today only because both are first-free
+/// allocators driven by the same call sequence, and silently wrong the
+/// moment either changes — the lookup returns null and the draw
+/// degrades to the built-in face. A missing improvement, never wrong
+/// glyphs. When the propagation lands, this function is the one place
+/// that changes.
+pub fn fontFaceForHandle(handle: FontHandle) ?FontFace {
+    _ = handle;
+    return null;
+}
+
+/// Font-aware text draw — the optional seam from labelle-core#75.
+///
+/// `null` means "use the built-in font", which is what `Game.fontId`
+/// returns while a lazily-declared font is still baking; the contract
+/// requires that case to render exactly what `drawText` would, and it
+/// does. A non-null handle this backend cannot resolve degrades the
+/// same way (see `fontFaceForHandle`).
+pub fn drawTextWithFont(
+    text: [:0]const u8,
+    x: f32,
+    y: f32,
+    size: f32,
+    tint: Color,
+    font: ?FontHandle,
+) void {
+    const handle = font orelse {
+        drawText(text, x, y, size, tint);
+        return;
+    };
+    drawTextMaybeFace(fontFaceForHandle(handle), text, x, y, size, tint);
+}
+
 /// Does this face resolve to the built-in 8x8 fallback?
 ///
 /// True for a null face — which is what a null font id resolves to —
@@ -948,8 +1003,8 @@ pub fn usesBuiltinFace(face: ?FontFace) bool {
 /// no font (or whose font failed to bake) renders exactly what it did
 /// before this file grew a TTF path.
 ///
-/// Internal until core publishes the public decl (see the NOTE above);
-/// this is the function that decl will forward to.
+/// Module-internal: this is what `drawTextWithFont` forwards to once
+/// it has resolved (or failed to resolve) its handle.
 pub fn drawTextMaybeFace(face: ?FontFace, text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void {
     if (usesBuiltinFace(face)) {
         drawText(text, x, y, size, tint);
