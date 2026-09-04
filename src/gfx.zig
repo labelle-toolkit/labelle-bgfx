@@ -393,6 +393,31 @@ pub const VideoBackend = if (is_wasm) struct {} else @import("video/backend.zig"
 
 pub const drawText = font.drawText;
 
+// ── Font atlas surface (labelle-gfx#258, labelle-engine#448) ───────────
+//
+// These are the decls the contract `@hasDecl`-probes: declaring
+// `FontAtlas` + `decodeFont` + `uploadFontAtlas` + `unloadFontAtlas` at
+// the backend ROOT is what opts this backend in to the font traits, and
+// what lets the assembler's generated `FontBackendAdapter` bake a
+// declared `.font` resource instead of returning
+// `error.FontBackendNotImplemented`.
+//
+// The font-aware DRAW decl is deliberately absent: its name and
+// signature are still being settled in labelle-core, and a guessed name
+// would fail the `@hasDecl` probe silently. The implementation is
+// already in `gfx/font.zig` (`drawTextMaybeFace`), so binding it is a
+// one-line addition here once core publishes the signature.
+pub const CodepointRange = font.CodepointRange;
+pub const Glyph = font.Glyph;
+pub const CodepointEntry = font.CodepointEntry;
+pub const KernPair = font.KernPair;
+pub const FontBakeParams = font.FontBakeParams;
+pub const DecodedFont = font.DecodedFont;
+pub const FontAtlas = font.FontAtlas;
+pub const decodeFont = font.decodeFont;
+pub const uploadFontAtlas = font.uploadFontAtlas;
+pub const unloadFontAtlas = font.unloadFontAtlas;
+
 // ── Utility functions (Backend contract) ──────────────────────────────
 
 pub const beginMode2D = state.beginMode2D;

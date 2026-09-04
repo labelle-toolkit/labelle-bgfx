@@ -42,9 +42,11 @@
 #endif
 #define _FORTIFY_SOURCE 0
 
-// The bgfx backend uses its own embedded 8x8 bitmap font (gfx/font.zig),
-// so unlike the sokol backend it does NOT pull in stb_truetype here —
-// only stb_image for PNG/JPG/BMP/TGA decode.
+// Both stb single-header libs go through this one shim so the whole gfx
+// module shares a single translate-c invocation (and therefore a single
+// set of translated C declarations): stb_image for PNG/JPG/BMP/TGA
+// decode, stb_truetype for the TTF/OTF font baker in `gfx/font.zig`.
 #include "stb_image.h"
+#include "stb_truetype.h"
 
 #endif // LABELLE_STB_SHIM_H

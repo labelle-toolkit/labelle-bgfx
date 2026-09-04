@@ -160,6 +160,12 @@ pub fn build(b: *std.Build) void {
     // STBI_NO_STDIO and includes stb_image.h. This is what gives the bgfx
     // backend PNG decoding at parity with the sokol/raylib backends.
     gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_image_impl.c"), .flags = &.{} });
+    // stb_truetype implementation TU — the TTF/OTF baker behind
+    // `gfx/font.zig`'s `decodeFont`. Same shape as stb_image above: a
+    // single-header C lib with its implementation macro in a dedicated
+    // `_impl.c`, while `stb_shim.h` pulls the declarations into the
+    // translate-c `@cImport`. Mirrors the sokol backend's wiring.
+    gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_truetype_impl.c"), .flags = &.{} });
 
     // Shared windowless-SDL desktop gamepad source (core#28). One copy lives
     // in `backends/sdl_gamepad/`; the raylib, sokol AND bgfx desktop backends
@@ -697,6 +703,49 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(astc_run).step);
 
+    // Run the font tests (TTF/OTF surface, labelle-gfx#258).
+    //
+    // These need their OWN artifact rather than riding on `gfx_run`
+    // below: Zig collects tests from the ROOT source file of a test
+    // module, so a `test` block written inside `src/gfx/font.zig` is
+    // invisible to a test rooted at `src/gfx.zig` — the same trap the
+    // sampler-filter test in gfx.zig documents (it lives there
+    // specifically to be collected). Hence `src/font_tests.zig`, which
+    // is the root of this artifact and holds the blocks themselves.
+    //
+    // It is rooted at `src/`, not at `src/gfx/`, on purpose: a module
+    // rooted at `src/gfx/font.zig` puts the module path at `src/gfx/`,
+    // and `gfx/programs.zig`'s `@import("../shaders.zig")` then reaches
+    // outside it and fails to compile.
+    //
+    // The module mirrors `gfx_mod`'s wiring because font.zig pulls in
+    // texture.zig (labelle-core + the stb translate-c `@cImport`) and
+    // programs.zig (zbgfx). Native-only, and linked against the bgfx
+    // artifact, for the same reason as `gfx_run`: the tests drive pure
+    // CPU code, but the module carries bgfx symbols that have to
+    // resolve at link time.
+    if (target.query.isNative()) {
+        const font_test_mod = b.createModule(.{
+            .root_source_file = b.path("src/font_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        font_test_mod.addImport("zbgfx", zbgfx_mod);
+        font_test_mod.addImport("labelle-core", core_mod);
+        font_test_mod.addIncludePath(b.path("src"));
+        font_test_mod.addCSourceFile(.{ .file = b.path("src/stb_image_impl.c"), .flags = &.{} });
+        font_test_mod.addCSourceFile(.{ .file = b.path("src/stb_truetype_impl.c"), .flags = &.{} });
+
+        const font_run = b.addTest(.{ .root_module = font_test_mod });
+        font_run.root_module.linkLibrary(bgfx_artifact);
+        if (target.result.os.tag == .windows) {
+            font_run.root_module.linkSystemLibrary("gdi32", .{});
+            font_run.root_module.linkSystemLibrary("user32", .{});
+        }
+        test_step.dependOn(&b.addRunArtifact(font_run).step);
+    }
+
     // Run the video colour-conversion + plane-prep tests on the host. Both
     // `video/yuv.zig` (CPU YUV→RGBA, BT.601) and `video/planes.zig` (row-tighten
     // + NV12 de-interleave for the GPU plane-upload path, perf/gpu-yuv-video) are
@@ -1065,6 +1114,10 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // Package (or overridden) emscripten sysroot for stb_image's `<stdlib.h>` etc.
     gfx_mod.addSystemIncludePath(emsdk_sysroot_lp);
     gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_image_impl.c"), .flags = &.{} });
+    // stb_truetype baker, same as the desktop/Android graph above — the
+    // wasm build needs it too, since `gfx/font.zig` is part of gfx_mod on
+    // every target.
+    gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_truetype_impl.c"), .flags = &.{} });
 
     // ── Input backend module ────────────────────────────────────────
     // No zglfw / no sdl_gamepad (both desktop-only) — src/input.zig comptime-gates

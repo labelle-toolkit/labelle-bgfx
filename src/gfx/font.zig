@@ -1,12 +1,41 @@
-/// Embedded 8x8 bitmap font atlas + the `drawText` primitive that
-/// samples it. Owns its own bgfx texture handle and lazy-init flag
-/// so `programs.shutdownPrograms` only has to call
-/// `destroyFontAtlas()` here on teardown.
+/// Two font faces live here.
+///
+///   1. The **built-in** embedded 8x8 bitmap face (printable ASCII
+///      32..126, one-row atlas) behind the contract's mandatory
+///      `drawText`. Unchanged, and still the fallback whenever no
+///      baked font is in play.
+///   2. The **TTF/OTF** face (labelle-gfx#258, labelle-engine#448):
+///      `decodeFont` bakes glyphs with stb_truetype on a worker
+///      thread, `uploadFontAtlas` turns the bake into a bgfx texture
+///      on the render thread, `unloadFontAtlas` releases it.
+///
+/// The decode/upload split mirrors the image path (`texture.zig`):
+/// `decodeFont` is pure CPU and touches NO bgfx state — bgfx's API is
+/// not safe to call from the asset worker thread, and stb_truetype
+/// only writes into its own pack context plus the allocator-owned
+/// bitmap, so the bake is free to run off-thread. Everything that
+/// creates or destroys a bgfx handle stays in `uploadFontAtlas` /
+/// `unloadFontAtlas`, called from the render thread.
+///
+/// The value types are `extern struct` so the assembler's
+/// `writeFontBackendWiring` field-by-field copy into
+/// `engine.DecodedFont` lands on a stable memory layout. Their shape
+/// is identical to `labelle-core`'s `backend_contract.zig`
+/// definitions; declaring them as top-level `pub` in `gfx.zig` is
+/// what opts this backend in to the font traits (the contract
+/// `@hasDecl`-guards every one of them).
 const std = @import("std");
 const bgfx = @import("zbgfx").bgfx;
 const types = @import("types.zig");
 const state = @import("state.zig");
 const programs = @import("programs.zig");
+const texture = @import("texture.zig");
+
+// stb_truetype rides the same shimmed `@cImport` as stb_image (see
+// `src/stb_shim.h`) — a single translate-c invocation keeps the two
+// header sets sharing one translated set of C declarations, so the
+// `stbtt_*` symbols are reachable through `texture.stbi`.
+const stbtt = texture.stbi;
 
 const Color = types.Color;
 const PosTexColorVertex = programs.PosTexColorVertex;
@@ -15,19 +44,19 @@ const PosTexColorVertex = programs.PosTexColorVertex;
 
 /// Embedded 8x8 bitmap font covering printable ASCII (32..126).
 /// Each character is 8 rows of 8 bits (1 byte per row, MSB = leftmost pixel).
-const FONT_CHAR_W = 8;
-const FONT_CHAR_H = 8;
-const FONT_FIRST_CHAR = 32; // space
-const FONT_LAST_CHAR = 126; // tilde
-const FONT_NUM_CHARS = FONT_LAST_CHAR - FONT_FIRST_CHAR + 1;
+pub const FONT_CHAR_W = 8;
+pub const FONT_CHAR_H = 8;
+pub const FONT_FIRST_CHAR = 32; // space
+pub const FONT_LAST_CHAR = 126; // tilde
+pub const FONT_NUM_CHARS = FONT_LAST_CHAR - FONT_FIRST_CHAR + 1;
 
 /// Font atlas texture (created lazily on first drawText call).
 var font_texture: bgfx.TextureHandle = .{ .idx = std.math.maxInt(u16) };
 var font_atlas_initialized: bool = false;
 
 /// Atlas dimensions: characters laid out in a single row.
-const FONT_ATLAS_W = FONT_CHAR_W * FONT_NUM_CHARS;
-const FONT_ATLAS_H = FONT_CHAR_H;
+pub const FONT_ATLAS_W = FONT_CHAR_W * FONT_NUM_CHARS;
+pub const FONT_ATLAS_H = FONT_CHAR_H;
 
 /// 8x8 bitmap font data. Each entry is 8 bytes (rows top-to-bottom).
 const font_data: [FONT_NUM_CHARS][8]u8 = generateFontData();
@@ -174,10 +203,11 @@ fn generateFontData() [FONT_NUM_CHARS][8]u8 {
     return data;
 }
 
-fn ensureFontAtlas() void {
-    if (font_atlas_initialized) return;
-
-    // Build RGBA8 atlas: all chars in a single row
+/// Expand the 1-bit-per-pixel `font_data` rows into the RGBA8 atlas
+/// bgfx uploads. Split out of `ensureFontAtlas` so the exact bytes of
+/// the built-in face can be asserted on the host with no GPU in the
+/// picture — the TTF work below must not perturb a single one of them.
+pub fn buildBuiltinAtlasPixels() [FONT_ATLAS_W * FONT_ATLAS_H * 4]u8 {
     var pixels: [FONT_ATLAS_W * FONT_ATLAS_H * 4]u8 = [_]u8{0} ** (FONT_ATLAS_W * FONT_ATLAS_H * 4);
 
     for (0..FONT_NUM_CHARS) |ch| {
@@ -197,6 +227,15 @@ fn ensureFontAtlas() void {
             }
         }
     }
+
+    return pixels;
+}
+
+fn ensureFontAtlas() void {
+    if (font_atlas_initialized) return;
+
+    // Build RGBA8 atlas: all chars in a single row
+    var pixels = buildBuiltinAtlasPixels();
 
     const mem = bgfx.copy(&pixels, @intCast(pixels.len));
     font_texture = bgfx.createTexture2D(
@@ -276,4 +315,645 @@ pub fn drawText(text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void
 
         cursor_x += char_w;
     }
+}
+
+// ── TTF/OTF font surface (labelle-gfx#258, labelle-engine#448) ─────────
+//
+// Everything below is the baked-font path. It sits alongside the
+// built-in 8x8 face above and never disturbs it: `drawText` keeps its
+// exact behaviour, and a caller with no baked font (or an invalid one)
+// still gets the embedded face, byte for byte.
+
+/// Codepoint range to bake glyphs for, half-open `[first, last)`.
+pub const CodepointRange = extern struct {
+    first: u32,
+    last: u32,
+};
+
+/// One baked glyph. The UV rect is in *pixels* of the atlas (not
+/// normalised) — the renderer divides by the atlas size once, at draw
+/// time. `xoff`/`yoff` already incorporate the glyph's bearing.
+pub const Glyph = extern struct {
+    u0: u16,
+    v0: u16,
+    u1: u16,
+    v1: u16,
+    xoff: f32,
+    yoff: f32,
+    advance: f32,
+};
+
+/// Sorted (by codepoint) lookup from Unicode codepoint to dense glyph
+/// index. `glyphIndexFor` binary-searches this.
+pub const CodepointEntry = extern struct {
+    codepoint: u32,
+    glyph_index: u32,
+};
+
+/// One kern pair, in pixels at the baked size.
+pub const KernPair = extern struct {
+    first: u32,
+    second: u32,
+    advance: f32,
+};
+
+/// Bake-time parameters. The same TTF baked at a different
+/// `pixel_height` / range set / atlas size is a DIFFERENT atlas, which
+/// is why these ride alongside the source bytes rather than being
+/// inferred from the file.
+pub const FontBakeParams = struct {
+    pixel_height: f32 = 16,
+    ranges: []const CodepointRange = &.{.{ .first = 0x20, .last = 0x7F }},
+    atlas_width: u32 = 512,
+    atlas_height: u32 = 512,
+};
+
+/// CPU-decoded font atlas. All four slices are allocator-owned — the
+/// caller frees them on BOTH the success and the discard path (same
+/// contract as `DecodedImage.pixels`).
+pub const DecodedFont = struct {
+    /// 8-bit alpha coverage atlas. Length == `width * height`.
+    bitmap: []u8,
+    width: u32,
+    height: u32,
+
+    /// Dense per-glyph metrics, indexed by `CodepointEntry.glyph_index`.
+    glyphs: []Glyph,
+
+    /// Codepoint → glyph_index lookup, sorted by codepoint.
+    codepoint_index: []const CodepointEntry,
+
+    /// Vertical metrics in pixels at the baked size.
+    ascent: f32,
+    descent: f32, // negative (below the baseline)
+    line_gap: f32,
+    line_height: f32, // ascent - descent + line_gap
+
+    kerning: []const KernPair,
+};
+
+/// GPU-side font atlas handle.
+///
+/// bgfx forces one difference from the sokol backend here: the sprite
+/// program this backend already owns samples an RGBA texture and
+/// multiplies by the vertex colour, so `uploadFontAtlas` expands the
+/// R8 coverage bitmap into RGBA8 (white RGB, alpha = coverage) rather
+/// than uploading a single-channel image and adding a second program.
+/// Tinting still lands exactly right — `rgb = tint.rgb`,
+/// `a = tint.a * coverage` — and the built-in 8x8 atlas has always been
+/// RGBA8 for the same reason, so this stays inside the backend's own
+/// conventions.
+///
+/// `width`/`height` live next to the handle because bgfx has no way to
+/// query a texture's dimensions back, and the draw path needs them to
+/// turn a glyph's pixel-space rect into UVs.
+///
+/// The vertical metrics ride along too: they come out of `decodeFont`
+/// and the draw path needs them to place a baseline, and this struct is
+/// the only thing the assembler's generated `FontBackendAdapter` keeps
+/// per font (it stores the whole value opaquely in its slot table and
+/// hands it straight back to `unloadFontAtlas`).
+pub const FontAtlas = extern struct {
+    texture: bgfx.TextureHandle,
+    width: u32,
+    height: u32,
+    ascent: f32,
+    descent: f32,
+    line_gap: f32,
+    line_height: f32,
+};
+
+/// Pure CPU bake — runs on the asset worker thread.
+///
+/// Touches NO bgfx state: bgfx's API is single-threaded (render-thread
+/// only) and calling into it from the asset worker is undefined
+/// behaviour, so every handle-creating call is deferred to
+/// `uploadFontAtlas`. stb_truetype only writes into its own pack
+/// context and the allocator-owned bitmap, which makes it safe here.
+///
+/// Design: `stbtt_PackBegin` + `stbtt_PackFontRange` (one call per
+/// `CodepointRange`) + `stbtt_PackEnd`, rather than
+/// `stbtt_BakeFontBitmap`, because the pack API:
+///   1. Honors multiple non-contiguous codepoint ranges (ASCII +
+///      Latin-1 supplement, say) without re-walking the font per range.
+///   2. Uses skyline packing — denser than BakeFontBitmap's
+///      left-to-right strip pack, which matters as soon as a project
+///      bakes more than a couple of ranges into one atlas.
+///   3. Supports oversampling via `stbtt_PackSetOversampling` (left at
+///      1x for now; a later revision can surface it through
+///      `FontBakeParams`).
+///
+/// All four output slices (`bitmap`, `glyphs`, `codepoint_index`,
+/// `kerning`) come from `allocator`, so the caller frees them through
+/// the same allocator on both the success and the discard path.
+pub fn decodeFont(
+    file_type: [:0]const u8,
+    data: []const u8,
+    params: *const FontBakeParams,
+    allocator: std.mem.Allocator,
+) !DecodedFont {
+    // stb_truetype handles .ttf and .otf transparently — the CFF (OTF)
+    // outline path has been upstream for years. We accept both and
+    // never dispatch on the extension.
+    _ = file_type;
+
+    if (data.len == 0) return error.FontDecodeFailed;
+    if (params.atlas_width == 0 or params.atlas_height == 0) return error.FontDecodeFailed;
+
+    // Vertical metrics and kerning come out of `stbtt_fontinfo`, not
+    // out of the packer, so initialise the font first. `font_index = 0`
+    // — TTC (font collection) support is not in scope.
+    var font_info: stbtt.stbtt_fontinfo = undefined;
+    const offset = stbtt.stbtt_GetFontOffsetForIndex(@ptrCast(data.ptr), 0);
+    if (offset < 0) return error.FontDecodeFailed;
+    if (stbtt.stbtt_InitFont(&font_info, @ptrCast(data.ptr), offset) == 0) {
+        return error.FontDecodeFailed;
+    }
+
+    const atlas_w: usize = params.atlas_width;
+    const atlas_h: usize = params.atlas_height;
+    // Guard the bitmap-size multiply against `usize` wraparound on
+    // 32-bit targets (wasm32 included): a wrap would allocate an
+    // undersized buffer that the C packer happily writes past.
+    const bitmap_len = std.math.mul(usize, atlas_w, atlas_h) catch return error.FontAtlasTooLarge;
+    const bitmap = try allocator.alloc(u8, bitmap_len);
+    errdefer allocator.free(bitmap);
+    @memset(bitmap, 0);
+
+    var pack_ctx: stbtt.stbtt_pack_context = undefined;
+    if (stbtt.stbtt_PackBegin(
+        &pack_ctx,
+        bitmap.ptr,
+        @intCast(atlas_w),
+        @intCast(atlas_h),
+        0, // stride = 0 → tightly packed
+        1, // 1px padding, so bilinear taps can't bleed between glyphs
+        null,
+    ) == 0) {
+        return error.FontDecodeFailed;
+    }
+    defer stbtt.stbtt_PackEnd(&pack_ctx);
+
+    stbtt.stbtt_PackSetOversampling(&pack_ctx, 1, 1);
+
+    // An empty range slice means "default ASCII printable" per the
+    // contract's own default.
+    const effective_ranges: []const CodepointRange = if (params.ranges.len == 0)
+        &[_]CodepointRange{.{ .first = 0x20, .last = 0x7F }}
+    else
+        params.ranges;
+
+    // Count the glyphs across all ranges up-front so `glyphs` and
+    // `codepoint_index` can be dense, single allocations. Ranges are
+    // half-open [first, last).
+    var total_glyphs: usize = 0;
+    for (effective_ranges) |r| {
+        if (r.last <= r.first) continue;
+        total_glyphs += @intCast(r.last - r.first);
+    }
+    if (total_glyphs == 0) return error.FontDecodeFailed;
+
+    const packed_chars = try allocator.alloc(stbtt.stbtt_packedchar, total_glyphs);
+    defer allocator.free(packed_chars);
+
+    const glyphs = try allocator.alloc(Glyph, total_glyphs);
+    errdefer allocator.free(glyphs);
+
+    const codepoint_index = try allocator.alloc(CodepointEntry, total_glyphs);
+    errdefer allocator.free(codepoint_index);
+
+    var write_idx: usize = 0;
+    for (effective_ranges) |r| {
+        if (r.last <= r.first) continue;
+        const count: c_int = @intCast(r.last - r.first);
+        const ok = stbtt.stbtt_PackFontRange(
+            &pack_ctx,
+            @ptrCast(data.ptr),
+            0,
+            params.pixel_height,
+            @intCast(r.first),
+            count,
+            &packed_chars[write_idx],
+        );
+        if (ok == 0) {
+            // A partial pack failure almost always means "atlas too
+            // small". `bitmap`, `glyphs` and `codepoint_index` all
+            // carry `errdefer allocator.free(...)` at their allocation
+            // sites, so we let those fire — freeing here would be a
+            // double free.
+            return error.FontAtlasTooSmall;
+        }
+        write_idx += @intCast(count);
+    }
+
+    // Unpack `stbtt_packedchar` → our `Glyph`, building
+    // `codepoint_index` in lock-step. Ranges are emitted in the order
+    // the caller listed them; the index has to come out sorted by
+    // codepoint for the binary search in `glyphIndexFor`, so we assume
+    // caller-supplied ranges are already sorted and non-overlapping —
+    // which the contract's own defaults are, and re-sorting would be
+    // pure waste in the common case.
+    var idx: usize = 0;
+    for (effective_ranges) |r| {
+        if (r.last <= r.first) continue;
+        const count: u32 = r.last - r.first;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const pc = packed_chars[idx];
+            glyphs[idx] = .{
+                .u0 = pc.x0,
+                .v0 = pc.y0,
+                .u1 = pc.x1,
+                .v1 = pc.y1,
+                .xoff = pc.xoff,
+                .yoff = pc.yoff,
+                .advance = pc.xadvance,
+            };
+            codepoint_index[idx] = .{
+                .codepoint = r.first + i,
+                .glyph_index = @intCast(idx),
+            };
+            idx += 1;
+        }
+    }
+
+    // Vertical metrics: stbtt returns them in font design units, so
+    // scale them to pixels at the baked size. Note that
+    // `stbtt_ScaleForPixelHeight` normalises so that
+    // `ascent - descent == pixel_height` — the draw path relies on that
+    // to recover the baked size from the atlas alone.
+    var ascent_i: c_int = 0;
+    var descent_i: c_int = 0;
+    var line_gap_i: c_int = 0;
+    stbtt.stbtt_GetFontVMetrics(&font_info, &ascent_i, &descent_i, &line_gap_i);
+    const scale: f32 = stbtt.stbtt_ScaleForPixelHeight(&font_info, params.pixel_height);
+    const ascent: f32 = @as(f32, @floatFromInt(ascent_i)) * scale;
+    const descent: f32 = @as(f32, @floatFromInt(descent_i)) * scale;
+    const line_gap: f32 = @as(f32, @floatFromInt(line_gap_i)) * scale;
+    const line_height: f32 = ascent - descent + line_gap;
+
+    // Kerning: pull the whole table in one pass with
+    // `stbtt_GetKerningTable` — O(N + K) in the baked codepoint count N
+    // and the font's stored pair count K, rather than the N² calls a
+    // per-pair `stbtt_GetCodepointKernAdvance` loop would cost (~9K
+    // calls for plain ASCII, quadratic beyond it).
+    //
+    // The table stores GLYPH INDICES, not codepoints, so we build a
+    // glyph-index → codepoint map over the baked set and drop any pair
+    // that references a glyph outside it.
+    var kern_list = std.array_list.Aligned(KernPair, null).empty;
+    errdefer kern_list.deinit(allocator);
+
+    const pair_count_i = stbtt.stbtt_GetKerningTableLength(&font_info);
+    if (pair_count_i > 0) {
+        const pair_count: usize = @intCast(pair_count_i);
+
+        const GlyphMapEntry = struct { glyph: i32, codepoint: u32 };
+        const map = try allocator.alloc(GlyphMapEntry, codepoint_index.len);
+        defer allocator.free(map);
+        for (codepoint_index, 0..) |entry, mi| {
+            const gi = stbtt.stbtt_FindGlyphIndex(&font_info, @intCast(entry.codepoint));
+            map[mi] = .{ .glyph = gi, .codepoint = entry.codepoint };
+        }
+        std.mem.sort(GlyphMapEntry, map, {}, struct {
+            fn lessThan(_: void, a: GlyphMapEntry, b: GlyphMapEntry) bool {
+                return a.glyph < b.glyph;
+            }
+        }.lessThan);
+
+        const lookup = struct {
+            fn find(slice: []const GlyphMapEntry, glyph: i32) ?u32 {
+                var lo: usize = 0;
+                var hi: usize = slice.len;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (slice[mid].glyph < glyph) {
+                        lo = mid + 1;
+                    } else if (slice[mid].glyph > glyph) {
+                        hi = mid;
+                    } else {
+                        return slice[mid].codepoint;
+                    }
+                }
+                return null;
+            }
+        }.find;
+
+        const table = try allocator.alloc(stbtt.stbtt_kerningentry, pair_count);
+        defer allocator.free(table);
+        const written = stbtt.stbtt_GetKerningTable(&font_info, table.ptr, @intCast(pair_count));
+        const written_n: usize = if (written < 0) 0 else @intCast(written);
+        for (table[0..written_n]) |entry| {
+            if (entry.advance == 0) continue;
+            const first_cp = lookup(map, entry.glyph1) orelse continue;
+            const second_cp = lookup(map, entry.glyph2) orelse continue;
+            try kern_list.append(allocator, .{
+                .first = first_cp,
+                .second = second_cp,
+                .advance = @as(f32, @floatFromInt(entry.advance)) * scale,
+            });
+        }
+    }
+    const kerning = try kern_list.toOwnedSlice(allocator);
+
+    return .{
+        .bitmap = bitmap,
+        .width = params.atlas_width,
+        .height = params.atlas_height,
+        .glyphs = glyphs,
+        .codepoint_index = codepoint_index,
+        .ascent = ascent,
+        .descent = descent,
+        .line_gap = line_gap,
+        .line_height = line_height,
+        .kerning = kerning,
+    };
+}
+
+/// Expand an 8-bit coverage atlas into the RGBA8 layout the sprite
+/// program samples: white RGB, alpha = coverage. Pure, so the
+/// expansion can be asserted on the host without a device.
+///
+/// `dst.len` must be `src.len * 4`; callers size it from the same
+/// dimensions.
+pub fn expandCoverageToRgba(src: []const u8, dst: []u8) void {
+    std.debug.assert(dst.len == src.len * 4);
+    for (src, 0..) |coverage, i| {
+        dst[i * 4 + 0] = 255;
+        dst[i * 4 + 1] = 255;
+        dst[i * 4 + 2] = 255;
+        dst[i * 4 + 3] = coverage;
+    }
+}
+
+/// Render-thread GPU upload. Creates the bgfx texture backing a baked
+/// font. Does NOT free any slice in `decoded` — the caller owns them on
+/// both the success and the discard path, same contract as
+/// `uploadTexture` for `DecodedImage.pixels`.
+///
+/// The RGBA8 staging buffer comes from `bgfx.alloc` rather than a Zig
+/// allocator: bgfx takes ownership of a `Memory` block and frees it
+/// once the texture has been created, which is this backend's existing
+/// convention for handing pixels to the driver (see
+/// `texture.uploadTexture`, which uses the copying `bgfx.copy` because
+/// it already has the bytes in the right layout — here we have to
+/// build them, so we write straight into bgfx's block and skip a
+/// redundant copy).
+pub fn uploadFontAtlas(decoded: DecodedFont) !FontAtlas {
+    const w: u16 = std.math.cast(u16, decoded.width) orelse return error.FontUploadFailed;
+    const h: u16 = std.math.cast(u16, decoded.height) orelse return error.FontUploadFailed;
+    if (w == 0 or h == 0) return error.FontUploadFailed;
+
+    const expected = @as(usize, decoded.width) * @as(usize, decoded.height);
+    if (decoded.bitmap.len != expected) return error.FontUploadFailed;
+
+    const rgba_len = std.math.mul(usize, expected, 4) catch return error.FontUploadFailed;
+    const rgba_len_u32 = std.math.cast(u32, rgba_len) orelse return error.FontUploadFailed;
+
+    const mem = bgfx.alloc(rgba_len_u32);
+    if (mem == null) return error.FontUploadFailed;
+    expandCoverageToRgba(decoded.bitmap, mem.*.data[0..rgba_len]);
+
+    // Bilinear (the bgfx default sampler flags) — unlike the built-in
+    // 8x8 face, which forces point sampling because its glyphs are hard
+    // 1-bit stencils that must not blur. A TTF bake is antialiased
+    // coverage and wants the filtering.
+    const handle = bgfx.createTexture2D(w, h, false, 1, .RGBA8, 0, mem, 0);
+    if (handle.idx == std.math.maxInt(u16)) return error.FontUploadFailed;
+
+    return .{
+        .texture = handle,
+        .width = decoded.width,
+        .height = decoded.height,
+        .ascent = decoded.ascent,
+        .descent = decoded.descent,
+        .line_gap = decoded.line_gap,
+        .line_height = decoded.line_height,
+    };
+}
+
+/// Counterpart to `uploadFontAtlas`. Idempotent on an invalid handle so
+/// the catalog's discard path can call it unconditionally.
+pub fn unloadFontAtlas(atlas: FontAtlas) void {
+    if (atlas.texture.idx != std.math.maxInt(u16)) {
+        bgfx.destroyTexture(atlas.texture);
+    }
+}
+
+// ── Baked-font drawing ────────────────────────────────────────────────
+//
+// NOTE (pending public decl): the font-aware draw decl's exact name and
+// signature are being settled in labelle-core — an optional,
+// `@hasDecl`-guarded draw taking a nullable font id, modelled on
+// `drawTextureProMaterial` / `Gui.labelWidgetWithFont`. Until that
+// lands, the path below is INTERNAL to this file and is deliberately
+// NOT re-exported from `gfx.zig`: a guessed decl name would fail the
+// contract's `@hasDecl` check silently and look like it worked. Once
+// core publishes the signature, the export is a one-line addition in
+// `gfx.zig` over this same implementation.
+
+/// A baked face as the draw path needs it: the GPU atlas plus the
+/// borrowed metric slices from the `DecodedFont` it came from. The
+/// slices are borrowed, never owned — whoever holds the decoded font
+/// (today: the engine's asset catalog) keeps them alive.
+pub const FontFace = struct {
+    atlas: FontAtlas,
+    glyphs: []const Glyph,
+    codepoint_index: []const CodepointEntry,
+    kerning: []const KernPair = &.{},
+};
+
+/// Binary-search the sorted codepoint index. Returns null for a
+/// codepoint outside the baked ranges — the caller skips it (and
+/// advances by nothing), matching the built-in face's treatment of
+/// out-of-range bytes as far as it can.
+pub fn glyphIndexFor(index: []const CodepointEntry, codepoint: u32) ?u32 {
+    var lo: usize = 0;
+    var hi: usize = index.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (index[mid].codepoint < codepoint) {
+            lo = mid + 1;
+        } else if (index[mid].codepoint > codepoint) {
+            hi = mid;
+        } else {
+            return index[mid].glyph_index;
+        }
+    }
+    return null;
+}
+
+/// Kern advance between two codepoints, in baked pixels. Linear over
+/// the pair list, which is empty for most fonts and short for the rest.
+pub fn kernAdvance(pairs: []const KernPair, first: u32, second: u32) f32 {
+    for (pairs) |p| {
+        if (p.first == first and p.second == second) return p.advance;
+    }
+    return 0;
+}
+
+/// One positioned glyph quad, in post-transform screen pixels with UVs
+/// already normalised against the atlas.
+pub const GlyphQuad = struct {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    u0: f32,
+    v0: f32,
+    u1: f32,
+    v1: f32,
+};
+
+/// Lay `text` out against `face`, calling `emit` once per visible
+/// glyph. Pure: no bgfx, no allocation — which is what lets the layout
+/// be asserted on the host.
+///
+/// `x`/`y` are the pen's start in already-transformed screen pixels and
+/// `y` is the TOP of the line (the baseline sits `ascent` below it),
+/// matching `drawText`, where `y` is the top of the 8x8 cell.
+///
+/// `size` is the requested pixel height of the line. The scale factor
+/// recovers the baked size from `ascent - descent`, which
+/// `stbtt_ScaleForPixelHeight` guarantees equals the `pixel_height`
+/// the atlas was baked at.
+pub fn layoutText(
+    face: FontFace,
+    text: []const u8,
+    x: f32,
+    y: f32,
+    size: f32,
+    emit: *const fn (ctx: *anyopaque, quad: GlyphQuad) void,
+    ctx: *anyopaque,
+) void {
+    const baked_px = face.atlas.ascent - face.atlas.descent;
+    if (!(baked_px > 0)) return;
+    const scale = size / baked_px;
+
+    const atlas_w: f32 = @floatFromInt(face.atlas.width);
+    const atlas_h: f32 = @floatFromInt(face.atlas.height);
+    if (!(atlas_w > 0) or !(atlas_h > 0)) return;
+
+    var pen_x = x;
+    const baseline = y + face.atlas.ascent * scale;
+    var prev: ?u32 = null;
+
+    for (text) |byte| {
+        // ASCII-only for now: the byte IS the codepoint. Full UTF-8
+        // decoding lands with the public draw decl, since that is what
+        // decides whether the backend or the engine owns the decode.
+        const cp: u32 = byte;
+
+        if (prev) |p| pen_x += kernAdvance(face.kerning, p, cp) * scale;
+        prev = cp;
+
+        const gi = glyphIndexFor(face.codepoint_index, cp) orelse continue;
+        if (gi >= face.glyphs.len) continue;
+        const g = face.glyphs[gi];
+
+        // A zero-area rect is a blank glyph (space); it still advances.
+        if (g.u1 > g.u0 and g.v1 > g.v0) {
+            const gw: f32 = @floatFromInt(g.u1 - g.u0);
+            const gh: f32 = @floatFromInt(g.v1 - g.v0);
+            const qx0 = pen_x + g.xoff * scale;
+            const qy0 = baseline + g.yoff * scale;
+            emit(ctx, .{
+                .x0 = qx0,
+                .y0 = qy0,
+                .x1 = qx0 + gw * scale,
+                .y1 = qy0 + gh * scale,
+                .u0 = @as(f32, @floatFromInt(g.u0)) / atlas_w,
+                .v0 = @as(f32, @floatFromInt(g.v0)) / atlas_h,
+                .u1 = @as(f32, @floatFromInt(g.u1)) / atlas_w,
+                .v1 = @as(f32, @floatFromInt(g.v1)) / atlas_h,
+            });
+        }
+
+        pen_x += g.advance * scale;
+    }
+}
+
+/// Total advance width of `text` in `face` at `size`, in pixels.
+pub fn measureText(face: FontFace, text: []const u8, size: f32) f32 {
+    const baked_px = face.atlas.ascent - face.atlas.descent;
+    if (!(baked_px > 0)) return 0;
+    const scale = size / baked_px;
+
+    var width: f32 = 0;
+    var prev: ?u32 = null;
+    for (text) |byte| {
+        const cp: u32 = byte;
+        if (prev) |p| width += kernAdvance(face.kerning, p, cp) * scale;
+        prev = cp;
+        const gi = glyphIndexFor(face.codepoint_index, cp) orelse continue;
+        if (gi >= face.glyphs.len) continue;
+        width += face.glyphs[gi].advance * scale;
+    }
+    return width;
+}
+
+/// Submit `text` through the sprite pipeline using a baked face.
+/// Internal until core publishes the public decl (see the NOTE above).
+pub fn drawTextFace(face: FontFace, text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void {
+    if (face.atlas.texture.idx == std.math.maxInt(u16)) return;
+
+    const Submit = struct {
+        handle: bgfx.TextureHandle,
+        abgr: u32,
+
+        fn emit(ctx: *anyopaque, q: GlyphQuad) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const vertices = [6]PosTexColorVertex{
+                makeTexVertex(q.x0, q.y0, q.u0, q.v0, self.abgr),
+                makeTexVertex(q.x1, q.y0, q.u1, q.v0, self.abgr),
+                makeTexVertex(q.x1, q.y1, q.u1, q.v1, self.abgr),
+                makeTexVertex(q.x0, q.y0, q.u0, q.v0, self.abgr),
+                makeTexVertex(q.x1, q.y1, q.u1, q.v1, self.abgr),
+                makeTexVertex(q.x0, q.y1, q.u0, q.v1, self.abgr),
+            };
+            programs.submitTexturedTriangles(&vertices, self.handle);
+        }
+    };
+
+    var submit = Submit{ .handle = face.atlas.texture, .abgr = tint.toAbgr() };
+
+    // Same camera handling as the built-in `drawText`: world → screen
+    // through `state`, then the zoom folded into the glyph scale.
+    layoutText(
+        face,
+        text,
+        state.transformX(x),
+        state.transformY(y),
+        size * state.cameraZoom(),
+        &Submit.emit,
+        &submit,
+    );
+}
+
+/// Does this face resolve to the built-in 8x8 fallback?
+///
+/// True for a null face — which is what a null font id resolves to —
+/// and for a face whose atlas texture never made it onto the GPU,
+/// which is what an id pointing at a font that failed to bake or was
+/// already unloaded looks like. Split out as a pure predicate so the
+/// fallback decision is assertable without a device.
+pub fn usesBuiltinFace(face: ?FontFace) bool {
+    const f = face orelse return true;
+    return f.atlas.texture.idx == std.math.maxInt(u16);
+}
+
+/// Font-aware text draw with the built-in face as the fallback. A null
+/// or invalid `face` — which is what a null or stale font id resolves
+/// to — takes the `drawText` path unchanged, so a game that declared
+/// no font (or whose font failed to bake) renders exactly what it did
+/// before this file grew a TTF path.
+///
+/// Internal until core publishes the public decl (see the NOTE above);
+/// this is the function that decl will forward to.
+pub fn drawTextMaybeFace(face: ?FontFace, text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void {
+    if (usesBuiltinFace(face)) {
+        drawText(text, x, y, size, tint);
+        return;
+    }
+    drawTextFace(face.?, text, x, y, size, tint);
 }
