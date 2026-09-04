@@ -7,7 +7,9 @@
 /// up an `ALooper`, and calls our `android_main(app)` — from there we drive:
 ///
 ///   * the activity lifecycle (`APP_CMD_*`): create/destroy the bgfx
-///     surface on `INIT_WINDOW`/`TERM_WINDOW`, honor resume/pause, and
+///     surface on `INIT_WINDOW`/`TERM_WINDOW`, reconcile the backbuffer on
+///     the in-place geometry commands (`WINDOW_RESIZED`/`CONFIG_CHANGED`/
+///     `CONTENT_RECT_CHANGED`, labelle-bgfx#66), honor resume/pause, and
 ///     translate `app.destroyRequested` into `window.shouldQuit`.
 ///   * touch input (`AInputEvent`/`AMotionEvent_*`): fed into `input.zig`
 ///     as pointer-down + x/y so the engine sees touch as mouse-like
@@ -417,8 +419,14 @@ fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
                 const height = ANativeWindow_getHeight(w);
                 const ww: i32 = if (width > 0) width else default_width;
                 const wh: i32 = if (height > 0) height else default_height;
+                // Always the NEW window's size — never the dims cached before a
+                // TERM_WINDOW: a resume can come back in the other orientation,
+                // and the fit/projection are derived from `window.width()/
+                // height()` every frame, so trusting the old geometry here
+                // would stretch the first restored frames (#66).
                 window.initWindow(ww, wh, "labelle");
                 bgfx_ready = true;
+                std.log.info("bgfx: INIT_WINDOW surface {d}x{d}", .{ ww, wh });
 
                 // Cold init vs. surface restore (#386 Phase 4). The very
                 // first INIT_WINDOW runs the game's one-shot engine/scene
@@ -455,6 +463,25 @@ fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
             } else {
                 window.setAndroidNativeWindow(null);
             }
+        },
+        // In-place surface geometry changes (labelle-bgfx#66). A rotation under
+        // `sensorLandscape`, a resume that lands in the other orientation, or a
+        // multi-window/fold change can resize the ANativeWindow WITHOUT a
+        // TERM/INIT pair. Which of these three the framework delivers — and
+        // whether `WINDOW_RESIZED` comes at all — varies by OS version, so
+        // treat them uniformly: hand the window module the chance to
+        // re-read the live size and `bgfx.reset` through its ONE reconcile
+        // path (`ensureSurface`, the same one desktop resizes take). Often a
+        // no-op because `CONFIG_CHANGED` precedes the actual resize; the
+        // per-frame poll in `window.framebufferSize` is the safety net that
+        // makes the outcome independent of which command showed up. Only
+        // while bgfx is up — with no surface there is nothing to reconcile.
+        APP_CMD_WINDOW_RESIZED, APP_CMD_CONFIG_CHANGED, APP_CMD_CONTENT_RECT_CHANGED => {
+            if (bgfx_ready) window.reconcileSurface(switch (cmd) {
+                APP_CMD_WINDOW_RESIZED => "APP_CMD_WINDOW_RESIZED",
+                APP_CMD_CONFIG_CHANGED => "APP_CMD_CONFIG_CHANGED",
+                else => "APP_CMD_CONTENT_RECT_CHANGED",
+            });
         },
         APP_CMD_GAINED_FOCUS, APP_CMD_RESUME, APP_CMD_START => {
             is_resumed = true;
