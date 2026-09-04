@@ -50,12 +50,34 @@ pub fn frameSizes(native: u32, buf: *[max_frames]u32) []const u32 {
     return buf[0..n];
 }
 
-/// Box (area-average) downscale of tightly packed RGBA8. Each destination
-/// pixel averages the whole source footprint it covers — the footprint is
-/// `[floor(dx·sw/dw), floor((dx+1)·sw/dw))` and never empty — so a
-/// non-integer ratio blends rather than dropping rows, and an integer ratio
-/// is the exact block mean. Downscale ONLY: asserts `dw <= sw and dh <= sh`.
-/// Caller owns the returned `dw*dh*4` buffer.
+/// Round a non-negative channel value to the nearest `u8`, clamped.
+fn quantize(v: f64) u8 {
+    return @intFromFloat(@round(std.math.clamp(v, 0.0, 255.0)));
+}
+
+/// Area-average ("box") downscale of tightly packed RGBA8.
+///
+/// TRUE area average: each destination pixel covers the real-valued source
+/// footprint `[dx·sw/dw, (dx+1)·sw/dw)`, and every source pixel it touches is
+/// weighted by its FRACTIONAL overlap with that footprint. Flooring both
+/// boundaries instead — the obvious integer version — assigns each source
+/// pixel wholly to one destination, so a non-integer ratio like the supported
+/// 48→32 alternates one- and two-pixel kernels, shifting edges and aliasing
+/// detail. Integer ratios are unaffected: every weight is 1 and the result is
+/// the exact block mean.
+///
+/// PREMULTIPLIED alpha: RGB is accumulated weighted by its own alpha and then
+/// un-premultiplied, and alpha is averaged on its own. Averaging straight RGBA
+/// would fold the (invisible) colour of fully transparent pixels into the
+/// result — opaque red beside transparent white becomes translucent pink, a
+/// visible halo once the window system composites the icon. Where a
+/// destination pixel is FULLY transparent there is no colour to recover, so
+/// its RGB is the unweighted average of the source RGB: that keeps a stated
+/// colour (e.g. transparent white stays white) instead of collapsing to black,
+/// and is invisible either way.
+///
+/// Downscale ONLY: asserts `dw <= sw and dh <= sh`. Caller owns the returned
+/// `dw*dh*4` buffer.
 pub fn downscaleBox(
     allocator: std.mem.Allocator,
     src: []const u8,
@@ -73,27 +95,66 @@ pub fn downscaleBox(
     const out = try allocator.alloc(u8, out_len);
     errdefer allocator.free(out);
 
+    const x_step = @as(f64, @floatFromInt(sw)) / @as(f64, @floatFromInt(dw));
+    const y_step = @as(f64, @floatFromInt(sh)) / @as(f64, @floatFromInt(dh));
+
     var dy: u32 = 0;
     while (dy < dh) : (dy += 1) {
-        const y0: u32 = @intCast((@as(u64, dy) * sh) / dh);
-        const y1: u32 = @max(y0 + 1, @as(u32, @intCast((@as(u64, dy + 1) * sh) / dh)));
+        const y_lo = @as(f64, @floatFromInt(dy)) * y_step;
+        const y_hi = y_lo + y_step;
+        const y0: u32 = @intFromFloat(@floor(y_lo));
+        const y1: u32 = @min(sh, @as(u32, @intFromFloat(@ceil(y_hi))));
         var dx: u32 = 0;
         while (dx < dw) : (dx += 1) {
-            const x0: u32 = @intCast((@as(u64, dx) * sw) / dw);
-            const x1: u32 = @max(x0 + 1, @as(u32, @intCast((@as(u64, dx + 1) * sw) / dw)));
-            var acc = [4]u64{ 0, 0, 0, 0 };
+            const x_lo = @as(f64, @floatFromInt(dx)) * x_step;
+            const x_hi = x_lo + x_step;
+            const x0: u32 = @intFromFloat(@floor(x_lo));
+            const x1: u32 = @min(sw, @as(u32, @intFromFloat(@ceil(x_hi))));
+
+            // Premultiplied RGB (Σ v·a·w), plain RGB (Σ v·w, the all-transparent
+            // fallback), alpha (Σ a·w) and the weight total (Σ w).
+            var acc_pre = [3]f64{ 0, 0, 0 };
+            var acc_flat = [3]f64{ 0, 0, 0 };
+            var acc_a: f64 = 0;
+            var acc_w: f64 = 0;
+
             var sy = y0;
             while (sy < y1) : (sy += 1) {
+                const wy = @min(y_hi, @as(f64, @floatFromInt(sy + 1))) -
+                    @max(y_lo, @as(f64, @floatFromInt(sy)));
+                if (wy <= 0) continue;
                 var sx = x0;
                 while (sx < x1) : (sx += 1) {
+                    const wx = @min(x_hi, @as(f64, @floatFromInt(sx + 1))) -
+                        @max(x_lo, @as(f64, @floatFromInt(sx)));
+                    if (wx <= 0) continue;
+                    const w = wx * wy;
                     const i = (@as(usize, sy) * sw + sx) * 4;
-                    inline for (0..4) |c| acc[c] += src[i + c];
+                    const a = @as(f64, @floatFromInt(src[i + 3]));
+                    acc_w += w;
+                    acc_a += a * w;
+                    inline for (0..3) |c| {
+                        const v = @as(f64, @floatFromInt(src[i + c]));
+                        acc_pre[c] += v * a * w;
+                        acc_flat[c] += v * w;
+                    }
                 }
             }
-            const count: u64 = @as(u64, y1 - y0) * (x1 - x0);
+
             const o = (@as(usize, dy) * dw + dx) * 4;
-            // Round-to-nearest mean; `count >= 1` by construction.
-            inline for (0..4) |c| out[o + c] = @intCast((acc[c] + count / 2) / count);
+            // `acc_w` is > 0 for every destination pixel (the footprint is
+            // never empty), but guard rather than divide by zero on a
+            // degenerate rounding.
+            if (acc_w <= 0) {
+                @memset(out[o..][0..4], 0);
+                continue;
+            }
+            out[o + 3] = quantize(acc_a / acc_w);
+            if (acc_a > 0) {
+                inline for (0..3) |c| out[o + c] = quantize(acc_pre[c] / acc_a);
+            } else {
+                inline for (0..3) |c| out[o + c] = quantize(acc_flat[c] / acc_w);
+            }
         }
     }
     return out;
@@ -212,16 +273,117 @@ test "downscaleBox: averages, never point-samples" {
     try testing.expectEqualSlices(u8, &.{ 128, 128, 128, 255 }, out);
 }
 
-test "downscaleBox: non-integer ratio covers every source pixel once" {
-    // 3×1 → 2×1: footprints are [0,1) and [1,3) — the middle pixel is not
-    // dropped (as a stride sampler would), it is folded into the second cell.
+test "downscaleBox: a non-integer ratio weights fractional coverage" {
+    // 3×1 → 2×1, scale 1.5: the footprints are [0,1.5) and [1.5,3), so the
+    // MIDDLE pixel is split half-and-half between them.
+    //   dst0 = (0·1 + 90·0.5) / 1.5 = 30
+    //   dst1 = (90·0.5 + 30·1) / 1.5 = 50
+    // The integer-footprint filter this replaces flooded both boundaries —
+    // footprints [0,1) and [1,3) — and produced 0 and 60, shifting the edge.
     const src = [_]u8{
         0, 0, 0, 255, 90, 90, 90, 255, 30, 30, 30, 255,
     };
     const out = try downscaleBox(testing.allocator, &src, 3, 1, 2, 1);
     defer testing.allocator.free(out);
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, out[0..4]);
-    try testing.expectEqualSlices(u8, &.{ 60, 60, 60, 255 }, out[4..8]);
+    try testing.expectEqualSlices(u8, &.{ 30, 30, 30, 255 }, out[0..4]);
+    try testing.expectEqualSlices(u8, &.{ 50, 50, 50, 255 }, out[4..8]);
+}
+
+test "downscaleBox: 48→32 keeps a symmetric edge (the supported non-integer case)" {
+    // The ratio the icon path actually hits. A vertical black|white edge down
+    // the middle of a 48-wide image must stay centred and symmetric after the
+    // 1.5× reduction: with fractional weights the two straddling columns get
+    // mirrored blends; with floored footprints they did not.
+    const w: u32 = 48;
+    const px = try testing.allocator.alloc(u8, w * 4 * 4);
+    defer testing.allocator.free(px);
+    for (0..4) |y| for (0..w) |x| {
+        const v: u8 = if (x < w / 2) 0 else 255;
+        @memcpy(px[(y * w + x) * 4 ..][0..4], &[_]u8{ v, v, v, 255 });
+    };
+    const out = try downscaleBox(testing.allocator, px, w, 4, 32, 4);
+    defer testing.allocator.free(out);
+    // Mirror symmetry across the centre: out[i] + out[31 - i] == 255.
+    for (0..32) |i| {
+        const l = out[i * 4];
+        const r = out[(31 - i) * 4];
+        try testing.expectEqual(@as(u16, 255), @as(u16, l) + @as(u16, r));
+    }
+    // …and the edge is still an edge: fully black left, fully white right.
+    try testing.expectEqual(@as(u8, 0), out[0]);
+    try testing.expectEqual(@as(u8, 255), out[31 * 4]);
+}
+
+test "downscaleBox: premultiplied alpha — a transparent neighbour cannot tint the colour" {
+    // One opaque red pixel and three FULLY TRANSPARENT black ones collapse to
+    // a quarter-opacity RED. Straight RGBA averaging returns (64, 0, 0, 64) —
+    // a dark halo — because it folds the invisible black into the colour.
+    const src = [_]u8{
+        255, 0, 0, 255, 0, 0, 0, 0,
+        0,   0, 0, 0,   0, 0, 0, 0,
+    };
+    const out = try downscaleBox(testing.allocator, &src, 2, 2, 1, 1);
+    defer testing.allocator.free(out);
+    try testing.expectEqual(@as(u8, 255), out[0]); // red survives at full strength
+    try testing.expectEqual(@as(u8, 0), out[1]);
+    try testing.expectEqual(@as(u8, 0), out[2]);
+    try testing.expectEqual(@as(u8, 64), out[3]); // 255/4, rounded
+}
+
+test "buildFrames: an antialiased transparent border does not halo the icon" {
+    // The real-world shape of the premultiply bug: a 32×32 icon whose art is
+    // opaque red inside a 4px FULLY TRANSPARENT border — the way every icon
+    // exported with padding looks. Reduced to 16×16, the ring of pixels that
+    // straddles the art edge blends art with border. Under straight RGBA
+    // averaging those pixels take on the border's (invisible) black and the
+    // icon gains a dark fringe; premultiplied, their hue stays pure red and
+    // only their alpha drops.
+    const edge: u32 = 32;
+    // An ODD border, so the art boundary falls INSIDE a 2×2 reduction block
+    // and the boundary ring really is a blend (an even border would align the
+    // edge to the block grid and never mix the two).
+    const border: u32 = 3;
+    const px = try testing.allocator.alloc(u8, edge * edge * 4);
+    defer testing.allocator.free(px);
+    for (0..edge) |y| for (0..edge) |x| {
+        const inside = x >= border and x < edge - border and y >= border and y < edge - border;
+        const c: [4]u8 = if (inside) .{ 255, 0, 0, 255 } else .{ 0, 0, 0, 0 };
+        @memcpy(px[(y * edge + x) * 4 ..][0..4], &c);
+    };
+
+    var set = try buildFrames(testing.allocator, px, edge, edge);
+    defer set.deinit();
+    const small = set.slice()[1].pixels; // the 16×16 frame
+    try testing.expectEqual(@as(u32, 16), set.slice()[1].size);
+
+    // Every pixel with ANY opacity is pure red — no channel bleed at all.
+    var saw_partial = false;
+    for (0..16 * 16) |i| {
+        const p = small[i * 4 ..][0..4];
+        if (p[3] == 0) continue;
+        try testing.expectEqual(@as(u8, 255), p[0]);
+        try testing.expectEqual(@as(u8, 0), p[1]);
+        try testing.expectEqual(@as(u8, 0), p[2]);
+        if (p[3] != 255) saw_partial = true;
+    }
+    // The reduction really does straddle the edge (2px border at 16 → the
+    // boundary ring is partially covered), so the test is exercising the
+    // blend it claims to.
+    try testing.expect(saw_partial);
+}
+
+test "downscaleBox: a fully transparent block keeps its stated colour, not black" {
+    // No alpha anywhere means no colour to recover, so RGB falls back to the
+    // plain average — transparent white stays white rather than collapsing to
+    // black. Invisible either way, but it keeps `buildFrames` round-tripping
+    // an all-transparent region unchanged.
+    const src = [_]u8{
+        255, 255, 255, 0, 255, 255, 255, 0,
+        255, 255, 255, 0, 255, 255, 255, 0,
+    };
+    const out = try downscaleBox(testing.allocator, &src, 2, 2, 1, 1);
+    defer testing.allocator.free(out);
+    try testing.expectEqualSlices(u8, &.{ 255, 255, 255, 0 }, out);
 }
 
 test "downscaleBox: rejects upscales, zero sizes and short buffers" {
