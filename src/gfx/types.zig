@@ -16,6 +16,23 @@ const core = @import("labelle-core");
 /// calling anything here.
 pub const Texture = struct { id: core.BackendTextureId, width: i32, height: i32 };
 
+/// How the GPU samples a game texture between texels (labelle-bgfx#77).
+///
+/// `.linear` is bgfx's own default (bilinear) and is what every game texture
+/// got before this enum existed — it stays the default here so no existing
+/// game changes appearance. `.point` (nearest) is what pixel art wants: at
+/// 2x zoom a bilinear filter blends in the atlas neighbours of a tightly
+/// packed 16px tile, drawing a seam grid across the whole map.
+///
+/// The font atlas has always been point-sampled (`gfx/font.zig`); this makes
+/// the same choice reachable for game textures.
+pub const TextureFilter = enum {
+    /// bgfx default sampling (bilinear). Emits no filter bits.
+    linear,
+    /// Nearest-neighbour min+mag sampling — crisp pixel art, no atlas bleed.
+    point,
+};
+
 pub const Color = struct {
     r: u8,
     g: u8,

@@ -28,10 +28,54 @@ pub const stbi = @cImport({
 });
 
 const Texture = types.Texture;
+pub const TextureFilter = types.TextureFilter;
 const Color = types.Color;
 const Rectangle = types.Rectangle;
 const Vector2 = types.Vector2;
 const PosTexColorVertex = programs.PosTexColorVertex;
+
+// ── Sampler filtering (labelle-bgfx#77) ──────────────────────────
+// Every game texture used to be created with the clamp flags and nothing
+// else, which leaves bgfx on its default BILINEAR filter. For pixel art that
+// is wrong: a 16px tile drawn at 2x from a tightly packed atlas blends its
+// atlas neighbours along all four edges. The flags to fix it were already in
+// this backend (`gfx/font.zig` point-samples the font atlas) — games just had
+// no way to ask for them.
+//
+// The knob is additive and DEFAULT-PRESERVING: `default_texture_filter` starts
+// at `.linear`, so an unchanged caller produces byte-identical sampler flags to
+// the pre-#77 code.
+
+/// Filter applied to textures created without an explicit choice — i.e. every
+/// existing caller of `uploadTexture` / `loadTexture` / `uploadCompressed`.
+/// The engine drives this (once labelle-core carries the filter field) around
+/// a load so per-atlas point sampling reaches even the paths whose signatures
+/// take no filter, such as the ASTC upload.
+var default_texture_filter: TextureFilter = .linear;
+
+/// Set the filter used by subsequent unqualified texture creations.
+/// Main/GL-thread only, like every other upload entry point here.
+pub fn setTextureFilter(filter: TextureFilter) void {
+    default_texture_filter = filter;
+}
+
+/// The filter unqualified uploads currently use. `.linear` unless set.
+pub fn textureFilter() TextureFilter {
+    return default_texture_filter;
+}
+
+/// bgfx creation flags for `filter`, on top of the U/V clamp flags every game
+/// texture has always carried. `.linear` adds no bits — bgfx's default is
+/// bilinear — so this reproduces the pre-#77 flag word exactly.
+pub fn samplerFlags(filter: TextureFilter) u64 {
+    const clamp: u64 = bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp;
+    return switch (filter) {
+        .linear => clamp,
+        // Min+mag point, matching `font.zig`'s long-standing font-atlas flags.
+        // No mip bit: these textures are created with `num_mips = 1`.
+        .point => clamp | bgfx.SamplerFlags_MinPoint | bgfx.SamplerFlags_MagPoint,
+    };
+}
 
 // ── Texture handle storage ────────────────────────────────────────────
 
@@ -191,7 +235,18 @@ pub fn decodeImage(
 /// command queue via `bgfx.copy`, so we do NOT free `decoded.pixels` —
 /// the caller owns it and frees it on both the success and the discard
 /// paths. The backend retains its own copy via bgfx.copy's memcpy.
+///
+/// Samples with the module-level `default_texture_filter` (`.linear` unless
+/// the engine set it). `uploadTextureFiltered` takes the choice per call.
 pub fn uploadTexture(decoded: DecodedImage) !Texture {
+    return uploadTextureFiltered(decoded, default_texture_filter);
+}
+
+/// `uploadTexture` with an explicit sampler filter (labelle-bgfx#77) — the
+/// seam a per-atlas / per-sprite `filter` field drives once labelle-core's
+/// `backend_contract` carries one. Identical to `uploadTexture` in every
+/// other respect, including the pixel-buffer ownership rules above.
+pub fn uploadTextureFiltered(decoded: DecodedImage, filter: TextureFilter) !Texture {
     if (decoded.width == 0 or decoded.height == 0) return error.LoadFailed;
     const id = findFreeTextureSlot() orelse return error.LoadFailed;
 
@@ -205,7 +260,7 @@ pub fn uploadTexture(decoded: DecodedImage) !Texture {
         false,
         1,
         .RGBA8,
-        bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp,
+        samplerFlags(filter),
         mem,
         0,
     );
@@ -348,7 +403,11 @@ pub fn uploadCompressed(data: []const u8) !Texture {
         false,
         1,
         info.fmt,
-        bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp,
+        // Same filter policy as the decoded path: `.linear` (bgfx's default)
+        // unless the engine set `default_texture_filter`. An ASTC atlas is
+        // still an atlas, and this signature is fixed by core's contract, so
+        // the module-level default is the only knob it can honour.
+        samplerFlags(default_texture_filter),
         mem,
         0,
     );
