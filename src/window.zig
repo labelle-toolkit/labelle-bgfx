@@ -135,12 +135,13 @@ var surface_valid: bool = true;
 /// design resolution onto the physical framebuffer, so the GPU renders at full
 /// Retina sharpness and screen-space NDC stays correct.
 ///
-/// On Android `screen_w/h` are the `ANativeWindow` surface size handed over at
-/// `INIT_WINDOW` — already physical — which can differ from the project's
-/// configured default (e.g. a 2000x1200 tablet surface vs. an 800x600 config).
-/// The generated Android entry reads `height()` post-init so the
-/// engine's coordinate mapping matches the actual surface rather than the
-/// config.
+/// On Android `screen_w/h` are seeded from the `ANativeWindow` surface size
+/// handed over at `INIT_WINDOW` — already physical — which can differ from the
+/// project's configured default (e.g. a 2000x1200 tablet surface vs. an 800x600
+/// config), and reconciled every frame against the LIVE window size exactly
+/// like desktop (see `androidSurfaceSize`). The generated Android entry feeds
+/// `width()`/`height()` to `setScreenSize` each frame so the engine's
+/// coordinate mapping tracks the actual surface rather than the config.
 // Return the LIVE framebuffer size, not the cached `screen_w/h`. The
 // generated frame loop calls `setScreenSize(width(), ...)` at the
 // top of the frame, before `beginFrame`'s `ensureSurface()` reconciles
@@ -148,7 +149,8 @@ var surface_valid: bool = true;
 // physical size on the frame a resize/DPI/fullscreen change lands, while
 // the bgfx viewport already matched the new framebuffer (one-frame
 // aspect-fit mismatch). Querying live keeps gfx and the surface in step.
-// On Android `framebufferSize()` returns the cached native-surface dims.
+// On Android `framebufferSize()` queries the live `ANativeWindow` size
+// (labelle-bgfx#66), falling back to the cache only before/after a surface.
 pub fn width() i32 {
     return framebufferSize()[0];
 }
@@ -158,11 +160,11 @@ pub fn height() i32 {
 
 /// The physical framebuffer size of the render surface.
 ///
-/// On Android there's no GLFW; `screen_w/h` already hold the native
-/// `ANativeWindow` surface dims (physical), so return those. On desktop query
-/// GLFW's framebuffer size — on a Retina/HiDPI display this is larger than the
-/// logical window size (e.g. 2x), and it's the size the GPU swapchain must
-/// match for crisp rendering.
+/// On Android there's no GLFW; query the live `ANativeWindow` size (physical)
+/// — see `androidSurfaceSize` for why this must be live rather than the cached
+/// `screen_w/h`. On desktop query GLFW's framebuffer size — on a Retina/HiDPI
+/// display this is larger than the logical window size (e.g. 2x), and it's the
+/// size the GPU swapchain must match for crisp rendering.
 fn framebufferSize() [2]i32 {
     if (is_wasm) {
         // Query the live drawing-buffer size of the emscripten canvas so a CSS
@@ -176,7 +178,7 @@ fn framebufferSize() [2]i32 {
         }
         return .{ screen_w, screen_h };
     }
-    if (is_android) return .{ screen_w, screen_h };
+    if (is_android) return androidSurfaceSize();
     if (glfw_window) |win| {
         const fb = win.getFramebufferSize();
         return .{ @intCast(fb[0]), @intCast(fb[1]) };
@@ -192,6 +194,52 @@ const em = struct {
     extern "c" fn emscripten_get_canvas_element_size(target: [*:0]const u8, width: *c_int, height: *c_int) c_int;
 };
 
+/// NDK `ANativeWindow` size queries (libandroid, which the Android build links
+/// for the NativeActivity shell already). Hand-declared like the shell's own
+/// externs rather than `@cImport`-ing `<android/native_window.h>`; only
+/// referenced from the `is_android` arm of `framebufferSize`, so no other
+/// target ever names the symbols.
+const android_nw = struct {
+    extern fn ANativeWindow_getWidth(window: *anyopaque) i32;
+    extern fn ANativeWindow_getHeight(window: *anyopaque) i32;
+};
+
+/// The LIVE physical size of the Android surface (labelle-bgfx#66).
+///
+/// Android can resize the `ANativeWindow` in place — a rotation under
+/// `sensorLandscape`, a resume that comes back in the other orientation, a
+/// multi-window/foldable geometry change — WITHOUT a `TERM_WINDOW`/`INIT_WINDOW`
+/// pair, and the glue does not reliably deliver `APP_CMD_WINDOW_RESIZED` for
+/// it (NativeActivity fires `onConfigurationChanged`; `onNativeWindowResized`
+/// often never comes). Serving the size cached at `INIT_WINDOW` therefore left
+/// the bgfx backbuffer (and the design→physical fit fed from `width()`/
+/// `height()`) at the OLD geometry while the compositor scaled that buffer onto
+/// the new surface — the best-supported explanation of the "stretched after
+/// resume + 180° flip" symptom (on-device confirmation pending). Polling
+/// the window each frame is the same reconcile the desktop path does through
+/// `getFramebufferSize`, and it is exactly how sokol_app handles Android
+/// rotation (`_sapp_android_update_dimensions` on every frame; its
+/// `onNativeWindowResized`/`onConfigurationChanged` callbacks are stubs).
+///
+/// Falls back to the cached dims when there is no window (between `TERM_WINDOW`
+/// and the next `INIT_WINDOW`, or before the first surface) or when the query
+/// reports a non-positive size (a window mid-teardown), so `ensureSurface`'s
+/// `> 0` guard sees the cache rather than a 0 that would skip forever.
+fn androidSurfaceSize() [2]i32 {
+    const nwh = android_native_window orelse return .{ screen_w, screen_h };
+    const live = [2]i32{
+        android_nw.ANativeWindow_getWidth(nwh),
+        android_nw.ANativeWindow_getHeight(nwh),
+    };
+    return liveOrCached(live, .{ screen_w, screen_h });
+}
+
+/// Pure half of `androidSurfaceSize`: a live query is authoritative only when
+/// both dimensions are positive; otherwise keep the cache.
+fn liveOrCached(live: [2]i32, cached: [2]i32) [2]i32 {
+    return if (live[0] > 0 and live[1] > 0) live else cached;
+}
+
 /// Reconcile the bgfx backbuffer with the current physical framebuffer size.
 ///
 /// Called once per frame from `beginFrame`. If the framebuffer changed since
@@ -206,13 +254,47 @@ fn ensureSurface() void {
     // surface is restored. No-op on every path that never loses its surface
     // (desktop/wasm), where `surface_valid` is permanently true.
     if (!surface_valid) return;
-    const fb = framebufferSize();
-    if (fb[0] > 0 and fb[1] > 0 and (fb[0] != screen_w or fb[1] != screen_h)) {
-        screen_w = fb[0];
-        screen_h = fb[1];
-        // `.Count` = keep the current backbuffer format (no change).
-        bgfx.reset(@intCast(screen_w), @intCast(screen_h), current_reset, .Count);
+    const target = surfaceResetTarget(framebufferSize(), .{ screen_w, screen_h }) orelse return;
+    // Android surface geometry changes are rare, lifecycle-driven events
+    // (rotation, resume in the other orientation), and the on-device
+    // diagnosis of #66 hinged on seeing them — log at info there. Desktop
+    // resizes fire per frame while a window edge is dragged, so stay quiet.
+    if (is_android) {
+        std.log.info("bgfx: surface {d}x{d} -> {d}x{d}, backbuffer reset", .{ screen_w, screen_h, target[0], target[1] });
     }
+    screen_w = target[0];
+    screen_h = target[1];
+    // `.Count` = keep the current backbuffer format (no change).
+    bgfx.reset(@intCast(screen_w), @intCast(screen_h), current_reset, .Count);
+}
+
+/// Pure decision half of `ensureSurface`: the size the backbuffer must be
+/// `bgfx.reset` to given the LIVE framebuffer size and the cached one, or
+/// `null` when nothing is to be done. A non-positive live size (minimized
+/// window / surface mid-teardown) is never a reset target, and an unchanged
+/// size is a no-op — which is why `surfaceLost` zeroes the cache: a surface
+/// that comes back at the SAME size must still trigger one reset.
+fn surfaceResetTarget(live: [2]i32, cached: [2]i32) ?[2]i32 {
+    if (live[0] <= 0 or live[1] <= 0) return null;
+    if (live[0] == cached[0] and live[1] == cached[1]) return null;
+    return live;
+}
+
+/// Android shell entry for the in-place geometry commands
+/// (`APP_CMD_WINDOW_RESIZED` / `APP_CMD_CONFIG_CHANGED` /
+/// `APP_CMD_CONTENT_RECT_CHANGED`, labelle-bgfx#66). Reconciles the backbuffer
+/// against the live `ANativeWindow` size RIGHT NOW, through the very same
+/// `ensureSurface` the per-frame `beginFrame` runs — so the fix has one code
+/// path, not two. This is a fast path plus a diagnostic marker (`reason` is
+/// logged), not the mechanism: `CONFIG_CHANGED` usually arrives BEFORE the
+/// window has actually been resized, so this call is frequently a no-op and the
+/// per-frame poll in `framebufferSize` is what catches the change a frame or two
+/// later. Harmless with no live surface (`ensureSurface` guards on
+/// `surface_valid`; with no window the size query falls back to the cache).
+pub fn reconcileSurface(reason: []const u8) void {
+    const live = framebufferSize();
+    std.log.info("bgfx: {s} — surface now {d}x{d} (was {d}x{d})", .{ reason, live[0], live[1], screen_w, screen_h });
+    ensureSurface();
 }
 
 /// The native `ANativeWindow*` surface handed over by the NativeActivity
@@ -272,7 +354,7 @@ fn initWindowWasm(w: i32, h: i32) void {
     // On emscripten `nwh` is a CSS selector C-string for the target canvas; bgfx
     // creates the WebGL context against it. `ndt`/`context`/`queue` are unused.
     init.platformData.ndt = null;
-    init.platformData.nwh = @constCast(@ptrCast(wasm_canvas_selector.ptr));
+    init.platformData.nwh = @ptrCast(@constCast(wasm_canvas_selector.ptr));
     init.platformData.context = null;
     init.platformData.queue = null;
     init.platformData.backBuffer = null;
@@ -1451,6 +1533,61 @@ test "captureFrameFor pins the delayed-screenshot frame by ceil (#59)" {
     try testing.expectEqual(never, captureFrameFor(std.math.nan(f32), dt60));
     try testing.expectEqual(never, captureFrameFor(1.0e30, 1.0e-6)); // 1e36 frames
     try testing.expectEqual(never, captureFrameFor(1.0, 0.0)); // dt fixedDt() can't return
+}
+
+test "surfaceResetTarget: only a positive, CHANGED live size resets the backbuffer (#66)" {
+    // The everyday no-ops: a stable surface, and a minimized/mid-teardown one.
+    try testing.expect(surfaceResetTarget(.{ 2000, 1200 }, .{ 2000, 1200 }) == null);
+    try testing.expect(surfaceResetTarget(.{ 0, 0 }, .{ 2000, 1200 }) == null);
+    try testing.expect(surfaceResetTarget(.{ 2000, 0 }, .{ 2000, 1200 }) == null);
+    try testing.expect(surfaceResetTarget(.{ -1, 1200 }, .{ 2000, 1200 }) == null);
+
+    // A resume that comes back in the other orientation (landscape → portrait
+    // window) is a reset to the NEW size — the #66 "stretched viewport" case,
+    // where the cache kept the old geometry and the compositor scaled it.
+    try testing.expectEqual([2]i32{ 1200, 2000 }, surfaceResetTarget(.{ 1200, 2000 }, .{ 2000, 1200 }).?);
+    // A 180° flip under sensorLandscape keeps WxH: nothing to reset — the
+    // compositor handles the transform, and a same-size reset is the one sokol
+    // warns produces display artefacts.
+    try testing.expect(surfaceResetTarget(.{ 2000, 1200 }, .{ 2000, 1200 }) == null);
+    // `surfaceLost` zeroes the cache precisely so a surface restored at the
+    // SAME size still binds once.
+    try testing.expectEqual([2]i32{ 2000, 1200 }, surfaceResetTarget(.{ 2000, 1200 }, .{ 0, 0 }).?);
+}
+
+test "liveOrCached: a live ANativeWindow size wins only when both dims are positive (#66)" {
+    const cached = [2]i32{ 2000, 1200 };
+    try testing.expectEqual([2]i32{ 1200, 2000 }, liveOrCached(.{ 1200, 2000 }, cached));
+    // A window mid-teardown can report 0 — keep the cache so `ensureSurface`
+    // isn't fed a 0 it would skip (and `width()`/`height()` never hand the
+    // engine a 0x0 design fit).
+    try testing.expectEqual(cached, liveOrCached(.{ 0, 0 }, cached));
+    try testing.expectEqual(cached, liveOrCached(.{ 2000, 0 }, cached));
+    try testing.expectEqual(cached, liveOrCached(.{ 0, 1200 }, cached));
+}
+
+test "reconcileSurface off-Android with no window is a pure no-op on the cache (#66)" {
+    // On the host there is no GLFW window and no ANativeWindow, so
+    // `framebufferSize()` returns the cache: the live == cached comparison makes
+    // this a no-op and, crucially, never reaches `bgfx.reset` (no context here).
+    // Also pins that a torn-down surface is respected by the fast path.
+    const saved_w = screen_w;
+    const saved_h = screen_h;
+    defer {
+        screen_w = saved_w;
+        screen_h = saved_h;
+        surface_valid = true;
+    }
+    screen_w = 2000;
+    screen_h = 1200;
+    surface_valid = true;
+    reconcileSurface("test");
+    try testing.expectEqual(@as(i32, 2000), screen_w);
+    try testing.expectEqual(@as(i32, 1200), screen_h);
+    surface_valid = false;
+    reconcileSurface("test (surface lost)");
+    try testing.expectEqual(@as(i32, 2000), screen_w);
+    try testing.expect(!surface_valid);
 }
 
 test "surfaceLost forgets the surface, surfaceRestored marks it live again" {

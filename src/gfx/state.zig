@@ -384,6 +384,79 @@ test "designViewportToPhysical scales a design viewport into the framebuffer (#5
     try t.expectEqual(@as(u16, 1200), r2[3]);
 }
 
+test "fit is re-derived from the new surface size on rotation, with no residue (labelle-bgfx#66)" {
+    // The Android surface can change geometry in place (rotation, a resume in
+    // the other orientation). The generated frame feeds `setScreenSize(width(),
+    // height())` every frame, so the fit MUST follow whatever size arrives —
+    // and the pre-rotation fit must leave nothing behind.
+    const t = std.testing;
+    setDesignSize(800, 600);
+
+    // Landscape tablet: wider than 4:3 → pillarbox (x shrinks, y fills).
+    setScreenSize(2000, 1200);
+    try t.expectApproxEqAbs(@as(f32, 0.8), fitScaleX(), 1e-5);
+    try t.expectApproxEqAbs(@as(f32, 1.0), fitScaleY(), 1e-5);
+    const land_tl = designToPhysical(.{ .x = 0, .y = 0 });
+    const land_br = designToPhysical(.{ .x = 800, .y = 600 });
+    try t.expectApproxEqAbs(@as(f32, 200), land_tl.x, 1e-2); // 200px bars each side
+    try t.expectApproxEqAbs(@as(f32, 0), land_tl.y, 1e-2);
+    try t.expectApproxEqAbs(@as(f32, 1800), land_br.x, 1e-2);
+    try t.expectApproxEqAbs(@as(f32, 1200), land_br.y, 1e-2);
+
+    // The same device rotated 90°: portrait → letterbox (x fills, y shrinks).
+    // Had the fit NOT been re-derived, the 0.8/1.0 landscape scale would map
+    // the canvas to a 1200x1500 rect on a 1200x2000 surface — the stretch.
+    setScreenSize(1200, 2000);
+    try t.expectApproxEqAbs(@as(f32, 1.0), fitScaleX(), 1e-5);
+    try t.expectApproxEqAbs(@as(f32, 0.45), fitScaleY(), 1e-5);
+    const port_tl = designToPhysical(.{ .x = 0, .y = 0 });
+    const port_br = designToPhysical(.{ .x = 800, .y = 600 });
+    try t.expectApproxEqAbs(@as(f32, 0), port_tl.x, 1e-2);
+    try t.expectApproxEqAbs(@as(f32, 550), port_tl.y, 1e-2); // 550px bars top/bottom
+    try t.expectApproxEqAbs(@as(f32, 1200), port_br.x, 1e-2);
+    try t.expectApproxEqAbs(@as(f32, 1450), port_br.y, 1e-2);
+    // Aspect is preserved in both orientations: the mapped canvas is 4:3.
+    try t.expectApproxEqAbs(@as(f32, 4.0 / 3.0), (port_br.x - port_tl.x) / (port_br.y - port_tl.y), 1e-4);
+    try t.expectApproxEqAbs(@as(f32, 4.0 / 3.0), (land_br.x - land_tl.x) / (land_br.y - land_tl.y), 1e-4);
+
+    // A 180° flip under sensorLandscape keeps WxH: re-feeding the same size is
+    // exactly idempotent (no drift from repeated per-frame calls).
+    setScreenSize(1200, 2000);
+    try t.expectApproxEqAbs(@as(f32, 1.0), fitScaleX(), 1e-5);
+    try t.expectApproxEqAbs(@as(f32, 0.45), fitScaleY(), 1e-5);
+
+    // Back to landscape: byte-identical to the first derivation — no residue
+    // from the portrait pass.
+    setScreenSize(2000, 1200);
+    try t.expectApproxEqAbs(@as(f32, 0.8), fitScaleX(), 1e-5);
+    try t.expectApproxEqAbs(@as(f32, 1.0), fitScaleY(), 1e-5);
+    const again = designToPhysical(.{ .x = 800, .y = 600 });
+    try t.expectApproxEqAbs(land_br.x, again.x, 1e-3);
+    try t.expectApproxEqAbs(land_br.y, again.y, 1e-3);
+}
+
+test "a stale physical size is the stretch: touch input round-trips only through the CURRENT fit (#66)" {
+    // Pin the failure shape the fix removes: the design→physical mapping
+    // derived for the landscape surface, applied to a touch on the portrait
+    // surface, lands far off — so feeding the fit anything but the live
+    // surface size is never acceptable, not merely imprecise.
+    const t = std.testing;
+    setDesignSize(800, 600);
+    setScreenSize(2000, 1200);
+    const stale = designToPhysical(.{ .x = 400, .y = 300 }); // canvas centre, landscape
+    try t.expectApproxEqAbs(@as(f32, 1000), stale.x, 1e-2);
+    try t.expectApproxEqAbs(@as(f32, 600), stale.y, 1e-2);
+    setScreenSize(1200, 2000);
+    const fresh = designToPhysical(.{ .x = 400, .y = 300 }); // canvas centre, portrait
+    try t.expectApproxEqAbs(@as(f32, 600), fresh.x, 1e-2);
+    try t.expectApproxEqAbs(@as(f32, 1000), fresh.y, 1e-2);
+    // The centre moved by (400, -400) physical px between fits: a touch mapped
+    // with the stale fit would miss by that much. And the live fit round-trips.
+    const back = screenToDesign(fresh.x, fresh.y);
+    try t.expectApproxEqAbs(@as(f32, 400), back.x, 1e-2);
+    try t.expectApproxEqAbs(@as(f32, 300), back.y, 1e-2);
+}
+
 test "screenToDesign and designToPhysical round-trip (incl. letterbox)" {
     const t = std.testing;
     setDesignSize(800, 600);
