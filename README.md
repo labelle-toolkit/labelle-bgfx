@@ -158,3 +158,30 @@ All four run surfaceless and are wired into the display-less CI job.
 views** (Dear ImGui's overlay submits on its own bgfx view): the other three
 render a small fixed scene and were green while a real game crashed two frames
 into gameplay.
+
+## Writing tests here: where a `test` block actually runs
+
+**A `test` block in a file that is only ever `@import`ed does not run.** Zig
+collects tests from the **root source file** of a test module, so a block
+written in, say, `src/gfx/texture.zig` or `src/gfx/font.zig` compiles, is
+reported by nothing, and passes forever — including when its assertion is
+false. This has already produced dead tests in this repo; `src/gfx.zig`'s
+sampler-filter test carries a comment explaining that it lives there, rather
+than in `gfx/texture.zig`, precisely to be collected.
+
+So, before writing a test, check `build.zig` for a `b.addTest` whose
+`root_source_file` **is the file you are writing in**. If there isn't one:
+
+- **Pure, dependency-free file?** Give it its own test artifact, the way
+  `src/gfx/state.zig`, `src/gfx/astc.zig`, `src/video/yuv.zig` and
+  `src/video/planes.zig` each have one.
+- **File that pulls the module graph (zbgfx, the stb `@cImport`, shaders)?**
+  Add a dedicated root file under `src/` that imports it and holds the blocks,
+  then wire that as the artifact — `src/font_tests.zig` is the worked example.
+  Note it is rooted at `src/`, not `src/gfx/`: a module rooted at
+  `src/gfx/<file>.zig` puts the module path at `src/gfx/`, and
+  `gfx/programs.zig`'s `@import("../shaders.zig")` then fails with *"import of
+  file outside module path"*.
+
+To confirm your tests are collected, put a deliberately failing block in the
+file and run `zig build test`. If it passes, your tests are dead.

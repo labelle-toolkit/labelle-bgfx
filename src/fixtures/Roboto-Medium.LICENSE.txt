@@ -1,0 +1,18 @@
+Roboto-Medium.ttf
+=================
+
+Font:      Roboto Medium, Version 2.001152 (2014)
+Copyright: Copyright 2011 Google Inc. All Rights Reserved.
+Licence:   Apache License, Version 2.0
+           http://www.apache.org/licenses/LICENSE-2.0
+
+The licence is recorded in the font's own `name` table (name IDs 13 and
+14), which is the authoritative statement for this file.
+
+Used ONLY as a test fixture: `src/gfx/font.zig` embeds it to bake a real
+TTF through `decodeFont` and assert the resulting glyph metrics and
+atlas dimensions. It is not shipped to, or loaded by, any game.
+
+The Apache 2.0 licence permits redistribution in source form, which is
+what vendoring the file here is. No NOTICE file accompanies the upstream
+release, so none is reproduced.

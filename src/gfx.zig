@@ -393,6 +393,38 @@ pub const VideoBackend = if (is_wasm) struct {} else @import("video/backend.zig"
 
 pub const drawText = font.drawText;
 
+// Optional font-aware text draw (labelle-core#75). This decl name is
+// exactly what `core.hasFontAwareText` — and the `Backend(Impl)`
+// wrapper's `@hasDecl(Impl, "drawTextWithFont")` — probes for; a
+// backend that omits it degrades to the plain `drawText` above. `null`
+// means "use the built-in font", which is what `Game.fontId` returns
+// while a lazily-declared font is still baking.
+//
+// `src/font_tests.zig` asserts this binds, because a misspelled or
+// mis-arity decl fails the probe SILENTLY and reads as success.
+pub const drawTextWithFont = font.drawTextWithFont;
+pub const FontHandle = font.FontHandle;
+
+// ── Font atlas surface (labelle-gfx#258, labelle-engine#448) ───────────
+//
+// These are the decls the contract `@hasDecl`-probes: declaring
+// `FontAtlas` + `decodeFont` + `uploadFontAtlas` + `unloadFontAtlas` at
+// the backend ROOT is what opts this backend in to the font traits, and
+// what lets the assembler's generated `FontBackendAdapter` bake a
+// declared `.font` resource instead of returning
+// `error.FontBackendNotImplemented`.
+//
+pub const CodepointRange = font.CodepointRange;
+pub const Glyph = font.Glyph;
+pub const CodepointEntry = font.CodepointEntry;
+pub const KernPair = font.KernPair;
+pub const FontBakeParams = font.FontBakeParams;
+pub const DecodedFont = font.DecodedFont;
+pub const FontAtlas = font.FontAtlas;
+pub const decodeFont = font.decodeFont;
+pub const uploadFontAtlas = font.uploadFontAtlas;
+pub const unloadFontAtlas = font.unloadFontAtlas;
+
 // ── Utility functions (Backend contract) ──────────────────────────────
 
 pub const beginMode2D = state.beginMode2D;
