@@ -272,7 +272,7 @@ fn initWindowWasm(w: i32, h: i32) void {
     // On emscripten `nwh` is a CSS selector C-string for the target canvas; bgfx
     // creates the WebGL context against it. `ndt`/`context`/`queue` are unused.
     init.platformData.ndt = null;
-    init.platformData.nwh = @constCast(@ptrCast(wasm_canvas_selector.ptr));
+    init.platformData.nwh = @ptrCast(@constCast(wasm_canvas_selector.ptr));
     init.platformData.context = null;
     init.platformData.queue = null;
     init.platformData.backBuffer = null;
@@ -1119,6 +1119,73 @@ pub fn setVsync(on: bool) void {
     }
 }
 
+// ── Window icon (labelle-cli#359) ────────────────────────────────────────
+//
+// The runtime half of the app-icon story: the assembler embeds the project's
+// `app_icon` (or its bundled default) into the generated `main.zig` and, after
+// `initWindow`, calls `setWindowIconPng` behind `@hasDecl(window, ...)` — so a
+// game generated against an older bgfx (no decl) still builds, and a backend
+// without GLFW pays nothing. Per target:
+//   - Windows / X11: `glfwSetWindowIcon` sets the title-bar + taskbar icon.
+//   - macOS: a NO-OP. GLFW documents that Cocoa ignores window icons — the
+//     Dock/Finder icon comes from the `.app` bundle (`labelle bundle`, cli#362).
+//   - Android / wasm: NO-OP — no GLFW; the launcher icon (APK mipmaps) and the
+//     page favicon are packaging concerns, not the window's.
+//   - Wayland: GLFW has no protocol for it and reports
+//     GLFW_FEATURE_UNAVAILABLE; harmless, and Linux maps to X11 here anyway
+//     (see platform.zig).
+// Frame preparation (size table + box downscale) lives in `window_icon.zig`,
+// pure Zig, so it is unit-tested on the host without a window or a GPU.
+
+const window_icon = @import("window_icon.zig");
+
+/// True where `glfwSetWindowIcon` actually does something: a GLFW desktop
+/// target other than macOS. Everything below folds to a no-op elsewhere.
+const window_icon_supported = !no_glfw and builtin.target.os.tag != .macos;
+
+/// Set the window icon from tightly packed RGBA8 pixels (`w*h*4` bytes).
+/// Emits the native frame plus 32×32 and 16×16 box-downscales (see
+/// `window_icon.frameSizes`) so the window system has a crisp small size for
+/// the taskbar instead of nearest-scaling one big image. GLFW copies the
+/// pixel data, so nothing is retained here. A no-op — never an error — when
+/// there is no window yet (call it AFTER `initWindow`), on macOS, Android and
+/// wasm, and on malformed input (a wrong icon must not take the game down).
+pub fn setWindowIconRgba(w: u32, h: u32, pixels: []const u8) void {
+    if (comptime !window_icon_supported) return;
+    const win = glfw_window orelse return;
+    // Short-lived scratch: three small buffers freed on the way out. The page
+    // allocator keeps this independent of the game's allocator, which the
+    // backend never sees.
+    const allocator = std.heap.page_allocator;
+    var set = window_icon.buildFrames(allocator, pixels, w, h) catch |err| {
+        std.log.warn("bgfx: window icon ignored — {s} ({d}x{d}, {d} bytes)", .{ @errorName(err), w, h, pixels.len });
+        return;
+    };
+    defer set.deinit();
+    var images: [window_icon.max_frames]glfw.Image = undefined;
+    for (set.slice(), 0..) |f, i| {
+        images[i] = .{ .width = @intCast(f.size), .height = @intCast(f.size), .pixels = f.pixels.ptr };
+    }
+    glfw.setWindowIcon(win, images[0..set.count]);
+}
+
+/// Set the window icon from encoded image bytes (PNG — the `app_icon`
+/// contract — but anything the in-tree stb_image decodes works). Decodes to
+/// RGBA8 via the same `gfx.decodeImage` path sprites use, then hands off to
+/// `setWindowIconRgba`. Same no-op rules: no window, macOS, Android, wasm, or
+/// undecodable bytes all return quietly (the last with a warning).
+pub fn setWindowIconPng(png_bytes: []const u8) void {
+    if (comptime !window_icon_supported) return;
+    if (glfw_window == null) return;
+    const allocator = std.heap.page_allocator;
+    const img = gfx.decodeImage("", png_bytes, allocator) catch |err| {
+        std.log.warn("bgfx: window icon ignored — could not decode icon bytes ({s}, {d} bytes)", .{ @errorName(err), png_bytes.len });
+        return;
+    };
+    defer allocator.free(img.pixels);
+    setWindowIconRgba(img.width, img.height, img.pixels);
+}
+
 // ── GPU surface loss (labelle-core #53 window contract, epic #386 Phase 4) ──
 //
 // bgfx CAN lose its GPU surface at runtime, so this backend declares the paired
@@ -1476,4 +1543,46 @@ test "surfaceLost forgets the surface, surfaceRestored marks it live again" {
     try testing.expect(!surface_valid);
     surfaceRestored();
     try testing.expect(surface_valid);
+}
+
+test "window icon: setters are a quiet no-op with no window (every target)" {
+    // The generated main calls these right after `initWindow`; a headless test
+    // process has no window, so both must return without touching GLFW — and
+    // without failing on garbage bytes, since a bad icon must never take a
+    // game down. On macOS/Android/wasm the comptime gate folds them to nothing.
+    try testing.expect(glfw_window == null);
+    setWindowIconPng("not a png");
+    setWindowIconRgba(2, 2, &[_]u8{0} ** 16);
+    setWindowIconRgba(4, 4, &[_]u8{0} ** 4); // short buffer: rejected, not read past
+}
+
+test "window icon: the embedded PNG fixture decodes and yields 32 + 16 frames" {
+    // End-to-end minus the GLFW call: the same `gfx.decodeImage` (stb_image)
+    // path `setWindowIconPng` takes, then the frame build. The fixture is a
+    // 32×32 RGBA with solid quadrants (red / green / blue / transparent white),
+    // so the 16×16 box downscale must reproduce each quadrant colour exactly
+    // at its centre pixel — proving decode, size table and filter agree.
+    const fixture = @embedFile("fixtures/icon_quadrants_32.png");
+    const img = try gfx.decodeImage("", fixture, testing.allocator);
+    defer testing.allocator.free(img.pixels);
+    try testing.expectEqual(@as(u32, 32), img.width);
+    try testing.expectEqual(@as(u32, 32), img.height);
+
+    var set = try window_icon.buildFrames(testing.allocator, img.pixels, img.width, img.height);
+    defer set.deinit();
+    const frames = set.slice();
+    try testing.expectEqual(@as(usize, 2), frames.len);
+    try testing.expectEqual(@as(u32, 32), frames[0].size);
+    try testing.expectEqual(@as(u32, 16), frames[1].size);
+
+    const small = frames[1].pixels;
+    const at = struct {
+        fn px(p: []const u8, x: usize, y: usize) []const u8 {
+            return p[(y * 16 + x) * 4 ..][0..4];
+        }
+    };
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, at.px(small, 4, 4));
+    try testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, at.px(small, 12, 4));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, at.px(small, 4, 12));
+    try testing.expectEqualSlices(u8, &.{ 255, 255, 255, 0 }, at.px(small, 12, 12));
 }

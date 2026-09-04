@@ -642,6 +642,20 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run bgfx backend unit tests");
     test_step.dependOn(&b.addRunArtifact(platform_tests).step);
 
+    // ── Unit tests for the window-icon frame builder (labelle-cli#359) ──
+    // `src/window_icon.zig` is pure Zig (size table + box downscale, no
+    // zglfw/stb/bgfx), so it EXECUTES on the host like platform.zig. The
+    // GLFW call + stb decode sit in window.zig and are covered by the
+    // native `window_run` below (decode of the embedded PNG fixture).
+    const window_icon_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/window_icon.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(window_icon_tests).step);
+
     // ── Unit tests for the shipped build hook ───────────────────────
     // `backend.hook.zig` is std-only (it's the file the assembler stages
     // and `@import`s into a generated build.zig — see build.zig.zon's
