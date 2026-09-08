@@ -430,7 +430,7 @@ fn initMaterialPrograms() void {
         !isValidProgram(dissolve_program) or !isValidProgram(outline_program))
     {
         std.log.warn("bgfx: some material programs failed to link; those effects degrade to plain sprites (flash={} palette_swap={} dissolve={} outline={})", .{
-            isValidProgram(flash_program),   isValidProgram(palette_program),
+            isValidProgram(flash_program),    isValidProgram(palette_program),
             isValidProgram(dissolve_program), isValidProgram(outline_program),
         });
     }
@@ -751,7 +751,7 @@ pub fn submitPostPass(
     // asserting inside bgfx on a starved frame (#648).
     const quad_n: u32 = @intCast(verts.len);
     if (!transient_budget.fits(quad_n, bgfx.getAvailTransientVertexBuffer(quad_n, &vertex_layout))) {
-        noteTransientDrop("post-fx pass quad", quad_n);
+        noteTransientDrop("post-fx pass quad", "vertex", quad_n);
         return;
     }
     var tvb: bgfx.TransientVertexBuffer = undefined;
@@ -788,7 +788,7 @@ pub fn submitFullscreenBlit(src_color: bgfx.TextureHandle) void {
     const verts = fullscreenQuad(postFxFlipV());
     const quad_n: u32 = @intCast(verts.len);
     if (!transient_budget.fits(quad_n, bgfx.getAvailTransientVertexBuffer(quad_n, &vertex_layout))) {
-        noteTransientDrop("full-screen blit quad", quad_n);
+        noteTransientDrop("full-screen blit quad", "vertex", quad_n);
         return;
     }
     var tvb: bgfx.TransientVertexBuffer = undefined;
@@ -887,14 +887,20 @@ pub fn ensureLayouts() void {
 var transient_drops: transient_budget.DropLog = .{};
 
 /// Report a dropped submission once, with enough context to act on.
-fn noteTransientDrop(what: []const u8, dropped: u32) void {
-    if (transient_drops.note(dropped)) {
+///
+/// `dropped_vertices` is always a VERTEX count — the geometry actually lost —
+/// even when the shortage was in the index buffer. `which_buffer` names the
+/// arena that ran out, because the fix differs: a short index ring is raised
+/// with a different init limit than a short vertex ring, and reporting an
+/// index count as "vertices" sends the reader at the wrong number.
+fn noteTransientDrop(what: []const u8, which_buffer: []const u8, dropped_vertices: u32) void {
+    if (transient_drops.note(dropped_vertices)) {
         std.log.warn(
-            "bgfx: transient vertex buffer exhausted — dropped {d} vertices from {s}. " ++
-                "Geometry is missing from this frame. Raise the transient VB size in the " ++
-                "bgfx init limits, or submit less shape/mesh geometry per frame. " ++
+            "bgfx: transient {s} buffer exhausted — dropped {d} vertices from {s}. " ++
+                "Geometry is missing from this frame. Raise the transient {s} buffer size in " ++
+                "the bgfx init limits, or submit less shape/mesh geometry per frame. " ++
                 "(labelle-assembler#648; this warning fires once per process)",
-            .{ dropped, what },
+            .{ which_buffer, dropped_vertices, what, which_buffer },
         );
     }
 }
@@ -902,6 +908,14 @@ fn noteTransientDrop(what: []const u8, dropped: u32) void {
 /// Diagnostic accessor for the drop counters (tests, probes).
 pub fn transientDropStats() transient_budget.DropLog {
     return transient_drops;
+}
+
+/// How many vertices of the CURRENT frame's transient arena remain, in this
+/// file's vertex layout. Exposed for the exhaustion probe; production paths
+/// query bgfx inline at the point of use.
+pub fn availTransientVertices(request: u32) u32 {
+    ensureLayouts();
+    return bgfx.getAvailTransientVertexBuffer(request, &vertex_layout);
 }
 
 /// Warn-once for a polygon rejected by `draw.drawPolygon`'s fixed stack budget
@@ -927,9 +941,9 @@ pub fn notePolygonTooLarge(num_verts: u32, cap: u32) void {
 /// Before this, the batch was handed straight to `allocTransientVertexBuffer`,
 /// which asserts in Debug and truncates in release once the per-frame ring is
 /// short — the silent-shape-drop this ticket is about. Now each round asks what
-/// is available and submits the largest whole-triangle piece that fits, so a
-/// heavy frame degrades into several submits instead of vanishing. If not even
-/// one triangle fits, the remainder is dropped LOUDLY and once.
+/// is available and submits the largest whole-triangle prefix that fits.
+/// Submitting does not replenish this frame's arena; the remainder is dropped
+/// and reported once if it cannot fit.
 ///
 /// Each chunk re-binds texture and state because bgfx discards both on submit.
 pub fn submitFlatTriangles(vertices: []const PosTexColorVertex) void {
@@ -952,7 +966,7 @@ pub fn submitFlatTriangles(vertices: []const PosTexColorVertex) void {
         const remaining = total - offset;
         const avail = bgfx.getAvailTransientVertexBuffer(remaining, &vertex_layout);
         const chunk = transient_budget.nextTriangleChunk(remaining, avail) orelse {
-            noteTransientDrop("flat triangles", remaining);
+            noteTransientDrop("flat triangles", "vertex", remaining);
             return;
         };
 
@@ -994,7 +1008,7 @@ pub fn submitTexturedTriangles(vertices: []const PosTexColorVertex, texture_hand
         const remaining = total - offset;
         const avail = bgfx.getAvailTransientVertexBuffer(remaining, &vertex_layout);
         const chunk = transient_budget.nextTriangleChunk(remaining, avail) orelse {
-            noteTransientDrop("textured triangles", remaining);
+            noteTransientDrop("textured triangles", "vertex", remaining);
             return;
         };
 
@@ -1051,11 +1065,15 @@ pub fn submitMesh(
     // An indexed mesh cannot be chunked without rewriting its indices, so this
     // stays all-or-nothing — but it now reports instead of vanishing (#648).
     if (!transient_budget.fits(num_v, bgfx.getAvailTransientVertexBuffer(num_v, &vertex_layout))) {
-        noteTransientDrop("indexed mesh vertices", num_v);
+        noteTransientDrop("an indexed mesh", "vertex", num_v);
         return;
     }
+    // The shortage is in the INDEX arena, but what is lost is still the whole
+    // mesh — so the named buffer is the index one and the reported count is
+    // `num_v`, the geometry dropped. Reporting `num_i` here would inflate the
+    // vertex tally by the index count and mislabel the arena to raise.
     if (!transient_budget.fits(num_i, bgfx.getAvailTransientIndexBuffer(num_i, false))) {
-        noteTransientDrop("indexed mesh indices", num_i);
+        noteTransientDrop("an indexed mesh", "index", num_v);
         return;
     }
 
@@ -1100,7 +1118,7 @@ pub fn submitYuvTriangles(
     // The video quad is a fixed pair of triangles bound to three planes;
     // chunking it would tear the frame, so it is all-or-nothing (#648).
     if (!transient_budget.fits(num, bgfx.getAvailTransientVertexBuffer(num, &vertex_layout))) {
-        noteTransientDrop("YUV video quad", num);
+        noteTransientDrop("YUV video quad", "vertex", num);
         return;
     }
     var tvb: bgfx.TransientVertexBuffer = undefined;

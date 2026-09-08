@@ -466,6 +466,22 @@ pub fn build(b: *std.Build) void {
     const sprobe_step = b.step("screenshot-probe", "Run the headless screenshot-to-file validation probe (#36)");
     sprobe_step.dependOn(&b.addRunArtifact(sprobe).step);
 
+    // Exercise real per-frame exhaustion on demand; no GPU needed by unit tests.
+    const transient_probe = b.addExecutable(.{
+        .name = "transient_exhaustion_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/transient_exhaustion_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    transient_probe.root_module.addImport("zbgfx", zbgfx_mod);
+    transient_probe.root_module.addImport("gfx", gfx_mod);
+    transient_probe.root_module.linkLibrary(bgfx_artifact);
+    const transient_probe_step = b.step("transient-exhaustion-probe", "Verify transient exhaustion against a real GPU (#648)");
+    transient_probe_step.dependOn(&b.addRunArtifact(transient_probe).step);
+
     const probe_step = b.step("headless-probe", "Run the headless bgfx feasibility probe (#36)");
     probe_step.dependOn(&b.addRunArtifact(probe).step);
 

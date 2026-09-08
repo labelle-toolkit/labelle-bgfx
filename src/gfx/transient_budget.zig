@@ -11,20 +11,31 @@
 //! split `src/gfx/state.zig` uses for the coordinate math. `programs.zig` owns
 //! the bgfx calls; everything here is decidable from two integers.
 //!
-//! ## Why chunking rather than dropping
+//! ## What the chunk loop actually buys — and what it does not
 //!
-//! A triangle list is order-independent across triangles, so a batch that does
-//! not fit whole can be submitted in pieces across several `alloc`+`submit`
-//! rounds. What must NOT happen is splitting *inside* a triangle: every chunk is
-//! rounded down to a multiple of three vertices, so a chunk is always a whole
-//! number of triangles.
+//! It submits the largest whole-triangle PREFIX that currently fits, then drops
+//! and reports the rest. It does **not** recover capacity by submitting:
+//! bgfx's transient buffer is a single per-frame arena reclaimed at `bgfx.frame`,
+//! and `submit` does not give any of it back. So a second round sees LESS
+//! headroom than the first, never more, and a starved batch converges on the
+//! drop path rather than draining. The loop shape is what makes the partial
+//! submission safe and terminating; it is not a way to fit more geometry into a
+//! full frame. To actually fit more, raise the transient VB size at init or
+//! submit less per frame — which is what the drop warning says.
+//!
+//! Chunking is a prefix split, and that is deliberate: **triangle order is
+//! preserved**. Alpha-blended geometry is order-dependent — painter's-algorithm
+//! output changes if triangles are reordered or interleaved — so chunks are cut
+//! at ascending offsets and submitted in sequence, and a dropped remainder is
+//! always a suffix. What must NOT happen is splitting *inside* a triangle:
+//! every chunk is rounded down to a multiple of three vertices.
 //!
 //! ## The two invariants worth stating
 //!
 //! 1. **Progress.** `nextTriangleChunk` returns either `null` or a value `>= 3`.
 //!    A caller looping `while (offset < total)` therefore advances by at least
-//!    one triangle per iteration and cannot spin. This is the property that
-//!    turns "guard the alloc" into "guard the alloc without inventing a hang".
+//!    one triangle per iteration and cannot spin — including when the budget
+//!    shrinks to nothing, which is the realistic case.
 //! 2. **Containment.** The returned count never exceeds `remaining`, so
 //!    `vertices[offset..][0..chunk]` is always in bounds.
 
@@ -124,23 +135,61 @@ test "nextTriangleChunk: never exceeds remaining (no out-of-bounds copy)" {
     }
 }
 
-test "nextTriangleChunk: a drain loop always terminates (no infinite chunking)" {
-    // The property that matters: every non-null chunk advances the cursor, so
-    // a fixed `avail` cannot make the caller spin. Iteration cap is a tripwire,
-    // not an expectation — 300 verts at 3/chunk needs 100 rounds.
-    for ([_]u32{ 3, 4, 5, 6, 7, 99, 100, 4096 }) |avail| {
+test "nextTriangleChunk: a drain loop terminates when the budget never replenishes" {
+    // The realistic exhaustion shape. bgfx's transient arena is per-FRAME:
+    // `submit` returns none of it, so each round sees strictly less headroom.
+    // Modelling `avail` as a fixed number would quietly assert the opposite —
+    // a ring that refills — and would pass even if the guard could spin.
+    //
+    // Here the budget is consumed by what we submit, so the loop must submit a
+    // prefix and then hit the drop path, never loop forever and never advance
+    // past `total`.
+    for ([_]u32{ 0, 2, 3, 7, 99, 150, 300, 4096 }) |initial_budget| {
         const total: u32 = 300;
+        var budget = initial_budget;
         var offset: u32 = 0;
         var rounds: u32 = 0;
+        var dropped: u32 = 0;
+
         while (offset < total) {
-            const chunk = nextTriangleChunk(total - offset, avail) orelse break;
+            const remaining = total - offset;
+            const chunk = nextTriangleChunk(remaining, budget) orelse {
+                dropped = remaining;
+                break;
+            };
             try testing.expect(chunk > 0); // strict progress
+            try testing.expect(chunk <= budget); // never over-draws the arena
             offset += chunk;
+            budget -= chunk; // submit does NOT give it back
             rounds += 1;
             try testing.expect(rounds <= 128);
         }
-        try testing.expectEqual(total, offset); // fully drained, nothing lost
+
+        // Everything is accounted for: submitted + dropped == total.
+        try testing.expectEqual(total, offset + dropped);
+        // And we never submitted more than the arena ever held.
+        try testing.expect(offset <= initial_budget);
+        // A budget that cannot seat one triangle submits nothing at all.
+        if (initial_budget < VERTS_PER_TRI) try testing.expectEqual(@as(u32, 0), offset);
+        // One round is the common case: the first chunk takes the whole prefix.
+        if (initial_budget >= total) try testing.expectEqual(@as(u32, 1), rounds);
     }
+}
+
+test "nextTriangleChunk: the dropped remainder is always a suffix (order preserved)" {
+    // Alpha-blended triangles are order-dependent, so a partial submission has
+    // to be a PREFIX — dropping from the middle would reorder what survives.
+    const total: u32 = 30;
+    var budget: u32 = 13; // seats 4 triangles (12 verts), not 5
+    var offset: u32 = 0;
+    while (offset < total) {
+        const chunk = nextTriangleChunk(total - offset, budget) orelse break;
+        offset += chunk;
+        budget -= chunk;
+    }
+    try testing.expectEqual(@as(u32, 12), offset); // 4 whole triangles, in order
+    // The survivors are vertices [0, 12) — a prefix — and [12, 30) is dropped.
+    try testing.expect(offset % VERTS_PER_TRI == 0);
 }
 
 test "nextTriangleChunk: a non-multiple-of-3 batch drops only the ragged tail" {
