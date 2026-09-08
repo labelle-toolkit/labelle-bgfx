@@ -127,8 +127,16 @@ pub fn drawPolygon(points: []const Vector2, tint: Color) void {
     const num_verts = num_triangles * 3;
 
     // Stack buffer for small polygons, skip very large ones.
+    //
+    // This cap is a fixed stack budget, not a transient-ring shortage, so it
+    // is not chunked — but it used to drop silently, which is the same
+    // failure mode #648 is about. Report it once so a vanished polygon is
+    // diagnosable instead of mysterious.
     const MAX_POLYGON_VERTS = 128 * 3;
-    if (num_verts > MAX_POLYGON_VERTS) return;
+    if (num_verts > MAX_POLYGON_VERTS) {
+        programs.notePolygonTooLarge(@intCast(num_verts), MAX_POLYGON_VERTS);
+        return;
+    }
 
     var vertices: [MAX_POLYGON_VERTS]PosTexColorVertex = undefined;
     const p0 = makeVertex(state.transformX(points[0].x), state.transformY(points[0].y), abgr);

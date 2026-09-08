@@ -691,6 +691,20 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(state_run).step);
 
+    // Run the transient-buffer budgeting tests (labelle-assembler#648).
+    // `gfx/transient_budget.zig` is std-only arithmetic (no zbgfx), so the
+    // chunk planner EXECUTES on the host: whole-triangle chunking, the
+    // exhaustion path, and the loop-termination invariant that keeps the
+    // guarded submit paths in `programs.zig` from spinning on a starved ring.
+    const transient_budget_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gfx/transient_budget.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(transient_budget_run).step);
+
     // Run the ASTC container-parsing tests (#341). `gfx/astc.zig` is pure byte
     // parsing with no zbgfx dependency, so it EXECUTES on the host (magic
     // detection, block/image dims, ceil-to-block payload sizing, truncation).
