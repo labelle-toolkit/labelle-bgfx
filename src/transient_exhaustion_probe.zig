@@ -36,6 +36,7 @@
 const std = @import("std");
 const bgfx = @import("zbgfx").bgfx;
 const gfx = @import("gfx");
+const Material = @import("labelle-core").backend_contract.Material;
 
 const W: u16 = 64;
 const H: u16 = 64;
@@ -151,8 +152,49 @@ pub fn main() !void {
         std.process.exit(5);
     }
 
+    // Exercise the public material dispatch, including a valid LUT so
+    // palette_swap cannot silently fall back to the textured path.
+    const pixels = try allocator.dupe(u8, &white);
+    defer allocator.free(pixels);
+    const sprite = try gfx.uploadTexture(.{ .pixels = pixels, .width = 1, .height = 1 });
+
+    inline for (.{ .flash, .palette_swap, .dissolve, .outline }) |effect| {
+        const material: Material = .{ .effect = effect, .uniforms = .{
+            .aux_texture = sprite.id.toInt(),
+            .aux_count = 1,
+        } };
+        const rect = gfx.Rectangle{ .x = 0, .y = 0, .width = 1, .height = 1 };
+        const origin = gfx.Vector2{ .x = 0, .y = 0 };
+        const room = gfx.availTransientVertices(probe_request);
+        const before_material = gfx.transientDropStats();
+        gfx.drawTextureProMaterial(sprite, rect, rect, origin, 0, gfx.white, material);
+        if (gfx.availTransientVertices(probe_request) != room - 6 or
+            gfx.transientDropStats().drop_events != before_material.drop_events)
+            return error.MaterialDidNotRender;
+        // Fill the remainder, leaving fewer than one triangle. A fixed
+        // material quad must be rejected and account for all six vertices.
+        const remaining_room = gfx.availTransientVertices(probe_request);
+        gfx.submitFlatTriangles(verts[0 .. remaining_room - remaining_room % 3]);
+        const before_drop = gfx.transientDropStats();
+        gfx.drawTextureProMaterial(sprite, rect, rect, origin, 0, gfx.white, material);
+        const dropped = gfx.transientDropStats();
+        if (dropped.drop_events != before_drop.drop_events + 1 or
+            dropped.dropped_vertices != before_drop.dropped_vertices + 6)
+            return error.MaterialDropNotRecorded;
+        _ = bgfx.frame(0);
+        // The next frame must recover: the guard cannot latch rendering off.
+        const recovered_room = gfx.availTransientVertices(probe_request);
+        gfx.drawTextureProMaterial(sprite, rect, rect, origin, 0, gfx.white, material);
+        if (gfx.availTransientVertices(probe_request) != recovered_room - 6 or
+            gfx.transientDropStats().drop_events != dropped.drop_events)
+            return error.MaterialDidNotRecover;
+        _ = bgfx.frame(0);
+        std.debug.print("PROBE: {s} rendered, dropped exactly 6, recovered next frame\n", .{@tagName(effect)});
+    }
+
     std.debug.print("PROBE_RESULT: TRANSIENT_EXHAUSTION_OK\n", .{});
     bgfx.destroyTexture(texture);
+    gfx.unloadTexture(sprite);
     gfx.shutdownPrograms();
     bgfx.destroyFrameBuffer(fb);
     bgfx.destroyTexture(rt);

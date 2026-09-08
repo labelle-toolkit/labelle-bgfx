@@ -478,7 +478,16 @@ pub fn build(b: *std.Build) void {
     });
     transient_probe.root_module.addImport("zbgfx", zbgfx_mod);
     transient_probe.root_module.addImport("gfx", gfx_mod);
+    transient_probe.root_module.addImport("labelle-core", core_mod);
+    transient_probe.root_module.addImport("window", window_mod);
     transient_probe.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| transient_probe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        transient_probe.root_module.linkSystemLibrary("gdi32", .{});
+        transient_probe.root_module.linkSystemLibrary("user32", .{});
+    }
+    const transient_probe_build = b.step("transient-exhaustion-probe-build", "Compile the transient exhaustion probe without running it");
+    transient_probe_build.dependOn(&transient_probe.step);
     const transient_probe_step = b.step("transient-exhaustion-probe", "Verify transient exhaustion against a real GPU (#648)");
     transient_probe_step.dependOn(&b.addRunArtifact(transient_probe).step);
 

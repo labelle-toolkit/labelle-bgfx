@@ -541,6 +541,12 @@ pub fn submitMaterialTriangles(
     bgfx.setUniform(u_material_rect_uniform, &rect, 1);
 
     const num: u32 = @intCast(vertices.len);
+    // Material sprites are a whole submission, like the other fixed quads.
+    // Guard before allocation/copy: bgfx truncates or asserts on exhaustion.
+    if (!transient_budget.fits(num, bgfx.getAvailTransientVertexBuffer(num, &vertex_layout))) {
+        noteTransientDrop("material triangles", "vertex", num);
+        return;
+    }
     var tvb: bgfx.TransientVertexBuffer = undefined;
     bgfx.allocTransientVertexBuffer(&tvb, num, &vertex_layout);
     const dest_ptr: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));

@@ -37,6 +37,11 @@ jobs:
             bgfx-${{ runner.os }}-
       - name: Build + test
         run: zig build test
+      # Fixed-scene goldens do not exercise arena exhaustion or Windows links.
+      - name: Transient exhaustion (flat, textured and all material effects)
+        run: zig build transient-exhaustion-probe
+      - name: Cross-link transient probe for Windows
+        run: zig build transient-exhaustion-probe-build -Dtarget=x86_64-windows
       # Material seam golden (labelle-gfx#305, RFC §6): render the fixed scene
       # covering the full curated set — flash + palette_swap + dissolve + outline
       # — surfaceless (Metal offscreen FB — the macos-latest Apple-Silicon runner
