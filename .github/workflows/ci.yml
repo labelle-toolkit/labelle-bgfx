@@ -37,6 +37,8 @@ jobs:
             bgfx-${{ runner.os }}-
       - name: Build + test
         run: zig build test
+      - name: Texture sampling (rendered point versus linear pixels)
+        run: zig build texture-sampling-probe
       # Fixed-scene goldens do not exercise arena exhaustion or Windows links.
       - name: Transient exhaustion (flat, textured and all material effects)
         run: zig build transient-exhaustion-probe
