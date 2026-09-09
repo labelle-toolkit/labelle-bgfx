@@ -76,6 +76,16 @@ pub const getDesignHeight = state.getDesignHeight;
 pub const shutdownPrograms = programs.shutdownPrograms;
 pub const areProgramsReady = programs.areProgramsReady;
 
+// Transient-arena introspection (labelle-assembler#648). Exposed so the
+// exhaustion probe can measure the real device's capacity and read the drop
+// counters back — the guard's behaviour under a genuinely short arena is not
+// observable from the pure-arithmetic unit tests.
+pub const PosTexColorVertex = programs.PosTexColorVertex;
+pub const submitFlatTriangles = programs.submitFlatTriangles;
+pub const submitTexturedTriangles = programs.submitTexturedTriangles;
+pub const transientDropStats = programs.transientDropStats;
+pub const availTransientVertices = programs.availTransientVertices;
+
 // ── Draw primitives (Backend contract) ─────────────────────────────────
 
 pub const drawRectangleRec = draw.drawRectangleRec;

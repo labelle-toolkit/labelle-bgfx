@@ -8,6 +8,7 @@ const core = @import("labelle-core");
 const shaders_data = @import("../shaders.zig");
 const texture_mod = @import("texture.zig");
 const font_mod = @import("font.zig");
+const transient_budget = @import("transient_budget.zig");
 
 const MaterialEffect = core.backend_contract.MaterialEffect;
 const MaterialUniforms = core.backend_contract.MaterialUniforms;
@@ -429,7 +430,7 @@ fn initMaterialPrograms() void {
         !isValidProgram(dissolve_program) or !isValidProgram(outline_program))
     {
         std.log.warn("bgfx: some material programs failed to link; those effects degrade to plain sprites (flash={} palette_swap={} dissolve={} outline={})", .{
-            isValidProgram(flash_program),   isValidProgram(palette_program),
+            isValidProgram(flash_program),    isValidProgram(palette_program),
             isValidProgram(dissolve_program), isValidProgram(outline_program),
         });
     }
@@ -540,6 +541,12 @@ pub fn submitMaterialTriangles(
     bgfx.setUniform(u_material_rect_uniform, &rect, 1);
 
     const num: u32 = @intCast(vertices.len);
+    // Material sprites are a whole submission, like the other fixed quads.
+    // Guard before allocation/copy: bgfx truncates or asserts on exhaustion.
+    if (!transient_budget.fits(num, bgfx.getAvailTransientVertexBuffer(num, &vertex_layout))) {
+        noteTransientDrop("material triangles", "vertex", num);
+        return;
+    }
     var tvb: bgfx.TransientVertexBuffer = undefined;
     bgfx.allocTransientVertexBuffer(&tvb, num, &vertex_layout);
     const dest_ptr: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
@@ -745,6 +752,14 @@ pub fn submitPostPass(
     bgfx.setUniform(u_postfx_texel_uniform, &texel, 1);
 
     const verts = fullscreenQuad(postFxFlipV());
+    // A full-screen quad cannot be chunked — it is all six vertices or nothing.
+    // Dropping the pass leaves the previous target contents rather than
+    // asserting inside bgfx on a starved frame (#648).
+    const quad_n: u32 = @intCast(verts.len);
+    if (!transient_budget.fits(quad_n, bgfx.getAvailTransientVertexBuffer(quad_n, &vertex_layout))) {
+        noteTransientDrop("post-fx pass quad", "vertex", quad_n);
+        return;
+    }
     var tvb: bgfx.TransientVertexBuffer = undefined;
     bgfx.allocTransientVertexBuffer(&tvb, verts.len, &vertex_layout);
     const dest_ptr: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
@@ -777,6 +792,11 @@ pub fn submitFullscreenBlit(src_color: bgfx.TextureHandle) void {
     bgfx.setViewTransform(active_view, &identity, &identity);
 
     const verts = fullscreenQuad(postFxFlipV());
+    const quad_n: u32 = @intCast(verts.len);
+    if (!transient_budget.fits(quad_n, bgfx.getAvailTransientVertexBuffer(quad_n, &vertex_layout))) {
+        noteTransientDrop("full-screen blit quad", "vertex", quad_n);
+        return;
+    }
     var tvb: bgfx.TransientVertexBuffer = undefined;
     bgfx.allocTransientVertexBuffer(&tvb, verts.len, &vertex_layout);
     const dest_ptr: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
@@ -867,6 +887,71 @@ pub fn ensureLayouts() void {
 
 // ── Internal submit helpers ───────────────────────────────────────────
 
+/// Shared drop bookkeeping for every transient-buffer guard in this file
+/// (#648). One reporter, so the "geometry is being dropped" warning fires once
+/// per process rather than once per starved path.
+var transient_drops: transient_budget.DropLog = .{};
+
+/// Report a dropped submission once, with enough context to act on.
+///
+/// `dropped_vertices` is always a VERTEX count — the geometry actually lost —
+/// even when the shortage was in the index buffer. `which_buffer` names the
+/// arena that ran out, because the fix differs: a short index ring is raised
+/// with a different init limit than a short vertex ring, and reporting an
+/// index count as "vertices" sends the reader at the wrong number.
+fn noteTransientDrop(what: []const u8, which_buffer: []const u8, dropped_vertices: u32) void {
+    if (transient_drops.note(dropped_vertices)) {
+        std.log.warn(
+            "bgfx: transient {s} buffer exhausted — dropped {d} vertices from {s}. " ++
+                "Geometry is missing from this frame. Raise the transient {s} buffer size in " ++
+                "the bgfx init limits, or submit less shape/mesh geometry per frame. " ++
+                "(labelle-assembler#648; this warning fires once per process)",
+            .{ which_buffer, dropped_vertices, what, which_buffer },
+        );
+    }
+}
+
+/// Diagnostic accessor for the drop counters (tests, probes).
+pub fn transientDropStats() transient_budget.DropLog {
+    return transient_drops;
+}
+
+/// How many vertices of the CURRENT frame's transient arena remain, in this
+/// file's vertex layout. Exposed for the exhaustion probe; production paths
+/// query bgfx inline at the point of use.
+pub fn availTransientVertices(request: u32) u32 {
+    ensureLayouts();
+    return bgfx.getAvailTransientVertexBuffer(request, &vertex_layout);
+}
+
+/// Warn-once for a polygon rejected by `draw.drawPolygon`'s fixed stack budget
+/// (#648, "also noted"). Distinct from the transient-ring drops above — this is
+/// a compile-time cap, not a capacity shortage — but it shared their silence,
+/// which is the actual defect.
+var polygon_drops: transient_budget.DropLog = .{};
+
+pub fn notePolygonTooLarge(num_verts: u32, cap: u32) void {
+    if (polygon_drops.note(num_verts)) {
+        std.log.warn(
+            "bgfx: drawPolygon skipped a {d}-vertex polygon — over the {d}-vertex stack cap. " ++
+                "Split the polygon or raise MAX_POLYGON_VERTS. " ++
+                "(labelle-assembler#648; this warning fires once per process)",
+            .{ num_verts, cap },
+        );
+    }
+}
+
+/// Submit a non-indexed triangle list through the sprite program, CHUNKED
+/// against the transient ring's real capacity (#648).
+///
+/// Before this, the batch was handed straight to `allocTransientVertexBuffer`,
+/// which asserts in Debug and truncates in release once the per-frame ring is
+/// short — the silent-shape-drop this ticket is about. Now each round asks what
+/// is available and submits the largest whole-triangle prefix that fits.
+/// Submitting does not replenish this frame's arena; the remainder is dropped
+/// and reported once if it cannot fit.
+///
+/// Each chunk re-binds texture and state because bgfx discards both on submit.
 pub fn submitFlatTriangles(vertices: []const PosTexColorVertex) void {
     ensureShadersInitialized();
     if (!isValidProgram(sprite_program)) return;
@@ -881,22 +966,33 @@ pub fn submitFlatTriangles(vertices: []const PosTexColorVertex) void {
     };
     bgfx.setViewTransform(active_view, &identity, &identity);
 
-    const num_vertices: usize = vertices.len;
-    const num: u32 = @intCast(num_vertices);
-    var tvb: bgfx.TransientVertexBuffer = undefined;
+    const total: u32 = @intCast(vertices.len);
+    var offset: u32 = 0;
+    while (offset < total) {
+        const remaining = total - offset;
+        const avail = bgfx.getAvailTransientVertexBuffer(remaining, &vertex_layout);
+        const chunk = transient_budget.nextTriangleChunk(remaining, avail) orelse {
+            noteTransientDrop("flat triangles", "vertex", remaining);
+            return;
+        };
 
-    bgfx.allocTransientVertexBuffer(&tvb, num, &vertex_layout);
+        var tvb: bgfx.TransientVertexBuffer = undefined;
+        bgfx.allocTransientVertexBuffer(&tvb, chunk, &vertex_layout);
 
-    const dest: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
-    @memcpy(dest[0..num_vertices], vertices);
+        const dest: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
+        @memcpy(dest[0..chunk], vertices[offset..][0..chunk]);
 
-    bgfx.setTransientVertexBuffer(0, &tvb, 0, num);
-    // Bind 1x1 white texture so the shader computes: white * vertex_color = vertex_color
-    bgfx.setTexture(0, s_tex_uniform, white_texture, 0);
-    bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
-    bgfx.submit(active_view, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+        bgfx.setTransientVertexBuffer(0, &tvb, 0, chunk);
+        // Bind 1x1 white texture so the shader computes: white * vertex_color = vertex_color
+        bgfx.setTexture(0, s_tex_uniform, white_texture, 0);
+        bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
+        bgfx.submit(active_view, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+
+        offset += chunk;
+    }
 }
 
+/// Textured twin of `submitFlatTriangles`, chunked identically (#648).
 pub fn submitTexturedTriangles(vertices: []const PosTexColorVertex, texture_handle: bgfx.TextureHandle) void {
     ensureShadersInitialized();
     if (!isValidProgram(sprite_program)) return;
@@ -912,19 +1008,29 @@ pub fn submitTexturedTriangles(vertices: []const PosTexColorVertex, texture_hand
     };
     bgfx.setViewTransform(active_view, &identity, &identity);
 
-    const num_vertices: usize = vertices.len;
-    const num: u32 = @intCast(num_vertices);
-    var tvb: bgfx.TransientVertexBuffer = undefined;
+    const total: u32 = @intCast(vertices.len);
+    var offset: u32 = 0;
+    while (offset < total) {
+        const remaining = total - offset;
+        const avail = bgfx.getAvailTransientVertexBuffer(remaining, &vertex_layout);
+        const chunk = transient_budget.nextTriangleChunk(remaining, avail) orelse {
+            noteTransientDrop("textured triangles", "vertex", remaining);
+            return;
+        };
 
-    bgfx.allocTransientVertexBuffer(&tvb, num, &vertex_layout);
+        var tvb: bgfx.TransientVertexBuffer = undefined;
+        bgfx.allocTransientVertexBuffer(&tvb, chunk, &vertex_layout);
 
-    const dest_ptr: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
-    @memcpy(dest_ptr[0..num_vertices], vertices);
+        const dest_ptr: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
+        @memcpy(dest_ptr[0..chunk], vertices[offset..][0..chunk]);
 
-    bgfx.setTransientVertexBuffer(0, &tvb, 0, num);
-    bgfx.setTexture(0, s_tex_uniform, texture_handle, 0);
-    bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
-    bgfx.submit(active_view, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+        bgfx.setTransientVertexBuffer(0, &tvb, 0, chunk);
+        bgfx.setTexture(0, s_tex_uniform, texture_handle, 0);
+        bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
+        bgfx.submit(active_view, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+
+        offset += chunk;
+    }
 }
 
 /// Submit an INDEXED textured triangle mesh through the sprite program — the
@@ -962,8 +1068,20 @@ pub fn submitMesh(
     var tib: bgfx.TransientIndexBuffer = undefined;
 
     // Guard against over-allocating the transient ring (bgfx would assert).
-    if (bgfx.getAvailTransientVertexBuffer(num_v, &vertex_layout) < num_v) return;
-    if (bgfx.getAvailTransientIndexBuffer(num_i, false) < num_i) return;
+    // An indexed mesh cannot be chunked without rewriting its indices, so this
+    // stays all-or-nothing — but it now reports instead of vanishing (#648).
+    if (!transient_budget.fits(num_v, bgfx.getAvailTransientVertexBuffer(num_v, &vertex_layout))) {
+        noteTransientDrop("an indexed mesh", "vertex", num_v);
+        return;
+    }
+    // The shortage is in the INDEX arena, but what is lost is still the whole
+    // mesh — so the named buffer is the index one and the reported count is
+    // `num_v`, the geometry dropped. Reporting `num_i` here would inflate the
+    // vertex tally by the index count and mislabel the arena to raise.
+    if (!transient_budget.fits(num_i, bgfx.getAvailTransientIndexBuffer(num_i, false))) {
+        noteTransientDrop("an indexed mesh", "index", num_v);
+        return;
+    }
 
     bgfx.allocTransientVertexBuffer(&tvb, num_v, &vertex_layout);
     bgfx.allocTransientIndexBuffer(&tib, num_i, false); // 16-bit indices
@@ -1003,6 +1121,12 @@ pub fn submitYuvTriangles(
     bgfx.setViewTransform(active_view, &identity, &identity);
 
     const num: u32 = @intCast(vertices.len);
+    // The video quad is a fixed pair of triangles bound to three planes;
+    // chunking it would tear the frame, so it is all-or-nothing (#648).
+    if (!transient_budget.fits(num, bgfx.getAvailTransientVertexBuffer(num, &vertex_layout))) {
+        noteTransientDrop("YUV video quad", "vertex", num);
+        return;
+    }
     var tvb: bgfx.TransientVertexBuffer = undefined;
     bgfx.allocTransientVertexBuffer(&tvb, num, &vertex_layout);
     const dest_ptr: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
