@@ -690,6 +690,15 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(window_icon_tests).step);
 
+    const screenshot_path_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/screenshot_path.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(screenshot_path_tests).step);
+
     // ── Unit tests for the shipped build hook ───────────────────────
     // `backend.hook.zig` is std-only (it's the file the assembler stages
     // and `@import`s into a generated build.zig — see build.zig.zon's

@@ -747,7 +747,7 @@ pub fn isSurfaceless() bool {
 
 /// Capture the headless offscreen framebuffer (#36) to an uncompressed 32-bit
 /// TGA. Like bgfx's windowed `takeScreenshot` (which lets bgfx append the
-/// extension), a `.tga` suffix is appended to `path`, so the same `--screenshot`
+/// extension), a `.tga` suffix is appended to `path` only if absent, so the same `--screenshot`
 /// value yields the same filename windowed or headless. Returns false if not
 /// headless, the GPU→CPU readback never lands, the path is too long, or the file
 /// can't be written.
@@ -798,9 +798,9 @@ pub fn captureHeadless(path: [:0]const u8) bool {
     }
     readback_done = true;
 
-    // Append ".tga" to match bgfx's windowed `takeScreenshot` extension handling.
+    // Use the same idempotent TGA suffix handling as the windowed callback.
     var path_buf: [1024:0]u8 = undefined;
-    const out_path = std.fmt.bufPrintZ(&path_buf, "{s}.tga", .{path}) catch {
+    const out_path = @import("screenshot_path.zig").tgaPath(&path_buf, path) catch {
         std.log.err("bgfx: headless capture path too long: {s}", .{path});
         return false;
     };
@@ -1428,7 +1428,7 @@ pub fn endFrame() void {
 /// an empty, content-less frame and capture that instead — the cause of
 /// the initial blank-screenshot bug.)
 ///
-/// The capture callback appends the `.tga` extension, so a path like `/tmp/shot`
+/// The capture callback appends `.tga` unless that extension is already present, so a path like `/tmp/shot`
 /// yields `/tmp/shot.tga`.
 ///
 /// The path is COPIED into a static buffer (consumed a frame later in

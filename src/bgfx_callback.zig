@@ -271,7 +271,7 @@ fn screenShot(
     const src: [*]const u8 = @ptrCast(data orelse return);
     if (width == 0 or height == 0) return;
 
-    // Append the extension bgfx's stub used to add. A path too long for the
+    // Append the extension only when the caller has not already supplied it. A path too long for the
     // buffer is reported rather than silently truncated into a wrong filename.
     //
     // Sized to hold the LONGEST path the queue side can hand us plus `.tga`:
@@ -282,7 +282,7 @@ fn screenShot(
     // extra 4 bytes close that gap so every path the caller can queue is a path
     // this callback can write.
     var path_buf: [1024 + 4:0]u8 = undefined;
-    const out_path = std.fmt.bufPrintZ(&path_buf, "{s}.tga", .{std.mem.span(file_path)}) catch {
+    const out_path = @import("screenshot_path.zig").tgaPath(&path_buf, std.mem.span(file_path)) catch {
         log.err("screenshot: path too long: {s}", .{std.mem.span(file_path)});
         return;
     };
