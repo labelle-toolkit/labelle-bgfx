@@ -466,6 +466,31 @@ pub fn build(b: *std.Build) void {
     const sprobe_step = b.step("screenshot-probe", "Run the headless screenshot-to-file validation probe (#36)");
     sprobe_step.dependOn(&b.addRunArtifact(sprobe).step);
 
+    // Exercise real per-frame exhaustion on demand; no GPU needed by unit tests.
+    const transient_probe = b.addExecutable(.{
+        .name = "transient_exhaustion_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/transient_exhaustion_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    transient_probe.root_module.addImport("zbgfx", zbgfx_mod);
+    transient_probe.root_module.addImport("gfx", gfx_mod);
+    transient_probe.root_module.addImport("labelle-core", core_mod);
+    transient_probe.root_module.addImport("window", window_mod);
+    transient_probe.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| transient_probe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        transient_probe.root_module.linkSystemLibrary("gdi32", .{});
+        transient_probe.root_module.linkSystemLibrary("user32", .{});
+    }
+    const transient_probe_build = b.step("transient-exhaustion-probe-build", "Compile the transient exhaustion probe without running it");
+    transient_probe_build.dependOn(&transient_probe.step);
+    const transient_probe_step = b.step("transient-exhaustion-probe", "Verify transient exhaustion against a real GPU (#648)");
+    transient_probe_step.dependOn(&b.addRunArtifact(transient_probe).step);
+
     const probe_step = b.step("headless-probe", "Run the headless bgfx feasibility probe (#36)");
     probe_step.dependOn(&b.addRunArtifact(probe).step);
 
@@ -690,6 +715,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(state_run).step);
+
+    // Run the transient-buffer budgeting tests (labelle-assembler#648).
+    // `gfx/transient_budget.zig` is std-only arithmetic (no zbgfx), so the
+    // chunk planner EXECUTES on the host: whole-triangle chunking, the
+    // exhaustion path, and the loop-termination invariant that keeps the
+    // guarded submit paths in `programs.zig` from spinning on a starved ring.
+    const transient_budget_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gfx/transient_budget.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(transient_budget_run).step);
 
     // Run the ASTC container-parsing tests (#341). `gfx/astc.zig` is pure byte
     // parsing with no zbgfx dependency, so it EXECUTES on the host (magic
