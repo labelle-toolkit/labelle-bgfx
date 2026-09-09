@@ -78,8 +78,22 @@ fn androidLogFn(
 {{hooks_init_block}}
 var gpa = std.heap.DebugAllocator(.{}).init;
 
-const screen_w: u32 = {{width}};
-const screen_h: u32 = {{height}};
+/// The project's DESIGN CANVAS, in design pixels — `.width`/`.height` from
+/// `project.labelle`. `pub` so GAME CODE can read it (labelle-bgfx#42).
+///
+/// Content authored against a fixed canvas needs to know that canvas at
+/// runtime, and until now nothing exposed it: the engine and gfx have no
+/// accessor, and these consts were private to the generated root. A game
+/// that hardcoded "1024" instead then broke the moment the canvas changed —
+/// which is exactly how #42 was reported (a `screen_fill` backdrop sized
+/// for 1024 leaving the rest of a wider canvas uncovered).
+///
+/// This is the DESIGN size, NOT the physical framebuffer. A `screen_fill`
+/// layer stretches the canvas onto the whole surface, so content that
+/// covers the canvas covers the surface at any window size; the physical
+/// size is `window.width()`/`window.height()`.
+pub const screen_w: u32 = {{width}};
+pub const screen_h: u32 = {{height}};
 const screen_title = "{{title}}";
 const target_fps: u32 = {{fps}};
 
