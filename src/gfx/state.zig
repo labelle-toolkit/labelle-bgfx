@@ -469,3 +469,36 @@ test "screenToDesign and designToPhysical round-trip (incl. letterbox)" {
         try t.expectApproxEqAbs(s[1], p.y, 1e-2);
     }
 }
+
+test "screen_fill maps the design canvas onto the FULL framebuffer (#42)" {
+    // #42 reported a `screen_fill` backdrop covering only the left ~1024px
+    // of a 1280-wide window for a 1024-wide design. This pins the transform
+    // that claim is about: with the fit OFF, the design canvas must span the
+    // whole NDC range — that IS the full framebuffer — and with it ON it
+    // must pillarbox.
+    //
+    // Same aspect pair as the report: a 4:3 design in a 16:9 surface.
+    setDesignSize(1024, 768);
+    setScreenSize(1280, 720);
+    defer {
+        setDesignSize(800, 600);
+        setScreenSize(800, 600);
+        setApplyFit(true);
+    }
+
+    // screen_fill: edge to edge.
+    setApplyFit(false);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), toNdcX(0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), toNdcX(1024), 0.0001);
+    // The height already matches the surface, so Y is unchanged either way.
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), toNdcY(0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), toNdcY(768), 0.0001);
+
+    // The CONTROL: a normal fitted layer pillarboxes to 4:3 inside 16:9,
+    // i.e. 0.75 of the width. Without this the assertions above could pass
+    // in a build where the fit never applied at all, which would prove
+    // nothing about `screen_fill` specifically.
+    setApplyFit(true);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.75), toNdcX(0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), toNdcX(1024), 0.0001);
+}
