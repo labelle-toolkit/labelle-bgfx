@@ -60,8 +60,24 @@ fn readAll(src: bgfx.TextureHandle) bool {
         std.debug.print("PROBE: readback texture allocation failed\n", .{});
         return false;
     }
-    var done = false;
-    defer if (done) bgfx.destroyTexture(rb);
+    // Destroyed on EVERY path once the handle is valid, including the
+    // readback-timeout return below (#91 review). The earlier
+    // `defer if (done)` skipped a VALID texture precisely when the copy
+    // did not land, which is the one path where something went wrong and
+    // the least useful place to leak.
+    //
+    // Safe here, and this repo already relies on it: `headless_probe.zig`
+    // destroys its readback texture unconditionally before shutdown
+    // "so bgfx doesn't report them as leaks (#384)" — bgfx queues the
+    // destroy and retires the handle after the frame, rather than yanking
+    // it from under a pending copy.
+    //
+    // The sibling `surfaceless_scale_probe` deliberately leaks on this
+    // path instead, reasoning that a late write could land in reclaimed
+    // memory. That reasoning is about its readback BUFFER, and does not
+    // apply here: `pixels` is file-scope, so it outlives teardown and a
+    // late write lands somewhere still valid.
+    defer bgfx.destroyTexture(rb);
 
     bgfx.blit(0, rb, 0, 0, 0, 0, src, 0, 0, 0, 0, W, H, 1);
     const ready = bgfx.readTexture(rb, &pixels, 0);
@@ -69,7 +85,6 @@ fn readAll(src: bgfx.TextureHandle) bool {
     var guard: u32 = 0;
     while (f < ready and guard < 64) : (guard += 1) f = bgfx.frame(0);
     if (f < ready) return false;
-    done = true;
     return true;
 }
 
