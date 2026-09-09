@@ -553,7 +553,9 @@ pub fn submitMaterialTriangles(
     @memcpy(dest_ptr[0..vertices.len], vertices);
 
     bgfx.setTransientVertexBuffer(0, &tvb, 0, num);
-    bgfx.setTexture(0, s_tex_uniform, texture_handle, 0);
+    // UINT32_MAX inherits the sampler flags stored when the texture was
+    // created. Zero overrides them with linear/wrap, defeating point uploads.
+    bgfx.setTexture(0, s_tex_uniform, texture_handle, std.math.maxInt(u32));
     // palette_swap + dissolve sample the aux texture at unit 1 (`s_lut`).
     if (effect == .palette_swap or effect == .dissolve) bgfx.setTexture(1, s_lut_uniform, lut_handle, 0);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
@@ -1025,7 +1027,9 @@ pub fn submitTexturedTriangles(vertices: []const PosTexColorVertex, texture_hand
         @memcpy(dest_ptr[0..chunk], vertices[offset..][0..chunk]);
 
         bgfx.setTransientVertexBuffer(0, &tvb, 0, chunk);
-        bgfx.setTexture(0, s_tex_uniform, texture_handle, 0);
+        // UINT32_MAX inherits the sampler flags stored when the texture was
+        // created. Zero overrides them with linear/wrap, defeating point uploads.
+        bgfx.setTexture(0, s_tex_uniform, texture_handle, std.math.maxInt(u32));
         bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
         bgfx.submit(active_view, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
 
@@ -1093,7 +1097,9 @@ pub fn submitMesh(
 
     bgfx.setTransientVertexBuffer(0, &tvb, 0, num_v);
     bgfx.setTransientIndexBuffer(&tib, 0, num_i);
-    bgfx.setTexture(0, s_tex_uniform, texture_handle, 0);
+    // UINT32_MAX inherits the sampler flags stored when the texture was
+    // created. Zero overrides them with linear/wrap, defeating point uploads.
+    bgfx.setTexture(0, s_tex_uniform, texture_handle, std.math.maxInt(u32));
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | blend_state, 0);
     bgfx.submit(active_view, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
 }

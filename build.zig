@@ -568,6 +568,9 @@ pub fn build(b: *std.Build) void {
             return bb.addRunArtifact(exe);
         }
     };
+    const sampling_probe = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "texture_sampling_probe", "src/texture_sampling_probe.zig", false);
+    b.step("texture-sampling-probe", "Verify point and linear filtering through real sprite/material draws").dependOn(&sampling_probe.step);
+
     const golden_check = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "material_golden", "src/material_golden.zig", false);
     const golden_step = b.step("material-golden", "Diff the material flash + palette_swap + dissolve + outline scene against the committed golden (#305)");
     golden_step.dependOn(&golden_check.step);
