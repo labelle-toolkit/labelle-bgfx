@@ -52,6 +52,14 @@ fn readAll(src: bgfx.TextureHandle) bool {
         null,
         0,
     );
+    // A failed allocation hands back the invalid sentinel, and blitting or
+    // reading through that is undefined rather than merely useless
+    // (#91 review). Refuse instead — the caller already treats `false` as
+    // "readback did not happen".
+    if (rb.idx == std.math.maxInt(u16)) {
+        std.debug.print("PROBE: readback texture allocation failed\n", .{});
+        return false;
+    }
     var done = false;
     defer if (done) bgfx.destroyTexture(rb);
 
@@ -63,6 +71,13 @@ fn readAll(src: bgfx.TextureHandle) bool {
     if (f < ready) return false;
     done = true;
     return true;
+}
+
+/// `std.process.exit` does NOT run defers, so every early exit calls this
+/// explicitly. Same resources, same order as the `defer` on the happy path.
+fn teardown(uploaded: ?gfx.Texture) void {
+    if (uploaded) |t| gfx.unloadTexture(t);
+    window.closeWindow();
 }
 
 fn at(x: u16, y: u16) [4]u8 {
@@ -135,6 +150,16 @@ pub fn main() !void {
         std.debug.print("PROBE_RESULT: HEADLESS_INIT_FAILED\n", .{});
         std.process.exit(2);
     }
+    // Every exit below goes through `closeWindow`, like the sibling
+    // probes. An earlier revision ended the success path with a raw
+    // `bgfx.shutdown()`, which skips `teardownSurface` while the capture
+    // framebuffer, its texture and the sprite programs are still live —
+    // shutting the device down under its own resources (#91 review).
+    var uploaded: ?gfx.Texture = null;
+    defer {
+        if (uploaded) |t| gfx.unloadTexture(t);
+        window.closeWindow();
+    }
     std.debug.print(
         "PROBE: renderer={s}  framebuffer={d}x{d}  design={d}x{d}\n",
         .{ @tagName(bgfx.getRendererType()), W, H, DESIGN_W, DESIGN_H },
@@ -151,6 +176,7 @@ pub fn main() !void {
     drawBackdrop(false);
     if (!readAll(window.headlessColorTexture())) {
         std.debug.print("PROBE_RESULT: READBACK_NOT_READY\n", .{});
+        teardown(uploaded);
         std.process.exit(3);
     }
     const fill_l = at(left, mid_y);
@@ -167,6 +193,7 @@ pub fn main() !void {
     drawBackdrop(true);
     if (!readAll(window.headlessColorTexture())) {
         std.debug.print("PROBE_RESULT: READBACK_NOT_READY\n", .{});
+        teardown(uploaded);
         std.process.exit(3);
     }
     const fit_l = at(left, mid_y);
@@ -183,6 +210,7 @@ pub fn main() !void {
                 "not measuring the fit)\n",
             .{},
         );
+        teardown(uploaded);
         std.process.exit(5);
     }
 
@@ -192,17 +220,22 @@ pub fn main() !void {
                 "left an edge uncovered)\n",
             .{},
         );
+        teardown(uploaded);
         std.process.exit(4);
     }
 
     // ── The SPRITE path, which is what a real backdrop uses ─────────────
     const tex = makeBackdropTexture() catch {
         std.debug.print("PROBE_RESULT: READBACK_NOT_READY (texture upload failed)\n", .{});
+        teardown(uploaded);
         std.process.exit(3);
     };
+    // Recorded so both the `defer` and the early-exit `teardown` unload it.
+    uploaded = tex;
     drawBackdropTextured(tex, false);
     if (!readAll(window.headlessColorTexture())) {
         std.debug.print("PROBE_RESULT: READBACK_NOT_READY\n", .{});
+        teardown(uploaded);
         std.process.exit(3);
     }
     const tex_l = at(left, mid_y);
@@ -217,9 +250,12 @@ pub fn main() !void {
                 "an unfitted backdrop sprite left an edge uncovered)\n",
             .{},
         );
+        teardown(uploaded);
         std.process.exit(4);
     }
 
     std.debug.print("PROBE_RESULT: SCREEN_FILL_COVERS\n", .{});
-    bgfx.shutdown();
+    // No raw `bgfx.shutdown()` here — the `defer` above unloads the
+    // texture and calls `window.closeWindow()`, which tears the surface
+    // down in the right order.
 }
