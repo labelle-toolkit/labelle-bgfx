@@ -524,6 +524,31 @@ pub fn build(b: *std.Build) void {
     const scprobe_step = b.step("surfaceless-scale-probe", "Run the surfaceless scale + unbound-view probe (#61)");
     scprobe_step.dependOn(&b.addRunArtifact(scprobe).step);
 
+    // ── screen_fill coverage probe (labelle-bgfx#42) ────────────────
+    // `zig build screen-fill-cover-probe` — renders a design-canvas-sized
+    // backdrop into a WIDER framebuffer with the fit disabled and reads the
+    // edges back, so the reported gap is measured rather than reasoned about.
+    const sfprobe = b.addExecutable(.{
+        .name = "screen_fill_cover_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/screen_fill_cover_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    sfprobe.root_module.addImport("zbgfx", zbgfx_mod);
+    sfprobe.root_module.addImport("gfx", gfx_mod);
+    sfprobe.root_module.addImport("window", window_mod);
+    sfprobe.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| sfprobe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        sfprobe.root_module.linkSystemLibrary("gdi32", .{});
+        sfprobe.root_module.linkSystemLibrary("user32", .{});
+    }
+    const sfprobe_step = b.step("screen-fill-cover-probe", "Run the screen_fill coverage probe (#42)");
+    sfprobe_step.dependOn(&b.addRunArtifact(sfprobe).step);
+
     // ── Material golden harness (labelle-gfx#305 Slice B, RFC §6) ────────────
     // `zig build material-golden`       — render the fixed flash + palette_swap
     //     scene headless and DIFF it against the committed golden TGA (CI gate).
