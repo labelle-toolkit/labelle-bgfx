@@ -111,6 +111,7 @@ const AndroidVideoDecoder = struct {
     extern fn AMediaFormat_delete(*Format) void;
 
     extern fn AMediaCodec_createDecoderByType(mime: [*:0]const u8) ?*Codec;
+    extern fn AMediaCodec_createCodecByName(name: [*:0]const u8) ?*Codec;
     extern fn AMediaCodec_configure(*Codec, fmt: *Format, surface: ?*anyopaque, crypto: ?*anyopaque, flags: u32) i32;
     extern fn AMediaCodec_start(*Codec) i32;
     extern fn AMediaCodec_stop(*Codec) i32;
@@ -155,6 +156,10 @@ const AndroidVideoDecoder = struct {
     const INFO_TRY_AGAIN: isize = -1;
     const INFO_FORMAT_CHANGED: isize = -2;
     const INFO_BUFFERS_CHANGED: isize = -3;
+    /// `media_status_t` errors are `AMEDIA_ERROR_BASE - n` (NdkMediaError.h).
+    /// A dequeue returning at or below this is a CODEC ERROR, not one of the
+    /// `INFO_*` "nothing yet" codes above — see `terminalCodecError`.
+    const AMEDIA_ERROR_BASE: isize = -10000;
     const FORMAT_YUV_420_888: i32 = 0x23; // AIMAGE_FORMAT_YUV_420_888
 
     // AMediaFormat keys.
@@ -304,15 +309,10 @@ const AndroidVideoDecoder = struct {
         if (AImageReader_getWindow(reader, &window_opt) != AMEDIA_OK) return error.DecoderInit;
         const window = window_opt orelse return error.DecoderInit;
 
-        const codec = AMediaCodec_createDecoderByType(mime) orelse return error.DecoderInit;
-        errdefer AMediaCodec_delete(codec);
         const cfg_fmt = AMediaExtractor_getTrackFormat(ex, track) orelse return error.DecoderInit;
         defer AMediaFormat_delete(cfg_fmt);
-        // Render into the ImageReader's surface (decoder normalizes its vendor
-        // format to YUV_420_888 by the time AImage exposes the planes).
-        if (AMediaCodec_configure(codec, cfg_fmt, @ptrCast(window), null, 0) != AMEDIA_OK)
-            return error.DecoderInit;
-        if (AMediaCodec_start(codec) != AMEDIA_OK) return error.DecoderInit;
+        const codec = startDecoder(mime, cfg_fmt, window) orelse return error.DecoderInit;
+        errdefer AMediaCodec_delete(codec);
 
         const uw: u32 = @intCast(@max(w, 0));
         const uh: u32 = @intCast(@max(h, 0));
@@ -342,6 +342,87 @@ const AndroidVideoDecoder = struct {
             return error.DecoderInit;
         };
         return .{ .st = st };
+    }
+
+    /// Create, configure and start a decoder for `mime` rendering into
+    /// `window`, trying candidates in order until one starts — the device's
+    /// default (hardware) decoder first, then the platform software decoders
+    /// by name. Null when none starts.
+    ///
+    /// The fallback is load-bearing, not defensive: some vendor OMX decoders
+    /// refuse to be configured against an `AImageReader` consumer at all.
+    /// MediaTek's `OMX.MTK.VIDEO.DECODER.AVC` answers `BadParameter` to every
+    /// output buffer count the framework proposes and `start` fails with
+    /// "Failed to allocate buffers after transitioning to IDLE" (labelle-bgfx#95;
+    /// the same `-22` is on record for ExoPlayer on stock MediaTek firmware,
+    /// google/ExoPlayer#10285). The system Gallery plays the same clip on the
+    /// same device, so it is the decoder/consumer pairing, not the file — and
+    /// `c2.android.avc.decoder` decodes 1080p24 in real time there with this
+    /// reader unchanged. Software decode is the whole intro on such devices;
+    /// without it the clip never plays anywhere on them.
+    ///
+    /// `debug.labelle.video.force_sw=1` (a system property) skips the hardware
+    /// candidate so the software path can be exercised on devices whose
+    /// hardware decoder works — the fallback must be TESTED, not trusted.
+    fn startDecoder(mime: [*:0]const u8, cfg_fmt: *Format, window: *Window) ?*Codec {
+        const force_sw = forceSoftwareDecoder();
+        if (force_sw) std.log.warn("video: {s} forcing the software decoder", .{FORCE_SW_PROP});
+
+        if (!force_sw) {
+            if (tryStart(AMediaCodec_createDecoderByType(mime), cfg_fmt, window)) |c| return c;
+            std.log.warn("video: the device's default decoder for {s} failed to configure/start — trying software decoders", .{mime});
+        }
+        for (softwareDecoderNames(mime)) |name| {
+            if (tryStart(AMediaCodec_createCodecByName(name), cfg_fmt, window)) |c| {
+                std.log.info("video: decoding {s} with {s}", .{ mime, name });
+                return c;
+            }
+        }
+        std.log.err("video: no decoder for {s} could be started", .{mime});
+        return null;
+    }
+
+    /// Configure + start one candidate; on failure the codec is deleted and
+    /// null returned so the caller moves on to the next.
+    fn tryStart(codec_opt: ?*Codec, cfg_fmt: *Format, window: *Window) ?*Codec {
+        const codec = codec_opt orelse return null;
+        // Render into the ImageReader's surface (decoder normalizes its vendor
+        // format to YUV_420_888 by the time AImage exposes the planes).
+        if (AMediaCodec_configure(codec, cfg_fmt, @ptrCast(window), null, 0) != AMEDIA_OK) {
+            AMediaCodec_delete(codec);
+            return null;
+        }
+        if (AMediaCodec_start(codec) != AMEDIA_OK) {
+            AMediaCodec_delete(codec);
+            return null;
+        }
+        return codec;
+    }
+
+    /// Platform software decoders for a MIME type, newest first: the Codec2
+    /// names (Android 10+, `media.swcodec`) then the OMX names older devices
+    /// ship. Unknown types have no software fallback.
+    fn softwareDecoderNames(mime: [*:0]const u8) []const [*:0]const u8 {
+        const m = std.mem.span(mime);
+        if (std.mem.eql(u8, m, "video/avc")) return &.{ "c2.android.avc.decoder", "OMX.google.h264.decoder" };
+        if (std.mem.eql(u8, m, "video/hevc")) return &.{ "c2.android.hevc.decoder", "OMX.google.hevc.decoder" };
+        if (std.mem.eql(u8, m, "video/x-vnd.on2.vp9")) return &.{ "c2.android.vp9.decoder", "OMX.google.vp9.decoder" };
+        if (std.mem.eql(u8, m, "video/x-vnd.on2.vp8")) return &.{ "c2.android.vp8.decoder", "OMX.google.vp8.decoder" };
+        return &.{};
+    }
+
+    const FORCE_SW_PROP = "debug.labelle.video.force_sw";
+    // bionic: `int __system_property_get(const char *name, char *value)`;
+    // `value` must hold PROP_VALUE_MAX (92) bytes. Returns the value length,
+    // 0 when unset.
+    extern fn __system_property_get(name: [*:0]const u8, value: [*]u8) c_int;
+
+    fn forceSoftwareDecoder() bool {
+        var buf: [92]u8 = undefined;
+        const n = __system_property_get(FORCE_SW_PROP, &buf);
+        if (n <= 0) return false;
+        const v = buf[0..@intCast(n)];
+        return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
     }
 
     /// Allocate the ring's tight plane buffers (Y = w*h, U/V = cw*ch per slot).
@@ -473,6 +554,10 @@ const AndroidVideoDecoder = struct {
             // buffer rather than being silently skipped).
             while (!st.input_done and cushionLoad(st) < RING_SIZE) {
                 const in_idx = AMediaCodec_dequeueInputBuffer(st.codec, 0);
+                if (in_idx <= AMEDIA_ERROR_BASE) {
+                    terminalCodecError(st, "input", in_idx);
+                    break;
+                }
                 if (in_idx < 0) break; // no free input buffer right now
                 const idx: usize = @intCast(in_idx);
                 var cap: usize = 0;
@@ -512,6 +597,10 @@ const AndroidVideoDecoder = struct {
                 if (out_idx == INFO_FORMAT_CHANGED) {
                     refreshFormat(st);
                     continue;
+                }
+                if (out_idx <= AMEDIA_ERROR_BASE) {
+                    terminalCodecError(st, "output", out_idx);
+                    break;
                 }
                 if (out_idx < 0) break; // no decoded output ready right now
                 if (info.flags & FLAG_EOS != 0) {
@@ -562,6 +651,22 @@ const AndroidVideoDecoder = struct {
                 _ = usleep(2000); // idle: back off briefly
             } else pending_dry = 0;
         }
+    }
+
+    /// A codec that reports an ERROR from a dequeue is done: it will never
+    /// produce EOS, so treating the error as "nothing yet" (what `< 0` alone
+    /// does) would spin here forever with `eof()` false — the clip freezes on
+    /// its last frame and a play-once video never finishes. End the stream
+    /// instead: what is already in the ring still plays out, then `eof()`
+    /// fires and the engine hands off exactly as on a normal end of clip.
+    fn terminalCodecError(st: *State, side: []const u8, code: isize) void {
+        lock(&st.mutex);
+        defer st.mutex.unlock();
+        if (st.eof_seen) return; // already ending (EOS or an earlier error)
+        std.log.err("video: codec error {d} on {s} dequeue — ending the stream", .{ code, side });
+        st.input_done = true;
+        st.eof_seen = true;
+        st.pending = 0; // frames the dead codec still owed will never arrive
     }
 
     fn imageTimestamp(img: *Image) f64 {
