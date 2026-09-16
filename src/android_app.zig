@@ -269,6 +269,10 @@ extern fn AKeyEvent_getKeyCode(event: *AInputEvent) i32;
 // is the normalized UI scale (a 320dpi phone → 2.0, the 213dpi P42 → ~1.33).
 // Linked from libandroid, same as the input/window symbols above.
 extern fn AConfiguration_getDensity(config: *AConfiguration) i32;
+// Two distinct "no usable density" sentinels, and BOTH have to be rejected:
+// they are ordinary positive i32 values, so a `> 0` test lets them through
+// and `density / 160` then yields ~409, not the 1.0 a caller expects.
+const ACONFIGURATION_DENSITY_ANY: i32 = 0xfffe;
 const ACONFIGURATION_DENSITY_NONE: i32 = 0xffff;
 
 // ── Shell state ─────────────────────────────────────────────────────
@@ -352,11 +356,17 @@ var app_ptr: ?*android_app = null;
 /// `dp` baseline). Exported as a C symbol so `window.displayScale()` can bind
 /// it `extern "c"`. Returns 1.0 before `run` has stashed the app or if the
 /// density is unknown, so callers always get a sane factor.
+///
+/// "Unknown" is TWO sentinels, `DENSITY_ANY` (0xfffe) and `DENSITY_NONE`
+/// (0xffff). Guarding only `NONE` let `ANY` through as a real bucket and
+/// returned ~409.59 — the consumer's viewport cap hides that on a short
+/// screen (it takes the min of density and height/reference), but a tall
+/// one would jump straight to the maximum scale.
 export fn labelle_bgfx_display_scale() callconv(.c) f32 {
     const app = app_ptr orelse return 1.0;
     const config = app.config orelse return 1.0;
     const density = AConfiguration_getDensity(config);
-    if (density <= 0 or density == ACONFIGURATION_DENSITY_NONE) return 1.0;
+    if (density <= 0 or density == ACONFIGURATION_DENSITY_ANY or density == ACONFIGURATION_DENSITY_NONE) return 1.0;
     return @as(f32, @floatFromInt(density)) / 160.0;
 }
 
