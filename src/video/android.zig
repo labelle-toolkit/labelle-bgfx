@@ -659,6 +659,11 @@ const AndroidVideoDecoder = struct {
     /// its last frame and a play-once video never finishes. End the stream
     /// instead: what is already in the ring still plays out, then `eof()`
     /// fires and the engine hands off exactly as on a normal end of clip.
+    ///
+    /// `pending` is left alone: it counts frames already RELEASED to the
+    /// reader, not frames the codec still owes, so they can still be acquired
+    /// and shown. Any that never surface are written off by the worker's
+    /// dry-drain failsafe once `eof_seen` is set, the same as after a normal EOS.
     fn terminalCodecError(st: *State, side: []const u8, code: isize) void {
         lock(&st.mutex);
         defer st.mutex.unlock();
@@ -666,7 +671,6 @@ const AndroidVideoDecoder = struct {
         std.log.err("video: codec error {d} on {s} dequeue — ending the stream", .{ code, side });
         st.input_done = true;
         st.eof_seen = true;
-        st.pending = 0; // frames the dead codec still owed will never arrive
     }
 
     fn imageTimestamp(img: *Image) f64 {
