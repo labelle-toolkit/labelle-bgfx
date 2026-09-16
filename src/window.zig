@@ -28,6 +28,12 @@ const gui_enabled = @import("build_options").gui_enabled;
 /// non-imgui build never references the (then-undefined) symbol.
 const imgui = if (gui_enabled) struct {
     extern fn imgui_bridge_invalidate_textures() void;
+    // The bridge's display-override setter. Zero `w`/`h` leave the bridge on its
+    // own backbuffer stats; the `dpi` slot carries `displayScale()` so scripts
+    // can size UI density-aware (labelle-bgfx#93). Every pinned bridge already
+    // exports this symbol (the sokol one consumed `dpi` from day one), so the
+    // call links against older labelle-imgui too — it just ignored the value.
+    extern fn imgui_bridge_set_dims(w: i32, h: i32, dpi: f32) void;
 } else struct {};
 
 /// Android has no GLFW (zglfw is desktop-only). The Android windowing
@@ -158,6 +164,33 @@ pub fn height() i32 {
     return framebufferSize()[1];
 }
 
+/// Normalized display scale — the OS "UI scale" where 1.0 == a standard-density
+/// screen — for density-aware UI sizing (labelle-bgfx#93). A control sized
+/// against a 1.0 reference renders at a consistent PHYSICAL size on every
+/// device, unlike `framebufferSize()`, where two screens with the same pixel
+/// count but different DPI would drive very different UI. Per platform:
+///   * Desktop — GLFW window content scale (1.0 / 1.5 / 2.0…), the OS setting.
+///   * Android — the display density bucket / 160 (Android's `dp` baseline).
+///   * Wasm    — `window.devicePixelRatio`.
+/// Always returns a sane factor: 1.0 whenever the platform value is missing or
+/// nonsensical (no window yet, unknown density, etc.).
+pub fn displayScale() f32 {
+    if (is_wasm) {
+        const r = em.emscripten_get_device_pixel_ratio();
+        return if (r > 0) @floatCast(r) else 1.0;
+    }
+    if (is_android) {
+        const s = labelle_bgfx_display_scale();
+        return if (s > 0) s else 1.0;
+    }
+    if (glfw_window) |win| {
+        // x and y content scale match on every real display; use y.
+        const cs = win.getContentScale();
+        return if (cs[1] > 0) cs[1] else 1.0;
+    }
+    return 1.0;
+}
+
 /// The physical framebuffer size of the render surface.
 ///
 /// On Android there's no GLFW; query the live `ANativeWindow` size (physical)
@@ -192,6 +225,9 @@ fn framebufferSize() [2]i32 {
 /// emcc resolves these symbols at link time. Only referenced on wasm.
 const em = struct {
     extern "c" fn emscripten_get_canvas_element_size(target: [*:0]const u8, width: *c_int, height: *c_int) c_int;
+    // `window.devicePixelRatio` — the browser's CSS-px-to-physical ratio, which
+    // encodes DPI and page zoom (the wasm analogue of the OS UI scale).
+    extern "c" fn emscripten_get_device_pixel_ratio() f64;
 };
 
 /// NDK `ANativeWindow` size queries (libandroid, which the Android build links
@@ -239,6 +275,13 @@ fn androidSurfaceSize() [2]i32 {
 fn liveOrCached(live: [2]i32, cached: [2]i32) [2]i32 {
     return if (live[0] > 0 and live[1] > 0) live else cached;
 }
+
+// The Android density scale, exported by the NativeActivity shell
+// (`android_app.zig`) as a C symbol so this module reaches it without importing
+// the shell (which would cycle — the shell imports `input`, and so does this).
+// Only referenced in the `is_android` branch of `displayScale`, so desktop/wasm
+// never link it.
+extern fn labelle_bgfx_display_scale() f32;
 
 /// Reconcile the bgfx backbuffer with the current physical framebuffer size.
 ///
@@ -1347,6 +1390,10 @@ pub fn beginFrame() void {
     // runs every frame uniformly so HiDPI changes are picked up without a
     // dedicated resize callback.
     ensureSurface();
+    // Hand the bridge this frame's display scale (density can change at runtime:
+    // window dragged to another monitor, fold, external display). Cheap: two
+    // stores on the bridge side.
+    if (comptime gui_enabled) imgui.imgui_bridge_set_dims(0, 0, displayScale());
     // Reset the per-frame transient post-fx view cursor (labelle-gfx#305) at the
     // frame boundary, so each frame's post-fx passes reuse the same small view band
     // (submit order == bgfx execution order) and it never exhausts across frames.
@@ -1471,6 +1518,15 @@ test {
     // `screen_shot` arity a stale zbgfx binding got wrong, labelle-bgfx#61)
     // would compile and never run.
     _ = bgfx_callback;
+}
+
+test "displayScale always yields a positive factor, 1.0 with no window (labelle-bgfx#93)" {
+    // Referenced from a test so every target's compile-check (desktop, the
+    // aarch64-linux-android object check) analyzes the platform branches.
+    // On the host with no GLFW window open the fallback must be exactly 1.0.
+    const s = displayScale();
+    try testing.expect(s > 0);
+    if (!is_android and !is_wasm and glfw_window == null) try testing.expectEqual(@as(f32, 1.0), s);
 }
 
 test "window advertises the surface-loss capability via the paired contract hooks" {
