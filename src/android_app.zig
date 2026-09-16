@@ -264,6 +264,13 @@ extern fn AMotionEvent_getAxisValue(event: *AInputEvent, axis: i32, pointer_inde
 extern fn AKeyEvent_getAction(event: *AInputEvent) i32;
 extern fn AKeyEvent_getKeyCode(event: *AInputEvent) i32;
 
+// `<android/configuration.h>` — the density bucket in dpi (160, 240, 320,
+// 420, 480, 560, 640…). 160 is Android's `dp` baseline, so `density / 160`
+// is the normalized UI scale (a 320dpi phone → 2.0, the 213dpi P42 → ~1.33).
+// Linked from libandroid, same as the input/window symbols above.
+extern fn AConfiguration_getDensity(config: *AConfiguration) i32;
+const ACONFIGURATION_DENSITY_NONE: i32 = 0xffff;
+
 // ── Shell state ─────────────────────────────────────────────────────
 // `bgfx_ready` guards the per-frame tick: we only draw once the surface
 // exists and bgfx is initialized (between INIT_WINDOW and TERM_WINDOW).
@@ -333,6 +340,25 @@ fn focusHook(activity: *ANativeActivity, has_focus: c_int) callconv(.c) void {
 //     `input`, so `input` can't import the shell back — exactly how the sokol
 //     adapter reaches sokol_app's `sapp_android_get_native_activity()`.
 var native_activity: ?*ANativeActivity = null;
+
+// Stashed from `run` so `labelle_bgfx_display_scale` can read the live
+// `app.config` (density can change — external display, fold). Same
+// C-symbol-bridge shape as `native_activity`, so `window.zig` reaches the
+// density without importing this shell module (which would cycle: the shell
+// imports `input`, and `window` imports `input`).
+var app_ptr: ?*android_app = null;
+
+/// Normalized display scale on Android: the density bucket / 160 (Android's
+/// `dp` baseline). Exported as a C symbol so `window.displayScale()` can bind
+/// it `extern "c"`. Returns 1.0 before `run` has stashed the app or if the
+/// density is unknown, so callers always get a sane factor.
+export fn labelle_bgfx_display_scale() callconv(.c) f32 {
+    const app = app_ptr orelse return 1.0;
+    const config = app.config orelse return 1.0;
+    const density = AConfiguration_getDensity(config);
+    if (density <= 0 or density == ACONFIGURATION_DENSITY_NONE) return 1.0;
+    return @as(f32, @floatFromInt(density)) / 160.0;
+}
 
 /// Optional per-frame tick callback, set by the game's entry before it
 /// hands control to the shell. Called once per loop iteration while the
@@ -657,6 +683,9 @@ pub fn run(app: *android_app) void {
     // immersive-mode helper calls (see `native_activity` above). The glue
     // has populated `app.activity` by the time it calls us.
     native_activity = app.activity;
+    // Same for the app itself, so `labelle_bgfx_display_scale` can read the
+    // live `app.config` density.
+    app_ptr = app;
 
     // Chain `onWindowFocusChanged` so the engine's immersive re-hide runs
     // on the UI thread (the only thread `WindowInsetsController.hide()` is
