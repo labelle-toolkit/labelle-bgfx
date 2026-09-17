@@ -18,6 +18,9 @@
 //!   D  scaling + independence ............. the same reservoir at native 1x, 2x
 //!      and 4x nearest enlargement, then TWO INDEPENDENT reservoirs (their own
 //!      masks, reflections, colours, levels and ripples) drawn back to back
+//!   E  ATLAS sub-rect ..................... the same reservoir drawn from a
+//!      STANDALONE texture and from an offset frame inside a larger atlas
+//!      sheet, so `u_water_rect` is exercised at something other than (0,0,1,1)
 //!
 //! FIXTURE CAVEAT: the real COND-07 condenser artwork is NOT in this repository
 //! (`docs/issue-references/condenser-100/` does not exist here), so every
@@ -29,14 +32,19 @@
 //! Beyond the image diff, the capture is checked for two SEMANTIC invariants
 //! that a value-only golden would happily bless away (both run in bless mode
 //! too, so a regression can never be blessed in):
-//!   * an EXPIRED ripple must render bit-identically to no ripple at all, and
-//!   * a live entry parked past `ripple_count` must be ignored entirely.
+//!   * an EXPIRED ripple must render bit-identically to no ripple at all,
+//!   * a live entry parked past `ripple_count` must be ignored entirely, and
+//!   * an ATLAS sub-rect frame must render bit-identically to the same art in a
+//!     standalone texture (the `u_water_rect` remap is a coordinate change, not
+//!     a different effect) — the check that actually gives the atlas path teeth.
 //! Each is a pair of tiles drawn with identical parameters except the thing
 //! under test, compared region-for-region in the captured framebuffer.
 //!
 //! Modes, exit codes and tolerance match `material_golden.zig` exactly, plus one:
 //!   0 = OK · 2 = HEADLESS_INIT_FAILED · 3 = CAPTURE_FAILED ·
-//!   4 = GOLDEN_MISMATCH · 5 = GOLDEN_MISSING · 6 = SEMANTIC_MISMATCH
+//!   4 = GOLDEN_MISMATCH · 5 = GOLDEN_MISSING · 6 = SEMANTIC_MISMATCH ·
+//!   7 = PIXEL_WATER_UNSUPPORTED (the water program did not link here, so the
+//!       scene is the static fallback — captured or blessed, it would be a lie)
 //!
 //! Run with:  zig build pixel-water-golden        (check)
 //!            zig build pixel-water-golden-bless  (regenerate)
@@ -48,7 +56,7 @@ const window = @import("window");
 const options = @import("golden_options");
 
 const W: u16 = 720;
-const H: u16 = 320;
+const H: u16 = 400;
 
 /// Reservoir size in NATIVE ART PIXELS. Origin top-left, +X right, +Y down.
 const LW: u32 = 32;
@@ -200,9 +208,51 @@ fn makeReflectionBands(w: u32, h: u32) gfx.DecodedImage {
     return .{ .pixels = px, .width = w, .height = h };
 }
 
+/// The reservoir art embedded as ONE FRAME inside a larger atlas sheet, at
+/// offset (`LW`, `LH`) in a 3x3-frame sheet. Every other frame is filled with a
+/// garish magenta so any mis-mapped UV shows up instantly rather than sampling
+/// something plausible. Drawn with `atlas_rect` below, this must render exactly
+/// like the standalone art — that is what `u_water_rect` is for.
+fn makeAtlasSheet(w: u32, h: u32) gfx.DecodedImage {
+    const sw = w * 3;
+    const sh = h * 3;
+    const px = alloc(sw * sh * 4);
+    const art = makeReservoirArt(w, h);
+    defer std.heap.page_allocator.free(art.pixels);
+    var y: u32 = 0;
+    while (y < sh) : (y += 1) {
+        var x: u32 = 0;
+        while (x < sw) : (x += 1) {
+            const o = (y * sw + x) * 4;
+            if (x >= w and x < w * 2 and y >= h and y < h * 2) {
+                const src_o = ((y - h) * w + (x - w)) * 4;
+                px[o] = art.pixels[src_o];
+                px[o + 1] = art.pixels[src_o + 1];
+                px[o + 2] = art.pixels[src_o + 2];
+                px[o + 3] = art.pixels[src_o + 3];
+            } else {
+                px[o] = 255;
+                px[o + 1] = 0;
+                px[o + 2] = 255;
+                px[o + 3] = 255;
+            }
+        }
+    }
+    return .{ .pixels = px, .width = sw, .height = sh };
+}
+
 // ── Scene ────────────────────────────────────────────────────────────────────
 
 const src_rect = gfx.Rectangle{ .x = 0, .y = 0, .width = @floatFromInt(LW), .height = @floatFromInt(LH) };
+/// The centre frame of `makeAtlasSheet`'s 3x3 sheet: a NON-trivial source rect,
+/// so `u_water_rect` is (1/3, 1/3, 2/3, 2/3) rather than the degenerate
+/// (0, 0, 1, 1) every other tile produces.
+const atlas_rect = gfx.Rectangle{
+    .x = @floatFromInt(LW),
+    .y = @floatFromInt(LH),
+    .width = @floatFromInt(LW),
+    .height = @floatFromInt(LH),
+};
 const origin = gfx.Vector2{ .x = 0, .y = 0 };
 
 const deep = gfx.PixelWaterRgba{ .r = 0.055, .g = 0.106, .b = 0.129, .a = 1.0 };
@@ -259,6 +309,7 @@ fn renderScene() void {
     const mask_hole = gfx.uploadTextureFiltered(makeMask(LW, LH, true), .point) catch unreachable;
     const refl = gfx.uploadTextureFiltered(makeReflectionBars(LW, LH), .point) catch unreachable;
     const refl2 = gfx.uploadTextureFiltered(makeReflectionBands(LW, LH), .point) catch unreachable;
+    const sheet = gfx.uploadTextureFiltered(makeAtlasSheet(LW, LH), .point) catch unreachable;
 
     const m = mask.id.toInt();
     const mh = mask_hole.id.toInt();
@@ -404,6 +455,20 @@ fn renderScene() void {
         w_d5.highlight = .{ .r = 0.90, .g = 0.75, .b = 0.45, .a = 0.5 };
         gfx.drawTextureProPixelWater(art2, src_rect, tile(xs[4], 248, 4), origin, 0, gfx.white, w_d5);
 
+        // ── Row E: the atlas sub-rect (`u_water_rect`) ───────────────────────
+        // E1/E2 — the SAME reservoir, first from a standalone LWxLH texture
+        // (u_water_rect = (0,0,1,1)) and then from the centre frame of a 3x3
+        // atlas sheet (u_water_rect = (1/3,1/3,2/3,2/3)). Everything else — the
+        // mask, the reflection, the level, the time, the ripples — is identical,
+        // so the remap from atlas UV to reservoir-local art pixels is the ONLY
+        // variable. The two tiles must come out bit-identical; `semanticChecksPass`
+        // asserts exactly that, in bless mode too. Without this the atlas path
+        // would be dead code in the capture: every other tile's source rect is
+        // the whole texture.
+        const w_e = baseWater(m, r);
+        gfx.drawTextureProPixelWater(art, src_rect, tile(xs[0], 328, 4), origin, 0, gfx.white, w_e);
+        gfx.drawTextureProPixelWater(sheet, atlas_rect, tile(xs[1], 328, 4), origin, 0, gfx.white, w_e);
+
         window.endFrame();
     }
 }
@@ -442,6 +507,12 @@ fn semanticChecksPass(tga: []const u8) bool {
         std.debug.print("GOLDEN: SEMANTIC — a ripple past `ripple_count` was read (entries past the count must be ignored)\n", .{});
         ok = false;
     }
+    // An ATLAS sub-rect is a coordinate change, not a different effect: E2 (the
+    // centre frame of a 3x3 sheet) must equal E1 (the same art standalone).
+    if (!regionsEqual(tga, 8, 328, 152, 328, 128, 64)) {
+        std.debug.print("GOLDEN: SEMANTIC — the atlas sub-rect tile differs from the standalone tile (`u_water_rect` remap is wrong)\n", .{});
+        ok = false;
+    }
     return ok;
 }
 
@@ -472,10 +543,18 @@ pub fn main() !void {
 
     // The whole point of the capture is that the WATER program ran. If it failed
     // to link on this renderer every tile silently degrades to the static art —
-    // which is the correct runtime behaviour but a useless golden, so say so
-    // loudly rather than blessing a fallback capture.
+    // which is the correct runtime behaviour but a useless golden. The check
+    // must run AFTER renderScene(): `materialSupported(.pixel_water)` never
+    // forces a program build, so before the first water draw it answers the
+    // optimistic "bgfx implements this".
     if (!gfx.materialSupported(.pixel_water)) {
-        std.debug.print("GOLDEN: WARNING — pixel_water reported UNSUPPORTED; the scene is the static fallback\n", .{});
+        // FAIL, do not warn: in bless mode a warning would let the static-sprite
+        // fallback be written over the committed golden, and because every
+        // fallback tile is identical where the semantic checks expect equality,
+        // those checks would pass too and the run would report BLESSED.
+        std.debug.print("GOLDEN_RESULT: PIXEL_WATER_UNSUPPORTED\n", .{});
+        window.closeWindow();
+        std.process.exit(7);
     }
 
     const out_base = if (bless) GOLDEN_BASE else CANDIDATE_BASE;

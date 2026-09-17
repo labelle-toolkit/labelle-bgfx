@@ -44,20 +44,32 @@ and [`labelle-android-gamepad`](https://github.com/labelle-toolkit/labelle-andro
 
 ## Material seam (curated per-draw effects, labelle-gfx#305)
 
-bgfx implements the P1 curated material effects `flash` and `palette_swap` (the
-optional `drawTextureProMaterial` / `materialSupported` contract decls in
-labelle-core). Both are authored the same way as the GPU-YUV video one-off: a
-`.sc` fragment shader (`src/shaders/fs_flash.sc`, `fs_palette.sc`) compiled by
-bgfx `shaderc` to per-renderer bytecode (Metal / SPIR-V / GLSL / ESSL) embedded
-in `src/shaders.zig`, built into a program alongside the sprite program
-(`src/gfx/programs.zig`). Effects the backend does not implement (`dissolve`,
-`outline`) degrade to a plain sprite. See `RFC-MATERIAL-POSTFX.md` (labelle-gfx).
+bgfx implements the whole curated material set — `flash`, `palette_swap`,
+`dissolve` and `outline` through the optional `drawTextureProMaterial` /
+`materialSupported` contract decls in labelle-core, plus `pixel_water` through
+its own `drawTextureProPixelWater` decl and its own program (see "Pixel water"
+below). Every one is authored the same way as the GPU-YUV video one-off: a `.sc`
+fragment shader (`src/shaders/fs_flash.sc`, `fs_palette.sc`, `fs_dissolve.sc`,
+`fs_outline.sc`, `fs_pixel_water.sc`) compiled by bgfx `shaderc` to per-renderer
+bytecode (Metal / SPIR-V / GLSL / ESSL) embedded in `src/shaders.zig`, built into
+a program alongside the sprite program (`src/gfx/programs.zig`). Nothing here is
+unimplemented; the only degrade-to-a-plain-sprite path left is a RENDERER-SPECIFIC
+program failure (or a missing required input, below), and it degrades ONLY the
+affected effect. See `RFC-MATERIAL-POSTFX.md` (labelle-gfx).
 
 - **flash** — mixes the sprite texel toward an rgba colour by `amount`
   (`MaterialUniforms.scalar0`), preserving alpha (the GPU hit-flash).
 - **palette_swap** — recolours a shared atlas: the texel's red channel is a
   palette index looked up in a LUT ramp bound from `MaterialUniforms.aux_texture`
   (`aux_count` entries). A zero/dead LUT handle degrades to a plain sprite.
+- **dissolve** — threshold-based burn-away. Its noise texture is optional: no
+  `aux_texture` (or a dead handle) falls back to built-in procedural noise, so
+  this effect never degrades to a plain sprite.
+- **outline** — composites a coloured border around the sprite's alpha edge.
+- **pixel_water** — the COND-07 reactive reservoir (#100), its own draw path and
+  program; a missing mask, or a renderer that will not link `fs_pixel_water`,
+  degrades to the authored static sprite and flips
+  `materialSupported(.pixel_water)` to false.
 
 ### Regenerating the material shaders
 
@@ -165,11 +177,15 @@ optional**: it is what WebGL2 and Android GLES select.
 `src/pixel_water_golden.zig` renders a fixed-simulation-time matrix — fill levels,
 the waves flag, ripple start/mid/expired, edge impacts, a live entry parked past
 `ripple_count`, masked-out pixels, zero amplitude, a one-native-pixel displacement,
-a coarse grid, native/2x/4x nearest scaling and two independent reservoirs — into
-its **own** golden (`test/golden/pixel_water.tga`), never the material one. It also
-asserts two semantic invariants region-for-region (expired ripple == no ripple; a
-ripple past the count == ignored) in check **and** bless mode, so a regression
-cannot be blessed in. Regenerate with `zig build pixel-water-golden-bless`.
+a coarse grid, native/2x/4x nearest scaling, two independent reservoirs and an
+ATLAS sub-rect frame — into its **own** golden (`test/golden/pixel_water.tga`),
+never the material one. It also asserts three semantic invariants region-for-region
+(expired ripple == no ripple; a ripple past the count == ignored; an atlas
+sub-rect frame == the same art standalone) in check **and** bless mode, so a
+regression cannot be blessed in. If the water program does not link on the
+capturing machine the run exits `7` (`PIXEL_WATER_UNSUPPORTED`) instead of
+capturing — a static-fallback scene must never reach the golden, least of all
+through bless mode. Regenerate with `zig build pixel-water-golden-bless`.
 
 > **Fixture caveat.** The real COND-07 artwork is not in this repository, so the
 > golden's mask, reflection and reservoir art are small procedural stand-ins. They

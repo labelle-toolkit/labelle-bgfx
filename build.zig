@@ -280,7 +280,7 @@ pub fn build(b: *std.Build) void {
     // proof). No production code depends on it: gfx deps `labelle-core`, bgfx deps
     // `labelle-core`, and labelle-gfx is BACKEND-AGNOSTIC (deps core, NOT bgfx), so
     // there is no dependency cycle. We MUST override labelle-gfx's own
-    // `labelle-core` onto bgfx's `core_mod` (both pin v1.26.0, identical hash) so
+    // `labelle-core` onto bgfx's `core_mod` (their own pins need not match) so
     // the diamond unifies at the SOURCE level — otherwise `PostPass`/`RenderTargetId`
     // from gfx's core instance would not type-check against the bgfx backend's core
     // instance and `PostFxDriver(gfx_backend)` wouldn't compile. Desktop only (the

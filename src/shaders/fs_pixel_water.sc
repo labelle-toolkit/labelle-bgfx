@@ -109,11 +109,15 @@ float waterQuant(float v, float g)
 
 void main()
 {
-	// The sprite's own art, straight-alpha and tinted, exactly as fs_sprite
-	// produces it. This is the BASE the water composites over, so the authored
-	// reservoir art remains visible above the surface line and outside the mask
-	// (and a level of 0 reduces this shader to a plain sprite draw).
-	vec4 base = texture2D(s_tex, v_texcoord0) * v_color0;
+	// The sprite's own art, straight-alpha, with the vertex tint's COLOUR applied
+	// exactly as fs_sprite does. This is the BASE the water composites over, so
+	// the authored reservoir art remains visible above the surface line and
+	// outside the mask (and a level of 0 reduces this shader to a plain sprite
+	// draw). The tint's ALPHA is deliberately held back until after compositing —
+	// see the over-operator below.
+	vec4 art = texture2D(s_tex, v_texcoord0);
+	vec3 base_rgb = art.rgb * v_color0.rgb;
+	float base_a = art.a;
 
 	// Atlas UV -> sprite-local 0..1 -> logical art pixels (+Y down).
 	vec2 span = max(u_water_rect.zw - u_water_rect.xy, vec2(1e-6, 1e-6));
@@ -222,12 +226,17 @@ void main()
 	// would multiply the water by (1 - 1) and render nothing at all.
 	//     comp_a   = Aw + Ab*(1-Aw)
 	//     comp_pre = Cw*Aw + Cb*Ab*(1-Aw)
-	// The tint fade applies to the water too, so tint.a = 0 hides art and water
-	// together, and a level of 0 (coverage 0) reduces exactly to `base`.
-	float water_a = coverage * body_a * v_color0.a;
-	float comp_a = water_a + base.a * (1.0 - water_a);
-	vec3 comp_pre = water_rgb * water_a + base.rgb * base.a * (1.0 - water_a);
+	// Both alphas here are INTRINSIC (the art's own texel alpha, the water's own
+	// coverage x body alpha): the vertex tint's alpha is applied ONCE, to the
+	// finished composite. Folding it into both layers instead would apply it
+	// twice — an opaque half-faded sprite would come out at t + t*(1-t) (0.75 for
+	// t = 0.5) rather than t, so a fading reservoir would stay visibly too solid.
+	// tint.a = 0 still hides art and water together, and a level of 0
+	// (coverage 0) still reduces exactly to the plain tinted sprite.
+	float water_a = coverage * body_a;
+	float comp_a = water_a + base_a * (1.0 - water_a);
+	vec3 comp_pre = water_rgb * water_a + base_rgb * base_a * (1.0 - water_a);
 	vec3 comp_rgb = comp_a > 0.0 ? comp_pre / comp_a : vec3(0.0, 0.0, 0.0);
 
-	gl_FragColor = vec4(comp_rgb, comp_a);
+	gl_FragColor = vec4(comp_rgb, comp_a * v_color0.a);
 }
