@@ -845,6 +845,18 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(planes_run).step);
 
+    // Browser video geometry (`video/web.zig`) plus the fit-rect math it shares
+    // (`video/fit.zig`): pure Zig, host-run. The EM_JS externs are never
+    // referenced by these tests, so nothing needs the browser to link.
+    const web_video_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/video/web.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(web_video_run).step);
+
     // ── Compile-check window.zig (+ input.zig via its import) ───────
     // window.zig does the real comptime dispatch on builtin.target — both
     // the per-OS desktop branches and the Android `is_android` path — so
@@ -1194,6 +1206,9 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // wasm build needs it too, since `gfx/font.zig` is part of gfx_mod on
     // every target.
     gfx_mod.addCSourceFile(.{ .file = b.path("src/stb_truetype_impl.c"), .flags = &.{} });
+    // Browser video (`video/web_backend.zig`): the EM_JS half that drives a
+    // muted `<video>` element. wasm-only; emcc links the JS bodies at the end.
+    gfx_mod.addCSourceFile(.{ .file = b.path("src/video/web_video.c"), .flags = &.{} });
 
     // ── Input backend module ────────────────────────────────────────
     // No zglfw / no sdl_gamepad (both desktop-only) — src/input.zig comptime-gates
