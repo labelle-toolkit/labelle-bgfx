@@ -180,6 +180,16 @@ void main()
 	float offset = waterQuant(wave + ripple, grid);
 	float surface = surface_y + offset;
 
+	// FULL-LEVEL ENDPOINT. At level 1 the base surface IS the top edge
+	// (surface_y == 0), so a POSITIVE displacement would push it below the top
+	// logical row and `step(surface, cell.y)` would fail for every cell whose
+	// centre sits above it — dry holes in a reservoir that is, by definition,
+	// completely full. Clamp the displaced surface so at level 1 it can never
+	// sit below the endpoint; a negative offset (a crest above the top edge)
+	// still passes through and is harmless, and every level below 1 is
+	// untouched, so the wave keeps its full travel there.
+	surface = mix(surface, min(surface, surface_y), step(1.0 - 1e-6, level));
+
 	// Silhouette mask, sampled at the cell centre in reservoir-local UV.
 	// Coverage = alpha x max(rgb) so a white-on-transparent mask and a
 	// white-on-black mask both read as "interior".

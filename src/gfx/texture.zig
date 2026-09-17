@@ -534,17 +534,54 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
 /// sync with `programs.submitMaterialTriangles`'s effect switch,
 /// `programs.submitPixelWaterTriangles` + the `.material_effects` capability
 /// manifests.
+///
+/// `pixel_water` is reached BY NAME rather than as a literal switch prong. A
+/// generated game's build replaces this module's `labelle-core` with the APP's
+/// core (`build_fragments/backend_dep.txt` — `overrideImport(backend_gfx,
+/// "labelle-core", core_mod)`), so the `MaterialEffect` this compiles against is
+/// the app's, not this repo's pin. On an app core older than v1.32 that enum has
+/// no `.pixel_water` member, and a literal prong would make THIS function — which
+/// every sprite draw reaches through `core.Backend(Impl).materialSupported`
+/// (labelle-gfx `retained_engine/draw.zig`) — fail to compile there. A backend
+/// must degrade against an older app core, never break its build; the water path
+/// is simply invisible to a core that has no name for it. Verified by generating
+/// `examples/bgfx` against core v1.28.0.
 pub fn materialSupported(effect: MaterialEffect) bool {
+    // `pixel_water` (#100) is the ONE effect whose support is not implied by
+    // `drawTextureProMaterial`: it rides its own `drawTextureProPixelWater` decl,
+    // and the contract additionally requires this to go false once the water
+    // program has failed to build on THIS renderer. `waterProgramAvailable`
+    // reports exactly that (and never forces a build — see programs.zig).
+    if (@hasField(MaterialEffect, "pixel_water")) {
+        if (effect == @field(MaterialEffect, "pixel_water")) return programs.waterProgramAvailable();
+    }
     return switch (effect) {
         .flash, .palette_swap, .dissolve, .outline => true,
-        // `pixel_water` (#100) is the ONE effect whose support is not implied by
-        // `drawTextureProMaterial`: it rides its own `drawTextureProPixelWater`
-        // decl, and the contract additionally requires this to go false once the
-        // water program has failed to build on THIS renderer. `waterProgramAvailable`
-        // reports exactly that (and never forces a build — see programs.zig).
-        .pixel_water => programs.waterProgramAvailable(),
-        .none => false,
+        // `.none` (the no-material fast path), plus `.pixel_water` on a core that
+        // has it — handled above, so this prong is never its answer.
+        else => false,
     };
+}
+
+// Exhaustiveness tripwire for the two `MaterialEffect` switches above and in
+// `programs.programForEffect`. Both had to give up their exhaustive prong lists
+// so an older app core still compiles (see `materialSupported`), which would
+// otherwise mean a NEW curated effect landing in labelle-core silently reads as
+// "unsupported" here instead of failing the build. This puts that failure back.
+comptime {
+    for (std.enums.values(MaterialEffect)) |eff| {
+        const name = @tagName(eff);
+        const known = std.mem.eql(u8, name, "none") or
+            std.mem.eql(u8, name, "flash") or
+            std.mem.eql(u8, name, "palette_swap") or
+            std.mem.eql(u8, name, "dissolve") or
+            std.mem.eql(u8, name, "outline") or
+            std.mem.eql(u8, name, "pixel_water");
+        if (!known) @compileError(
+            "bgfx: labelle-core gained MaterialEffect." ++ name ++
+                " — handle it in texture.materialSupported and programs.programForEffect",
+        );
+    }
 }
 
 /// Material-aware sprite draw — the bgfx impl of labelle-core's optional

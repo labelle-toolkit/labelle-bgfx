@@ -384,20 +384,31 @@ fn buildMaterialProgram(fs_data: []const u8) bgfx.ProgramHandle {
 }
 
 /// The material program backing `effect` (invalid sentinel for `none`/unbuilt).
+///
+/// `pixel_water` is matched BY NAME, not as a literal prong, for the same reason
+/// as `texture.materialSupported`: a generated game overrides this module's
+/// `labelle-core` with the app's, and an app core older than v1.32 has no
+/// `.pixel_water` member to name. See the note there.
 fn programForEffect(effect: MaterialEffect) bgfx.ProgramHandle {
+    const invalid_program = bgfx.ProgramHandle{ .idx = std.math.maxInt(u16) };
+    // `pixel_water` is deliberately NOT in this group. It has its own
+    // independently built program + uniforms (see the pixel-water section below)
+    // so neither group's link failure can disable the other, and it is submitted
+    // by `submitPixelWaterTriangles`, never by `submitMaterialTriangles` —
+    // returning the invalid sentinel here keeps a stray material draw from ever
+    // picking up the water program.
+    if (@hasField(MaterialEffect, "pixel_water")) {
+        if (effect == @field(MaterialEffect, "pixel_water")) return invalid_program;
+    }
     return switch (effect) {
         .flash => flash_program,
         .palette_swap => palette_program,
         .dissolve => dissolve_program,
         .outline => outline_program,
-        // `pixel_water` is deliberately NOT in this group. It has its own
-        // independently built program + uniforms (see the pixel-water section
-        // below) so neither group's link failure can disable the other, and it
-        // is submitted by `submitPixelWaterTriangles`, never by
-        // `submitMaterialTriangles` — returning the invalid sentinel here keeps
-        // a stray material draw from ever picking up the water program.
-        .pixel_water => .{ .idx = std.math.maxInt(u16) },
-        .none => .{ .idx = std.math.maxInt(u16) },
+        // `.none`, plus `.pixel_water` on a core that has it (handled above).
+        // `texture.zig`'s comptime tripwire fails the build if core gains a
+        // curated effect neither list knows about.
+        else => invalid_program,
     };
 }
 

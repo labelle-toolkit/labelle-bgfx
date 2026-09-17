@@ -215,7 +215,11 @@ pub fn nativeTextureHandle(id: core.BackendTextureId) u16 {
 // Material seam (labelle-gfx#305 Slice B). Optional `@hasDecl`-gated contract
 // decls: `core.Backend(Impl).drawTextureProMaterial` dispatches here for a
 // supported non-`none` effect, and `materialSupported` is the fine-grained gate.
-// bgfx implements `flash` + `palette_swap`; other effects degrade to plain sprites.
+// bgfx implements the whole curated set through `drawTextureProMaterial` —
+// `flash`, `palette_swap`, `dissolve` and `outline`; `pixel_water` rides the
+// separate `drawTextureProPixelWater` contract below. Nothing here is
+// unimplemented: an effect degrades to a plain sprite only when ITS program
+// fails to link on the running renderer, or a required input is missing.
 pub const drawTextureProMaterial = texture.drawTextureProMaterial;
 pub const materialSupported = texture.materialSupported;
 // Pixel water (COND-07, #100). Its own optional contract decl — declaring it is

@@ -18,9 +18,10 @@
 //!   D  scaling + independence ............. the same reservoir at native 1x, 2x
 //!      and 4x nearest enlargement, then TWO INDEPENDENT reservoirs (their own
 //!      masks, reflections, colours, levels and ripples) drawn back to back
-//!   E  ATLAS sub-rect ..................... the same reservoir drawn from a
+//!   E  ATLAS sub-rect + FULL coverage ..... the same reservoir drawn from a
 //!      STANDALONE texture and from an offset frame inside a larger atlas
-//!      sheet, so `u_water_rect` is exercised at something other than (0,0,1,1)
+//!      sheet, so `u_water_rect` is exercised at something other than (0,0,1,1);
+//!      then a level-1.0 reservoir whose mask reaches the TOP logical row
 //!
 //! FIXTURE CAVEAT: the real COND-07 condenser artwork is NOT in this repository
 //! (`docs/issue-references/condenser-100/` does not exist here), so every
@@ -29,16 +30,22 @@
 //! path the real art will, but they are explicitly NOT the condenser. Wiring the
 //! real artwork into a runnable example is a later PR (RFC plan phases 2 and 6).
 //!
-//! Beyond the image diff, the capture is checked for two SEMANTIC invariants
+//! Beyond the image diff, the capture is checked for four SEMANTIC invariants
 //! that a value-only golden would happily bless away (both run in bless mode
 //! too, so a regression can never be blessed in):
 //!   * an EXPIRED ripple must render bit-identically to no ripple at all,
 //!   * a live entry parked past `ripple_count` must be ignored entirely, and
 //!   * an ATLAS sub-rect frame must render bit-identically to the same art in a
 //!     standalone texture (the `u_water_rect` remap is a coordinate change, not
-//!     a different effect) — the check that actually gives the atlas path teeth.
+//!     a different effect) — the check that actually gives the atlas path teeth,
+//!   * a reservoir at level 1.0 must leave NO masked cell dry, including the top
+//!     logical row, however the surface wave displaces the surface.
 //! Each is a pair of tiles drawn with identical parameters except the thing
 //! under test, compared region-for-region in the captured framebuffer.
+//!
+//! BLESS ORDER: the capture always lands on the CANDIDATE first, in both modes.
+//! Bless replaces the committed golden only after every check above has passed,
+//! so a violating shader can never leave a bad image on disk.
 //!
 //! Modes, exit codes and tolerance match `material_golden.zig` exactly, plus one:
 //!   0 = OK · 2 = HEADLESS_INIT_FAILED · 3 = CAPTURE_FAILED ·
@@ -111,6 +118,15 @@ fn readFile(path: [:0]const u8) ?[]u8 {
     return buf;
 }
 
+/// Write `bytes` to `path`, truncating. Used only by the bless path, to promote
+/// a candidate that passed every check into the committed golden.
+fn writeFile(path: [:0]const u8, bytes: []const u8) bool {
+    const file = std.c.fopen(path.ptr, "wb") orelse return false;
+    const wrote = std.c.fwrite(bytes.ptr, 1, bytes.len, file);
+    const closed = std.c.fclose(file);
+    return wrote == bytes.len and closed == 0;
+}
+
 fn alloc(n: usize) []u8 {
     return std.heap.page_allocator.alloc(u8, n) catch unreachable;
 }
@@ -158,6 +174,34 @@ fn makeMask(w: u32, h: u32, hole: bool) gfx.DecodedImage {
             }
             if (hole and x >= w / 2 - 4 and x < w / 2 + 4 and y >= h / 2 - 2 and y < h / 2 + 2) {
                 inside = false;
+            }
+            px[o] = if (inside) 255 else 0;
+            px[o + 1] = if (inside) 255 else 0;
+            px[o + 2] = if (inside) 255 else 0;
+            px[o + 3] = if (inside) 255 else 0;
+        }
+    }
+    return .{ .pixels = px, .width = w, .height = h };
+}
+
+/// A mask whose interior reaches the TOP logical row (y == 0), unlike
+/// `makeMask`, which insets one pixel on every side. Bottom corners keep the
+/// same bevel. This is the coverage case a full reservoir has to survive: with
+/// the ordinary mask the top row is outside the silhouette anyway, so a surface
+/// displaced below the top edge at `level == 1` left no visible hole and the
+/// golden could not see the bug (labelle-bgfx#100 review round 2).
+fn makeMaskToTop(w: u32, h: u32) gfx.DecodedImage {
+    const px = alloc(w * h * 4);
+    var y: u32 = 0;
+    while (y < h) : (y += 1) {
+        var x: u32 = 0;
+        while (x < w) : (x += 1) {
+            const o = (y * w + x) * 4;
+            var inside = x >= 1 and x < w - 1 and y < h - 1;
+            const from_bottom = h - 1 - y;
+            if (from_bottom < 3) {
+                const inset = 3 - from_bottom;
+                if (x < 1 + inset or x >= w - 1 - inset) inside = false;
             }
             px[o] = if (inside) 255 else 0;
             px[o + 1] = if (inside) 255 else 0;
@@ -307,12 +351,14 @@ fn renderScene() void {
     const art2 = gfx.uploadTextureFiltered(makeReservoirArt(LW, LH), .point) catch unreachable;
     const mask = gfx.uploadTextureFiltered(makeMask(LW, LH, false), .point) catch unreachable;
     const mask_hole = gfx.uploadTextureFiltered(makeMask(LW, LH, true), .point) catch unreachable;
+    const mask_top = gfx.uploadTextureFiltered(makeMaskToTop(LW, LH), .point) catch unreachable;
     const refl = gfx.uploadTextureFiltered(makeReflectionBars(LW, LH), .point) catch unreachable;
     const refl2 = gfx.uploadTextureFiltered(makeReflectionBands(LW, LH), .point) catch unreachable;
     const sheet = gfx.uploadTextureFiltered(makeAtlasSheet(LW, LH), .point) catch unreachable;
 
     const m = mask.id.toInt();
     const mh = mask_hole.id.toInt();
+    const mt = mask_top.id.toInt();
     const r = refl.id.toInt();
     const r2 = refl2.id.toInt();
 
@@ -469,6 +515,18 @@ fn renderScene() void {
         gfx.drawTextureProPixelWater(art, src_rect, tile(xs[0], 328, 4), origin, 0, gfx.white, w_e);
         gfx.drawTextureProPixelWater(sheet, atlas_rect, tile(xs[1], 328, 4), origin, 0, gfx.white, w_e);
 
+        // E3 — a COMPLETELY FULL reservoir (level 1.0) whose mask reaches the TOP
+        // logical row, with waves on at a 2px amplitude. At level 1 the base
+        // surface is the top edge, so a positive quantized displacement used to
+        // push it BELOW the top row's cell centre and punch dry holes in a
+        // 100%-full reservoir. Row A's A4 could not see that: the ordinary mask
+        // insets 1px, so its top row is outside the silhouette either way.
+        // `semanticChecksPass` walks this tile's top row against the bare art.
+        var w_e3 = baseWater(mt, r);
+        w_e3.level = 1.0;
+        w_e3.wave_amplitude_pixels = 2.0;
+        gfx.drawTextureProPixelWater(art, src_rect, tile(xs[2], 328, 4), origin, 0, gfx.white, w_e3);
+
         window.endFrame();
     }
 }
@@ -491,7 +549,30 @@ fn regionsEqual(tga: []const u8, ax: u32, ay: u32, bx: u32, by: u32, rw: u32, rh
     return true;
 }
 
-/// The two invariants described in the module header. Returns false (and says
+/// Every pixel of region A must DIFFER from the matching pixel of region B.
+/// The "no dry holes" invariant needs this shape rather than `regionsEqual`: a
+/// water cell that failed to draw composites to exactly the bare sprite art, so
+/// a single pixel EQUAL to the bare-art reference is a hole. Same addressing as
+/// `regionsEqual` (top-down 32-bit TGA, 18-byte header).
+fn regionAllDiffer(tga: []const u8, ax: u32, ay: u32, bx: u32, by: u32, rw: u32, rh: u32) bool {
+    const stride: usize = @as(usize, W) * 4;
+    var row: u32 = 0;
+    while (row < rh) : (row += 1) {
+        var col: u32 = 0;
+        while (col < rw) : (col += 1) {
+            const a = 18 + (@as(usize, ay + row) * stride) + @as(usize, ax + col) * 4;
+            const b = 18 + (@as(usize, by + row) * stride) + @as(usize, bx + col) * 4;
+            if (a + 4 > tga.len or b + 4 > tga.len) return false;
+            if (std.mem.eql(u8, tga[a .. a + 4], tga[b .. b + 4])) {
+                std.debug.print("GOLDEN: first dry pixel at screen ({d}, {d})\n", .{ ax + col, ay + row });
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// The invariants described in the module header. Returns false (and says
 /// which one broke) on a violation.
 fn semanticChecksPass(tga: []const u8) bool {
     var ok = true;
@@ -511,6 +592,17 @@ fn semanticChecksPass(tga: []const u8) bool {
     // centre frame of a 3x3 sheet) must equal E1 (the same art standalone).
     if (!regionsEqual(tga, 8, 328, 152, 328, 128, 64)) {
         std.debug.print("GOLDEN: SEMANTIC — the atlas sub-rect tile differs from the standalone tile (`u_water_rect` remap is wrong)\n", .{});
+        ok = false;
+    }
+    // A reservoir at level 1.0 is COMPLETELY full: no masked cell may be left
+    // dry, whatever the surface displacement does. E3 (296, 328) is level 1 with
+    // waves at a 2px amplitude and a mask that reaches the TOP logical row, so
+    // every pixel of that row's masked span (logical x 1..LW-2, i.e. 30 cells x
+    // 4 screen px) must be water — that is, must DIFFER from the same pixels of
+    // A1 (8, 8), which is the identical art drawn at level 0 (no water at all).
+    // A dry cell composites to exactly the bare art and is caught here.
+    if (!regionAllDiffer(tga, 296 + 4, 328, 8 + 4, 8, 30 * 4, 4)) {
+        std.debug.print("GOLDEN: SEMANTIC — a full (level 1.0) reservoir left dry cells in its top masked row (the displaced surface must not sink below the full-level endpoint)\n", .{});
         ok = false;
     }
     return ok;
@@ -557,18 +649,23 @@ pub fn main() !void {
         std.process.exit(7);
     }
 
-    const out_base = if (bless) GOLDEN_BASE else CANDIDATE_BASE;
-    ensureParentDir(out_base);
-    if (!window.captureHeadless(out_base)) {
+    // ALWAYS capture to the candidate, bless mode included. Writing straight to
+    // `GOLDEN_BASE` would put the image on disk BEFORE the semantic invariants
+    // below get to look at it: a shader violating one of them still exited
+    // SEMANTIC_MISMATCH, but the committed baseline had already been overwritten
+    // with the bad capture and was sitting there, committable. The golden is
+    // replaced further down, once every check has passed.
+    ensureParentDir(CANDIDATE_BASE);
+    if (!window.captureHeadless(CANDIDATE_BASE)) {
         std.debug.print("GOLDEN_RESULT: CAPTURE_FAILED\n", .{});
         window.closeWindow();
         std.process.exit(3);
     }
     window.closeWindow();
 
-    // The semantic invariants run in BOTH modes, against whichever file was just
-    // written, so a broken build cannot be blessed into the golden.
-    const written = readFile(if (bless) GOLDEN_PATH else CANDIDATE_PATH) orelse {
+    // The semantic invariants run in BOTH modes, against the candidate that was
+    // just written, so a broken build cannot be blessed into the golden.
+    const written = readFile(CANDIDATE_PATH) orelse {
         std.debug.print("GOLDEN_RESULT: CAPTURE_FAILED (capture unreadable)\n", .{});
         std.process.exit(3);
     };
@@ -579,6 +676,12 @@ pub fn main() !void {
     }
 
     if (bless) {
+        // Only now — every invariant held — does the candidate become the golden.
+        ensureParentDir(GOLDEN_BASE);
+        if (!writeFile(GOLDEN_PATH, written)) {
+            std.debug.print("GOLDEN_RESULT: CAPTURE_FAILED (could not write {s})\n", .{GOLDEN_PATH});
+            std.process.exit(3);
+        }
         std.debug.print("GOLDEN_RESULT: BLESSED {s}\n", .{GOLDEN_PATH});
         std.process.exit(0);
     }

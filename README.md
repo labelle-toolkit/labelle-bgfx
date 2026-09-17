@@ -177,15 +177,19 @@ optional**: it is what WebGL2 and Android GLES select.
 `src/pixel_water_golden.zig` renders a fixed-simulation-time matrix — fill levels,
 the waves flag, ripple start/mid/expired, edge impacts, a live entry parked past
 `ripple_count`, masked-out pixels, zero amplitude, a one-native-pixel displacement,
-a coarse grid, native/2x/4x nearest scaling, two independent reservoirs and an
-ATLAS sub-rect frame — into its **own** golden (`test/golden/pixel_water.tga`),
-never the material one. It also asserts three semantic invariants region-for-region
-(expired ripple == no ripple; a ripple past the count == ignored; an atlas
-sub-rect frame == the same art standalone) in check **and** bless mode, so a
-regression cannot be blessed in. If the water program does not link on the
-capturing machine the run exits `7` (`PIXEL_WATER_UNSUPPORTED`) instead of
-capturing — a static-fallback scene must never reach the golden, least of all
-through bless mode. Regenerate with `zig build pixel-water-golden-bless`.
+a coarse grid, native/2x/4x nearest scaling, two independent reservoirs, an
+ATLAS sub-rect frame and a level-1.0 reservoir masked to its TOP row — into its
+**own** golden (`test/golden/pixel_water.tga`), never the material one. It also
+asserts four semantic invariants region-for-region (expired ripple == no ripple;
+a ripple past the count == ignored; an atlas sub-rect frame == the same art
+standalone; a full reservoir leaves no dry cell, top row included) in check
+**and** bless mode, so a regression cannot be blessed in. The capture ALWAYS
+lands on the candidate first: bless replaces the committed golden only after
+every invariant has passed, so a violating shader cannot leave a bad image on
+disk for someone to commit. If the water program does not link on the capturing
+machine the run exits `7` (`PIXEL_WATER_UNSUPPORTED`) instead of capturing — a
+static-fallback scene must never reach the golden, least of all through bless
+mode. Regenerate with `zig build pixel-water-golden-bless`.
 
 > **Fixture caveat.** The real COND-07 artwork is not in this repository, so the
 > golden's mask, reflection and reservoir art are small procedural stand-ins. They
