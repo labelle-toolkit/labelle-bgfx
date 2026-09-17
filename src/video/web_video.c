@@ -12,7 +12,9 @@
 // the player sizes its texture when the clip is opened, and a `<video>` only
 // learns its dimensions after `loadedmetadata`. The clip is drawn "contain"
 // into that buffer (the same geometry as `fit.fitRects(2, …)`), so a 16:9 clip
-// fills it exactly and any other aspect gets bars instead of distortion.
+// fills it exactly and any other aspect gets bars instead of distortion. The
+// backend never shows those bars: it asks for the clip's intrinsic size and
+// draws only the content rectangle (`web.zig` `contentRect`).
 //
 // Failure is bounded, never a hang: a load/decode `error`, a rejected `play()`,
 // no first frame within `FIRST_FRAME_TIMEOUT_MS`, or no progress for
@@ -63,6 +65,7 @@ EM_JS(int, labelle_web_video_open_js, (const char *url_ptr), {
         FIRST_FRAME_TIMEOUT_MS, STALL_TIMEOUT_MS,
         failed: false, ended: false,
         newFrame: false, mediaTime: 0, copiedTime: -1, gotFirstFrame: false,
+        seeking: false,
         openedAt: now(), lastProgressAt: now(),
         onVisibility: null,
     };
@@ -71,22 +74,28 @@ EM_JS(int, labelle_web_video_open_js, (const char *url_ptr), {
         if (!p.failed && !p.ended) console.warn('video: ' + why + ' - ending the clip');
         p.failed = true;
     };
+    p.fail = fail;
     video.addEventListener('error', () => {
         const e = video.error;
         fail('load/decode error' + (e ? ' (code ' + e.code + ')' : ''));
     });
     video.addEventListener('ended', () => { p.ended = true; });
     video.addEventListener('timeupdate', () => { p.lastProgressAt = now(); });
+    video.addEventListener('seeked', () => { p.seeking = false; p.lastProgressAt = now(); });
 
     // Prefer the per-presented-frame callback: it says exactly when a NEW frame
     // is on the element and its media time. Without it, a changed
     // `currentTime` with decoded data stands in for "new frame".
     if (typeof video.requestVideoFrameCallback === 'function') {
         const onFrame = (_now, meta) => {
+            if (reg.players.get(p.id) !== p) return;
+            video.requestVideoFrameCallback(onFrame);
+            // A frame presented before a restart finishes seeking belongs to
+            // the previous pass; taking it would pin the player to the old PTS.
+            if (p.seeking) return;
             p.newFrame = true;
             p.mediaTime = meta.mediaTime;
             p.lastProgressAt = now();
-            if (reg.players.get(p.id) === p) video.requestVideoFrameCallback(onFrame);
         };
         video.requestVideoFrameCallback(onFrame);
         p.hasRvfc = true;
@@ -119,6 +128,7 @@ EM_JS(double, labelle_web_video_frame_js, (int id, unsigned char *ptr, int len),
     const p = reg && reg.players.get(id);
     if (!p || len !== p.W * p.H * 4) return -1;
     const v = p.video;
+    if (p.seeking) return -1;
     if (v.readyState < 2 || v.videoWidth === 0 || v.videoHeight === 0) return -1; // < HAVE_CURRENT_DATA
 
     let t;
@@ -190,11 +200,35 @@ EM_JS(void, labelle_web_video_restart_js, (int id), {
     const p = reg && reg.players.get(id);
     if (!p || p.failed) return;
     p.ended = false;
+    // Drop any frame from the previous pass, and accept none until the seek
+    // lands: the player decodes right after this, and a stale media time would
+    // freeze the replay until the clock caught up with it.
+    p.newFrame = false;
     p.copiedTime = -1;
+    p.seeking = true;
     p.lastProgressAt = performance.now();
     p.video.currentTime = 0;
     const pr = p.video.play();
-    if (pr && typeof pr.catch === 'function') pr.catch(() => {});
+    if (pr && typeof pr.catch === 'function') {
+        pr.catch((err) => {
+            // A refused replay leaves the element paused, which the stall check
+            // ignores, so without this the clip would never report done.
+            if (reg.players.get(id) === p) p.fail('replay play() rejected: ' + (err && err.name));
+        });
+    }
+});
+
+// The clip's intrinsic size, or 0 until its metadata has loaded. `web.zig`
+// derives where the clip sits inside the fixed frame buffer from it.
+EM_JS(int, labelle_web_video_width_js, (int id), {
+    const reg = globalThis.__labelleWebVideo;
+    const p = reg && reg.players.get(id);
+    return p ? (p.video.videoWidth | 0) : 0;
+});
+EM_JS(int, labelle_web_video_height_js, (int id), {
+    const reg = globalThis.__labelleWebVideo;
+    const p = reg && reg.players.get(id);
+    return p ? (p.video.videoHeight | 0) : 0;
 });
 
 // Release the element and its network/decoder resources.
@@ -219,3 +253,5 @@ double labelle_web_video_time(int id) { return labelle_web_video_time_js(id); }
 int labelle_web_video_done(int id) { return labelle_web_video_done_js(id); }
 void labelle_web_video_restart(int id) { labelle_web_video_restart_js(id); }
 void labelle_web_video_close(int id) { labelle_web_video_close_js(id); }
+int labelle_web_video_width(int id) { return labelle_web_video_width_js(id); }
+int labelle_web_video_height(int id) { return labelle_web_video_height_js(id); }

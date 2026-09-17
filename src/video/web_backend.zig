@@ -59,19 +59,33 @@ pub const VideoBackend = struct {
         if (slotPtr(id)) |s| s.player.update(dt);
     }
 
+    /// The clip's content rectangle inside the fixed frame buffer (the bars the
+    /// JS adds around a non-16:9 clip are never drawn).
+    fn contentOf(s: *Slot) fit.Rectangle {
+        const size = s.player.decoder.intrinsicSize() orelse return web.contentRect(0, 0);
+        return web.contentRect(size.w, size.h);
+    }
+
     pub fn drawVideo(id: u32, x: f32, y: f32, w: f32, h: f32) void {
-        if (slotPtr(id)) |s| s.player.draw(.{ .x = x, .y = y, .width = w, .height = h });
+        const s = slotPtr(id) orelse return;
+        const c = contentOf(s);
+        s.player.drawRegion(
+            .{ .x = c.x, .y = c.y, .width = c.width, .height = c.height },
+            .{ .x = x, .y = y, .width = w, .height = h },
+        );
     }
 
     /// Fill the whole framebuffer with the current frame. `fit_tag` matches
-    /// core.VideoFit: 0=stretch, 1=cover, 2=contain. Same bracketing of the
-    /// aspect-fit toggle as the native backend.
+    /// core.VideoFit: 0=stretch, 1=cover, 2=contain, applied to the clip's own
+    /// content (see `web.fullscreenRects`). Same bracketing of the aspect-fit
+    /// toggle as the native backend.
     pub fn drawVideoFullscreen(id: u32, fit_tag: u8) void {
         const s = slotPtr(id) orelse return;
-        const r = fit.fitRects(
+        const size = s.player.decoder.intrinsicSize();
+        const r = web.fullscreenRects(
             fit_tag,
-            @floatFromInt(web.FRAME_W),
-            @floatFromInt(web.FRAME_H),
+            if (size) |z| z.w else 0,
+            if (size) |z| z.h else 0,
             @floatFromInt(state.getDesignWidth()),
             @floatFromInt(state.getDesignHeight()),
         );
@@ -92,9 +106,12 @@ pub const VideoBackend = struct {
         if (slotPtr(id)) |s| s.player.replay();
     }
 
+    /// The clip's intrinsic size once the browser has its metadata; before
+    /// that, the fixed frame-buffer size.
     pub fn videoDimensions(id: u32) struct { w: u32, h: u32 } {
-        if (slotPtr(id) != null) return .{ .w = web.FRAME_W, .h = web.FRAME_H };
-        return .{ .w = 0, .h = 0 };
+        const s = slotPtr(id) orelse return .{ .w = 0, .h = 0 };
+        const size = s.player.decoder.intrinsicSize() orelse return .{ .w = web.FRAME_W, .h = web.FRAME_H };
+        return .{ .w = size.w, .h = size.h };
     }
 
     pub fn closeVideo(id: u32) void {

@@ -24,6 +24,28 @@ extern "c" fn labelle_web_video_time(id: c_int) f64;
 extern "c" fn labelle_web_video_done(id: c_int) c_int;
 extern "c" fn labelle_web_video_restart(id: c_int) void;
 extern "c" fn labelle_web_video_close(id: c_int) void;
+extern "c" fn labelle_web_video_width(id: c_int) c_int;
+extern "c" fn labelle_web_video_height(id: c_int) c_int;
+
+/// Where a `vw`×`vh` clip sits inside the fixed frame buffer, in buffer pixels:
+/// drawn "contain", exactly as `web_video.c` draws it. Unknown size (metadata
+/// not loaded yet) is treated as filling the buffer.
+pub fn contentRect(vw: u32, vh: u32) fit.Rectangle {
+    if (vw == 0 or vh == 0) return .{ .x = 0, .y = 0, .width = @floatFromInt(FRAME_W), .height = @floatFromInt(FRAME_H) };
+    return fit.fitRects(2, @floatFromInt(vw), @floatFromInt(vh), @floatFromInt(FRAME_W), @floatFromInt(FRAME_H)).dest;
+}
+
+/// `fit.fitRects` for a web clip on an `sw`×`sh` screen. The fit applies to the
+/// clip's own content, not the padded buffer, so `cover`/`stretch` never show
+/// the bars baked in around a non-16:9 clip. The returned `src` is in buffer
+/// pixels (offset into the content rectangle), ready for `Player.drawRegion`.
+pub fn fullscreenRects(fit_tag: u8, vw: u32, vh: u32, sw: f32, sh: f32) fit.FitRects {
+    const c = contentRect(vw, vh);
+    var r = fit.fitRects(fit_tag, c.width, c.height, sw, sh);
+    r.src.x += c.x;
+    r.src.y += c.y;
+    return r;
+}
 
 pub const VideoDecoder = struct {
     id: c_int,
@@ -60,6 +82,14 @@ pub const VideoDecoder = struct {
 
     pub fn replay(self: *VideoDecoder, _: std.mem.Allocator) void {
         labelle_web_video_restart(self.id);
+    }
+
+    /// The clip's intrinsic size, or null until the browser has its metadata.
+    pub fn intrinsicSize(self: *const VideoDecoder) ?struct { w: u32, h: u32 } {
+        const w = labelle_web_video_width(self.id);
+        const h = labelle_web_video_height(self.id);
+        if (w <= 0 or h <= 0) return null;
+        return .{ .w = @intCast(w), .h = @intCast(h) };
     }
 
     pub fn deinit(self: *VideoDecoder) void {
@@ -100,4 +130,50 @@ test "a 4:3 clip is pillarboxed inside the web frame buffer, not stretched" {
     try std.testing.expectApproxEqAbs(@as(f32, 720), r.dest.height, 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 160), r.dest.x, 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 0), r.dest.y, 0.01);
+}
+
+test "content rect: a 4:3 clip occupies the pillarboxed middle of the buffer" {
+    const c = contentRect(640, 480);
+    try std.testing.expectApproxEqAbs(@as(f32, 160), c.x, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), c.y, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 960), c.width, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 720), c.height, 0.01);
+}
+
+test "content rect: unknown size (no metadata yet) is the whole buffer" {
+    const c = contentRect(0, 0);
+    try std.testing.expectEqual(@as(f32, 0), c.x);
+    try std.testing.expectEqual(@as(f32, 1280), c.width);
+    try std.testing.expectEqual(@as(f32, 720), c.height);
+}
+
+test "fullscreen cover: a 4:3 clip on a 16:9 screen crops the clip, never the baked bars" {
+    const r = fullscreenRects(1, 640, 480, 1280, 720);
+    // Fills the screen.
+    try std.testing.expectEqual(@as(f32, 1280), r.dest.width);
+    try std.testing.expectEqual(@as(f32, 720), r.dest.height);
+    // The source stays inside the content rect [160, 1120] x [0, 720]: full
+    // content width, height cropped to the screen aspect (960 / (16/9) = 540).
+    try std.testing.expectApproxEqAbs(@as(f32, 160), r.src.x, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 960), r.src.width, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 540), r.src.height, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 90), r.src.y, 0.01);
+}
+
+test "fullscreen stretch: a 4:3 clip stretches its content, not the padded buffer" {
+    const r = fullscreenRects(0, 640, 480, 1280, 720);
+    try std.testing.expectApproxEqAbs(@as(f32, 160), r.src.x, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 960), r.src.width, 0.01);
+    try std.testing.expectEqual(@as(f32, 1280), r.dest.width);
+}
+
+test "fullscreen: a 16:9 clip matches the plain buffer fit (FP's intro)" {
+    for ([_]u8{ 0, 1, 2 }) |tag| {
+        const web_r = fullscreenRects(tag, 1920, 1080, 1024, 768);
+        const buf_r = fit.fitRects(tag, 1280, 720, 1024, 768);
+        try std.testing.expectApproxEqAbs(buf_r.src.x, web_r.src.x, 0.01);
+        try std.testing.expectApproxEqAbs(buf_r.src.width, web_r.src.width, 0.01);
+        try std.testing.expectApproxEqAbs(buf_r.dest.y, web_r.dest.y, 0.01);
+        try std.testing.expectApproxEqAbs(buf_r.dest.height, web_r.dest.height, 0.01);
+    }
 }
