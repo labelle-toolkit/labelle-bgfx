@@ -604,6 +604,23 @@ pub fn build(b: *std.Build) void {
     const golden_bless_step = b.step("material-golden-bless", "Regenerate the material golden TGA (#305)");
     golden_bless_step.dependOn(&golden_bless_run.step);
 
+    // ── Pixel-water golden harness (COND-07, #100 / RFC-PIXEL-WATER §4) ──────
+    // `zig build pixel-water-golden`       — render the fixed-TIME reservoir
+    //     matrix (levels, waves on/off, ripple start/mid/expired, edge impacts,
+    //     masked-out pixels, grid quantization, native/2x/4x scaling, two
+    //     independent reservoirs) headless and DIFF it against the committed
+    //     golden TGA (CI gate).
+    // `zig build pixel-water-golden-bless` — regenerate + overwrite the golden.
+    // DELIBERATELY its own capture: the water effect must never be able to pass
+    // by re-blessing the material golden. See src/pixel_water_golden.zig.
+    const water_golden_check = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "pixel_water_golden", "src/pixel_water_golden.zig", false);
+    const water_golden_step = b.step("pixel-water-golden", "Diff the pixel-water reservoir matrix against the committed golden (#100)");
+    water_golden_step.dependOn(&water_golden_check.step);
+
+    const water_golden_bless_run = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "pixel_water_golden", "src/pixel_water_golden.zig", true);
+    const water_golden_bless_step = b.step("pixel-water-golden-bless", "Regenerate the pixel-water golden TGA (#100)");
+    water_golden_bless_step.dependOn(&water_golden_bless_run.step);
+
     // ── Post-fx golden harness (labelle-gfx#305 P2 Slice B, RFC §2.4 / §6) ────
     // `zig build post-fx-golden`       — render the fixed scene, run a bloom→crt
     //     stack through applyPostPass (render-target ping-pong), and DIFF the

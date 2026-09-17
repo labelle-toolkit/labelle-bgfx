@@ -89,6 +89,93 @@ on a machine with a Metal/Vulkan device:
 zig build material-golden-bless   # overwrites test/golden/material_flash_palette.tga
 ```
 
+## Pixel water (COND-07, #100 / RFC-PIXEL-WATER)
+
+`pixel_water` is a fifth curated effect, and the only one whose support is **not**
+implied by `drawTextureProMaterial`. Its per-instance payload (three colour ramps,
+wave/ripple tuning and eight live impacts) is 8x a `MaterialUniforms` block, so it
+rides its own optional contract decl — `drawTextureProPixelWater(texture, source,
+dest, origin, rotation, tint, water: PixelWaterDraw)` — taking labelle-core's flat
+256-byte `PixelWaterDraw` **by value**. Declaring that decl is what makes
+`core.materialCapabilities` advertise `pixel_water`; `materialSupported(.pixel_water)`
+additionally goes false once `fs_pixel_water` has failed to link on this renderer.
+
+Units, in one line each:
+
+- Local coordinates are **native art pixels**, origin at the reservoir rectangle's
+  top-left, +X right, +Y **down**.
+- `level` is the fraction filled from the **bottom**: `surface_y = logical_height *
+  (1 - level)`. Level 0 renders no water at all.
+- `grid_pixels` is native art pixels per effect cell. Every sample position is the
+  logical cell centre and every displacement is quantized to whole grid increments.
+  The reference scene's 6 screen pixels per cell is integer *enlargement* of the
+  art — not this value, and not an engine constant.
+- A ripple's age is `time - start_time`; an age outside
+  `[0, ripple_duration_seconds)` contributes nothing, and entries at or past
+  `ripple_count` are ignored (they are not guaranteed zeroed). `time` is
+  **simulation** seconds, never a wall clock.
+- `PIXEL_WATER_FLAG_WAVES` toggles surface waves without destroying the authored
+  amplitude.
+
+### Sampler slots and uniform registers
+
+Slots are fixed. Units 1 and 2 are bound with point+clamp sampler flags at draw
+time, so nearest/clamped sampling is a property of the effect, not of how the
+asset happened to be uploaded.
+
+| slot | uniform | content | colour space |
+|------|---------|---------|--------------|
+| 0 | `s_tex` | the reservoir sprite's own texture (also the fallback art) | authored, sampled exactly like a plain sprite (x vertex tint) |
+| 1 | `s_water_mask` | reservoir silhouette, standalone (never atlased) | coverage **data**: alpha x max(rgb), never gamma-converted. White-on-transparent and white-on-black both read correctly |
+| 2 | `s_water_reflect` | the **supplied** reflection, standalone, reservoir-local | authored, used as-is: not flipped, not captured from the scene |
+
+| register | uniform | content |
+|----------|---------|---------|
+| 0 | `u_water_rect` | `(u0, v0, u1, v1)` — the sprite's source frame in whole-atlas UV space; `(0,0,1,1)` standalone |
+| 1–2 | `u_water_head[2]` | `(logical_width, logical_height, grid_pixels, ripple_count)`, then `(waves_enabled, has_mask, has_reflection, raw_flags)`. The u32 header widened to float, with `flags` decoded on the Zig side so the shader never does bitwise arithmetic on a float |
+| 3–5 | `u_water_color[3]` | `deep` / `surface` / `highlight`, **linear** 0..1 rgba — already converted out of the authored sRGB by the engine. Nothing converts again |
+| 6–8 | `u_water_params[3]` | `(level, time, wave_amplitude_px, wave_period_s)`, `(distortion_px, reflection_opacity, ripple_duration_s, ripple_radius_px)`, `(ripple_strength_px, _, _, _)` |
+| 9–16 | `u_water_ripples[8]` | one impact per slot: `(x, start_time, strength, _)` |
+
+The three colour/param/ripple blocks are uploaded straight off the locked
+`PixelWaterDraw` layout (colours at byte 32, params at 80, ripples at 128 — exactly
+3 + 3 + 8 consecutive `vec4`s); only the integer header is repacked.
+
+`PIXEL_WATER_MAX_RIPPLES` is 8 and **fixed**: the shader's ripple loop needs a
+comptime trip count, because a dynamically-bounded loop is a portability hazard on
+ESSL 3.00 / WebGL2.
+
+### Program lifetime
+
+The water program and its uniforms are built and destroyed **independently** of the
+four material programs (`initWaterProgram` / `waterProgramReady` /
+`waterProgramAvailable` / `destroyWaterProgram` in `src/gfx/programs.zig`), following
+the same lazy-build + latch-failure pattern. A water link failure degrades only
+water — to the authored static reservoir sprite — and leaves flash / palette_swap /
+dissolve / outline untouched; the converse also holds. Nothing is created per frame,
+and every owned handle is released in `shutdownPrograms` (so an Android surface cycle
+gets one more honest attempt).
+
+`fs_pixel_water.sc` is compiled and embedded with the same offline shaderc recipe as
+the other material shaders (see above), in all four variants. **ESSL 3.00 is not
+optional**: it is what WebGL2 and Android GLES select.
+
+### Headless golden (`zig build pixel-water-golden`)
+
+`src/pixel_water_golden.zig` renders a fixed-simulation-time matrix — fill levels,
+the waves flag, ripple start/mid/expired, edge impacts, a live entry parked past
+`ripple_count`, masked-out pixels, zero amplitude, a one-native-pixel displacement,
+a coarse grid, native/2x/4x nearest scaling and two independent reservoirs — into
+its **own** golden (`test/golden/pixel_water.tga`), never the material one. It also
+asserts two semantic invariants region-for-region (expired ripple == no ripple; a
+ripple past the count == ignored) in check **and** bless mode, so a regression
+cannot be blessed in. Regenerate with `zig build pixel-water-golden-bless`.
+
+> **Fixture caveat.** The real COND-07 artwork is not in this repository, so the
+> golden's mask, reflection and reservoir art are small procedural stand-ins. They
+> exercise every code path the real art will; wiring the actual condenser into a
+> runnable example is later work (RFC plan phases 2 and 6).
+
 ## Texture filtering seam (point/nearest sampling, #77)
 
 Game textures upload with `SamplerFlags_UClamp | SamplerFlags_VClamp` and no
