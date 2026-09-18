@@ -1059,9 +1059,126 @@ pub fn headlessTicks() u64 {
 /// `headlessTicks` degrades a malformed count to 0. The optional means
 /// "unset" is representable without stealing a sentinel from the value space.
 pub fn fixedDt() ?f32 {
-    if (is_android) return null; // env vars are never set for an Android activity
+    // Android is NOT excluded (labelle-assembler#737). An activity launched
+    // normally inherits zygote's environment, so this is `null` there for the
+    // same reason it is on a desktop run with the knob unset — but a
+    // `debuggable` APK can be given a real environment by the platform's
+    // `wrap.<package>` property, which is the supported way to hand a device
+    // build the same `LABELLE_*` knobs the desktop path already honours.
+    // Hard-wiring `null` here made on-device verification fall back to
+    // `adb screencap` at wall-clock times, which can pin neither the frame nor
+    // the colour. `getenv` on bionic is the same libc call as everywhere else.
     const raw = getenv("LABELLE_FIXED_DT") orelse return null;
     return parseFixedDt(std.mem.span(raw));
+}
+
+/// Look up a `LABELLE_*` knob in the text of a device knob file
+/// (labelle-assembler#737).
+///
+/// The generated Android `main.zig` reads an optional `labelle_env` file from
+/// the activity's own internal data dir and asks this for each knob. That file
+/// exists because the ENVIRONMENT channel is not always available on Android:
+/// an activity launched normally inherits zygote's environment, and the one
+/// property that can replace it (`wrap.<package>`) is refused by SELinux on
+/// some devices and caps its value at 92 bytes where it is allowed. Writing the
+/// app's private dir needs `run-as`, which the platform grants only for a
+/// `debuggable` APK — so the channel is gated on the same opt-in.
+///
+/// Format: one `KEY=VALUE` per line; `#` starts a comment line; surrounding
+/// whitespace is trimmed from both key and value. First match wins. Lives here
+/// rather than in the template so the parse is unit-testable without a device.
+pub fn knobFromText(text: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, line[0..eq], " \t"), name)) continue;
+        return std.mem.trim(u8, line[eq + 1 ..], " \t");
+    }
+    return null;
+}
+
+/// `parseFixedDt` for callers outside this file (the generated Android main
+/// applies the SAME accept/reject policy to a knob-file value as `fixedDt`
+/// applies to the environment, so the two channels cannot disagree).
+pub fn parseFixedDtKnob(raw: []const u8) ?f32 {
+    return parseFixedDt(raw);
+}
+
+/// Read ONE `LABELLE_*` knob from the process environment
+/// (labelle-assembler#737).
+///
+/// The Android main resolves each knob independently — environment first
+/// (desktop parity), then the device knob file — because a path delivered by
+/// one channel and a delay delivered by the other is a legitimate
+/// combination. Resolving the whole screenshot request from whichever channel
+/// happened to carry the PATH silently drops the other channel's delay.
+///
+/// An empty value is reported as UNSET, matching `screenshot_request.parse`
+/// (which treats `LABELLE_SCREENSHOT_PATH=` as "no request") — otherwise an
+/// exported-but-empty variable would mask a perfectly good file knob.
+pub fn knobFromEnv(name: [*:0]const u8) ?[]const u8 {
+    const raw = getenv(name) orelse return null;
+    const value = std.mem.span(raw);
+    if (value.len == 0) return null;
+    return value;
+}
+
+/// `LABELLE_SCREENSHOT_AFTER_SEC`'s accept/reject policy, shared by the
+/// environment channel and the device knob file (labelle-assembler#737).
+///
+/// Rejects — rather than clamping — anything that cannot schedule a capture:
+///
+///   * unparseable text,
+///   * negatives (the engine's own env parser clamps these to 0; we agree by
+///     returning null, and the caller's default is 0),
+///   * NaN, and
+///   * **infinity**, which is the dangerous one. `inf` parses cleanly and is
+///     not negative, so a naive `>= 0` check lets it through — and then the
+///     gate `elapsed_sec >= after_sec` can never be true, so the run captures
+///     NOTHING and the harness waits out its timeout with no diagnostic. Same
+///     trap `parseFixedDt` guards with `isFinite`.
+pub fn parseAfterSecKnob(raw: []const u8) ?f32 {
+    const secs = std.fmt.parseFloat(f32, raw) catch return null;
+    // `secs >= 0` is already false for NaN; `isFinite` adds the `inf` reject.
+    if (!(secs >= 0.0) or !std.math.isFinite(secs)) return null;
+    return secs;
+}
+
+/// Does a RELATIVE knob path escape the directory it is resolved against?
+/// (labelle-assembler#737)
+///
+/// `LABELLE_SCREENSHOT_PATH=shot` is resolved against the activity's own
+/// internal data dir, so the raw value is concatenated onto a directory the
+/// app can write. Without this check `../shared_prefs/state` resolves to a
+/// real, writable file OUTSIDE the capture area and the screenshot clobbers
+/// it. The knob is a verification aid; it must not be a way to overwrite an
+/// arbitrary app-private file.
+///
+/// Reported as escaping:
+///   * empty, or absolute (`/...`) — an absolute path is a different case and
+///     is handled by the caller, not here;
+///   * any path whose `..` components walk at or above the base dir;
+///   * a path that resolves to the base dir itself (`.`, `a/..`) — it names a
+///     directory, not a capture file.
+///
+/// `.` and empty components (`a//b`) are ignored, as the kernel ignores them.
+pub fn relativeKnobPathEscapes(rel: []const u8) bool {
+    if (rel.len == 0 or rel[0] == '/') return true;
+    var depth: usize = 0;
+    var parts = std.mem.splitScalar(u8, rel, '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) {
+            if (depth == 0) return true;
+            depth -= 1;
+            continue;
+        }
+        depth += 1;
+    }
+    // depth 0 means the path resolved back to the base directory itself.
+    return depth == 0;
 }
 
 /// Pure half of `fixedDt` — split out so the accept/reject policy is testable
@@ -1616,6 +1733,89 @@ test "parseFixedDt accepts a positive timestep and rejects everything else (#59)
     try testing.expect(parseFixedDt("-0.016") == null);
     try testing.expect(parseFixedDt("inf") == null);
     try testing.expect(parseFixedDt("nan") == null);
+}
+
+test "knobFromText parses the device knob file the Android main reads (#737)" {
+    const file =
+        "# device verification knobs\n" ++
+        "\n" ++
+        "LABELLE_FIXED_DT = 0.02\n" ++
+        "LABELLE_SCREENSHOT_PATH=shot\r\n" ++
+        "  LABELLE_SCREENSHOT_AFTER_SEC=2  \n" ++
+        "#LABELLE_FIXED_DT=999\n" ++
+        "malformed line with no equals\n";
+    try testing.expectEqualStrings("0.02", knobFromText(file, "LABELLE_FIXED_DT").?);
+    // `\r` from a CRLF write must not leak into the value — it would make the
+    // resolved screenshot path name a file nothing can then `adb pull`.
+    try testing.expectEqualStrings("shot", knobFromText(file, "LABELLE_SCREENSHOT_PATH").?);
+    try testing.expectEqualStrings("2", knobFromText(file, "LABELLE_SCREENSHOT_AFTER_SEC").?);
+    // A commented-out knob is not a knob, and an absent one is null (not "").
+    try testing.expect(knobFromText(file, "LABELLE_HEADLESS") == null);
+    try testing.expect(knobFromText("", "LABELLE_FIXED_DT") == null);
+    // A key that is a PREFIX of a present key must not match it.
+    try testing.expect(knobFromText(file, "LABELLE_FIXED") == null);
+}
+
+test "parseFixedDtKnob applies the SAME policy as the env channel (#737)" {
+    // The file channel and the environment channel must not disagree about
+    // what a valid timestep is, or a run would behave differently depending on
+    // which one delivered the knob.
+    inline for (.{ "0.02", "0.0166667", "abc", "0", "-1", "inf", "nan", "" }) |raw| {
+        try testing.expectEqual(parseFixedDt(raw), parseFixedDtKnob(raw));
+    }
+    try testing.expectEqual(@as(?f32, 0.02), parseFixedDtKnob("0.02"));
+    try testing.expect(parseFixedDtKnob("0") == null);
+    try testing.expect(parseFixedDtKnob("-1") == null);
+}
+
+test "parseAfterSecKnob rejects infinity, which would never fire the capture (#737)" {
+    // The regression: `inf` parses, is >= 0, and then `elapsed >= after_sec`
+    // is false forever — the run captures nothing and looks like a hang.
+    try testing.expect(parseAfterSecKnob("inf") == null);
+    try testing.expect(parseAfterSecKnob("-inf") == null);
+    try testing.expect(parseAfterSecKnob("Infinity") == null);
+    try testing.expect(parseAfterSecKnob("nan") == null);
+    // …and the ordinary policy still holds.
+    try testing.expect(parseAfterSecKnob("abc") == null);
+    try testing.expect(parseAfterSecKnob("") == null);
+    try testing.expect(parseAfterSecKnob("-1") == null);
+    try testing.expectEqual(@as(?f32, 0.0), parseAfterSecKnob("0"));
+    try testing.expectEqual(@as(?f32, 2.5), parseAfterSecKnob("2.5"));
+}
+
+test "relativeKnobPathEscapes confines a relative screenshot knob to its base dir (#737)" {
+    // The regression: a relative path was concatenated onto the app's private
+    // dir with no normalization, so `..` walked out of the capture area and
+    // the screenshot overwrote an unrelated app-private file.
+    try testing.expect(relativeKnobPathEscapes("../shared_prefs/state"));
+    try testing.expect(relativeKnobPathEscapes(".."));
+    try testing.expect(relativeKnobPathEscapes("a/../../b"));
+    try testing.expect(relativeKnobPathEscapes("./.././x"));
+    // Absolute and empty are not this function's business — reported as
+    // escaping so no caller can treat them as a safe relative path.
+    try testing.expect(relativeKnobPathEscapes("/data/local/tmp/shot.tga"));
+    try testing.expect(relativeKnobPathEscapes(""));
+    // Resolving back to the base dir names a DIRECTORY, not a capture file.
+    try testing.expect(relativeKnobPathEscapes("."));
+    try testing.expect(relativeKnobPathEscapes("a/.."));
+    // Contained paths stay usable, `.` and `//` included.
+    try testing.expect(!relativeKnobPathEscapes("shot"));
+    try testing.expect(!relativeKnobPathEscapes("shot.tga"));
+    try testing.expect(!relativeKnobPathEscapes("sub/dir/shot.tga"));
+    try testing.expect(!relativeKnobPathEscapes("./shot.tga"));
+    try testing.expect(!relativeKnobPathEscapes("a//b"));
+    try testing.expect(!relativeKnobPathEscapes("a/../b"));
+    // A name that merely STARTS with dots is a normal name, not a walk.
+    try testing.expect(!relativeKnobPathEscapes("..shot"));
+    try testing.expect(!relativeKnobPathEscapes("...."));
+}
+
+test "knobFromEnv reports an unset knob as null (#737)" {
+    // No portable way to set an env var from a Zig 0.16 test, so this pins the
+    // half that is observable: an absent variable is null, never an empty
+    // slice — the Android main relies on that to fall through to the file
+    // channel instead of resolving the knob to "".
+    try testing.expect(knobFromEnv("LABELLE_BGFX_KNOB_THAT_IS_NEVER_SET_737") == null);
 }
 
 test "fixedDt is null when LABELLE_FIXED_DT is unset — the default is untouched (#59)" {

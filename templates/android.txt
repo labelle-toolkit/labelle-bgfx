@@ -78,6 +78,185 @@ fn androidLogFn(
 {{hooks_init_block}}
 var gpa = std.heap.DebugAllocator(.{}).init;
 
+// ── Device verification hooks (labelle-assembler#737) ────────────────────
+// The desktop template resolves `LABELLE_FIXED_DT` and `LABELLE_SCREENSHOT_PATH`
+// into loop-locals; the Android shell owns the loop, so the equivalents live at
+// file scope and are resolved ONCE in `gameInit` — the frame path never pays
+// for a lookup. Mirrors how `wasm.txt` hoists its `fixed_dt`.
+//
+// These are only reachable when the APK is built `debuggable` (the opt-in
+// `.android = .{ .debuggable = true }` knob): the platform's `wrap.<package>`
+// property is what gives the process a real environment, and it is honoured
+// only for debuggable apps. On a release APK every one of these stays at its
+// default and the whole block folds to today's behaviour — no screenshot, no
+// fixed timestep, one extra never-taken branch per frame.
+//
+// Why it matters: without them, on-device checking falls back to `adb screencap`
+// at wall-clock times, which on some devices applies a display colour transform
+// (so colour cannot be judged) and has ~1s of latency (so a frame cannot be
+// pinned to a simulation time).
+
+/// Pinned simulation timestep, or `null` to measure the real frame period
+/// (the default, and the only value a release build can have).
+var fixed_dt: ?f32 = null;
+/// Pending one-shot capture request from `LABELLE_SCREENSHOT_PATH`.
+/// An ABSOLUTE path is taken verbatim, so the caller decides exactly where it
+/// lands; a RELATIVE one is resolved against — and confined to — the app's own
+/// files dir, so `adb pull` (or `run-as ... cat`) can fetch it afterwards. See
+/// `resolveScreenshotPath`.
+var screenshot_req: ?engine.ScreenshotRequest = null;
+/// Under a fixed timestep the delay is translated into a FRAME INDEX up front,
+/// so the captured frame is decided by simulated time, not by the clock — that
+/// is what makes two runs byte-identical. `null` keeps the wall-clock gate.
+var capture_frame: ?u64 = null;
+/// 1-based count of simulated frames, feeding `capture_frame`.
+var frame_index: u64 = 0;
+/// Wall-clock baseline for the non-fixed-dt gate. Set at the END of `gameInit`,
+/// once the project's setup and scene load are done — a baseline taken before
+/// them would let slow device-side init eat the requested delay.
+var loop_start_ns: i128 = 0;
+/// Backing store for a RELATIVE `LABELLE_SCREENSHOT_PATH` resolved against the
+/// activity's own internal data dir (see `resolveScreenshotPath`).
+var screenshot_path_buf: [512]u8 = undefined;
+
+/// ── Knob channel ─────────────────────────────────────────────────────────
+/// `LABELLE_*` knobs, resolved PER KNOB: the process environment first (desktop
+/// parity; reachable where the platform's `wrap.<package>` property is
+/// permitted), and otherwise an optional `labelle_env` file in the activity's
+/// OWN internal data dir. See `knobValue`.
+///
+/// The file exists because the environment channel is not always available: an
+/// activity launched normally inherits zygote's environment, and `wrap.<package>`
+/// — the one property that can replace it — is refused by SELinux on some
+/// devices (measured on a Samsung SM-T505 / Android 12: `setprop` returns
+/// "error code: 0x18") and caps its value at 92 bytes where it is allowed. The
+/// app's private dir has neither problem, and writing to it requires `run-as`,
+/// which the platform grants only for a `debuggable` APK. The RUNTIME read is
+/// gated on the same opt-in independently, by asking the running apk for its
+/// own `FLAG_DEBUGGABLE` (`android_app.isDebuggable()`) — `run-as` restricts
+/// creation only, so a file left behind by a debuggable build must not keep
+/// working after an update to a release build.
+///
+///     adb shell run-as <package> sh -c 'printf "LABELLE_FIXED_DT=0.02\n\
+///       LABELLE_SCREENSHOT_PATH=shot\nLABELLE_SCREENSHOT_AFTER_SEC=2\n" \
+///       > files/labelle_env'
+///
+/// Format: one `KEY=VALUE` per line; `#` starts a comment; blank lines ignored.
+/// Missing file, unreadable file and malformed lines all degrade to "knob unset"
+/// — a verification aid must never be able to break a run.
+var knob_file_buf: [4096]u8 = undefined;
+var knob_file: []const u8 = &.{};
+
+fn loadKnobFile() void {
+    // Gate on the RUNNING apk's own `android:debuggable` flag, not on the fact
+    // that `run-as` was once able to WRITE this file. `run-as` restricts
+    // creation only: install a debuggable build, drop a knob file, then update
+    // to a release build over it, and the file survives in the app's private
+    // dir — a release APK would go on honouring it, taking a fixed timestep
+    // and writing screenshots. `android_app.isDebuggable()` asks the process
+    // about its own `ApplicationInfo.FLAG_DEBUGGABLE` and fails closed, so a
+    // release build ignores a stale file. `@hasDecl` so an older backend still
+    // builds — there it degrades to "no file channel", never to "ungated".
+    if (comptime !@hasDecl(android_app, "isDebuggable")) return;
+    if (!android_app.isDebuggable()) return;
+    const dir_c = android_app.internalDataPath() orelse return;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/labelle_env", .{std.mem.span(dir_c)}) catch return;
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    const n = std.c.read(fd, &knob_file_buf, knob_file_buf.len);
+    if (n <= 0) return;
+    knob_file = knob_file_buf[0..@intCast(n)];
+    std.log.info("labelle: device knobs loaded from {s} ({d} bytes)", .{ path, knob_file.len });
+}
+
+/// The parse itself lives in the backend (`window.knobFromText`) so it is
+/// unit-tested there rather than only exercised on a device.
+fn knobFromFile(name: []const u8) ?[]const u8 {
+    if (comptime !@hasDecl(window, "knobFromText")) return null;
+    return window.knobFromText(knob_file, name);
+}
+
+/// Resolve `raw` into a path the process can actually write.
+///
+/// An ABSOLUTE path is taken verbatim, and deliberately so: it is unambiguous,
+/// it names no directory implicitly, and it is the only way to aim a capture at
+/// e.g. a debugger-writable external dir. Nothing is confined about it — the
+/// caller spelled out exactly where the file goes.
+///
+/// A RELATIVE one is joined to `/data/data/<package>/files`, the only place a
+/// NativeActivity can always write and the place `run-as <package> cat` can
+/// read back. That matters because the ONLY channel for handing a debuggable
+/// Android app an environment is the `wrap.<package>` system property, whose
+/// value is capped at 92 bytes: spelling the absolute path in the knob leaves
+/// no room for `LABELLE_FIXED_DT` beside it.
+///
+/// A relative path is CONFINED to that directory. Plain concatenation let
+/// `../shared_prefs/state` resolve to a real, writable file outside the
+/// capture area, so the screenshot would clobber unrelated app-private state.
+/// `window.relativeKnobPathEscapes` walks the components and rejects anything
+/// whose `..` reaches at or above the base dir (and anything resolving to the
+/// dir itself, which names no file).
+///
+/// Returns null (and logs) when the name escapes, does not fit, or the activity
+/// has no data path, so a bad knob degrades to "no screenshot", never a crash
+/// and never a write somewhere else.
+fn resolveScreenshotPath(raw: []const u8) ?[:0]const u8 {
+    if (raw.len == 0) return null;
+    if (raw[0] == '/') {
+        return std.fmt.bufPrintZ(&screenshot_path_buf, "{s}", .{raw}) catch {
+            std.log.err("LABELLE_SCREENSHOT_PATH too long: {s}", .{raw});
+            return null;
+        };
+    }
+    if (comptime @hasDecl(window, "relativeKnobPathEscapes")) {
+        if (window.relativeKnobPathEscapes(raw)) {
+            std.log.err("LABELLE_SCREENSHOT_PATH '{s}' escapes the app's private dir — ignored", .{raw});
+            return null;
+        }
+    }
+    const dir_c = android_app.internalDataPath() orelse {
+        std.log.err("LABELLE_SCREENSHOT_PATH '{s}' is relative but the activity has no internal data path", .{raw});
+        return null;
+    };
+    return std.fmt.bufPrintZ(&screenshot_path_buf, "{s}/{s}", .{ std.mem.span(dir_c), raw }) catch {
+        std.log.err("LABELLE_SCREENSHOT_PATH too long once resolved: {s}", .{raw});
+        return null;
+    };
+}
+
+/// `LABELLE_FIXED_DT`'s accept/reject policy — the backend's own, so the file
+/// channel and the environment channel cannot disagree about what a valid
+/// timestep is.
+fn parseKnobDt(raw: []const u8) ?f32 {
+    if (comptime !@hasDecl(window, "parseFixedDtKnob")) return null;
+    return window.parseFixedDtKnob(raw);
+}
+
+/// `LABELLE_SCREENSHOT_AFTER_SEC`'s accept/reject policy, the backend's own so
+/// both channels agree. Notably rejects `inf`, which parses and is not
+/// negative but makes `elapsed >= after_sec` false forever — the run would
+/// capture nothing and merely look hung.
+fn parseKnobAfterSec(raw: []const u8) ?f32 {
+    if (comptime !@hasDecl(window, "parseAfterSecKnob")) return null;
+    return window.parseAfterSecKnob(raw);
+}
+
+/// Resolve ONE knob: the process ENVIRONMENT first (desktop parity), then the
+/// device knob file.
+///
+/// Per-knob on purpose. Resolving the whole screenshot request from whichever
+/// channel happened to carry the PATH meant a path exported in the environment
+/// plus a delay written to the knob file silently dropped the delay, and the
+/// capture fired on frame 1. Each knob now picks its own channel.
+fn knobValue(comptime name: [:0]const u8) ?[]const u8 {
+    if (comptime @hasDecl(window, "knobFromEnv")) {
+        if (window.knobFromEnv(name.ptr)) |v| return v;
+    }
+    return knobFromFile(name);
+}
+
 /// The project's DESIGN CANVAS, in design pixels — `.width`/`.height` from
 /// `project.labelle`. `pub` so GAME CODE can read it (labelle-bgfx#42).
 ///
@@ -138,7 +317,51 @@ fn gameInit() callconv(.c) void {
     defer if (comptime @hasDecl(engine, "script_contract") and @hasDecl(@This(), "scripting_enabled")) {
         engine.script_contract.unbind();
     };
-{{preview_setup}}{{init_code}}}
+    // Resolve the verification knobs once (see their declarations above).
+    // Both are `@hasDecl`/env gated, so this is a no-op on a release APK and on
+    // backends predating the helpers.
+    loadKnobFile();
+    if (comptime @hasDecl(window, "fixedDt")) fixed_dt = window.fixedDt();
+    if (fixed_dt == null) {
+        if (knobValue("LABELLE_FIXED_DT")) |raw| fixed_dt = parseKnobDt(raw);
+    }
+    // Path and delay resolve INDEPENDENTLY, each environment-first then file.
+    // Resolving both from whichever channel carried the path meant an exported
+    // `LABELLE_SCREENSHOT_PATH` plus a file-written delay dropped the delay and
+    // fired the capture on frame 1.
+    const shot_path: ?[]const u8 = knobValue("LABELLE_SCREENSHOT_PATH");
+    // A rejected delay (unparseable, negative, NaN, or `inf`) falls back to
+    // "capture as soon as possible" rather than to a gate that never fires.
+    const shot_after: f32 = blk: {
+        const raw = knobValue("LABELLE_SCREENSHOT_AFTER_SEC") orelse break :blk 0.0;
+        break :blk parseKnobAfterSec(raw) orelse {
+            std.log.err("LABELLE_SCREENSHOT_AFTER_SEC '{s}' is not a finite, non-negative number — capturing immediately", .{raw});
+            break :blk 0.0;
+        };
+    };
+    if (shot_path) |raw| {
+        if (resolveScreenshotPath(raw)) |resolved| {
+            screenshot_req = .{ .path = resolved, .after_sec = shot_after };
+        }
+    }
+    if (comptime @hasDecl(window, "captureFrameFor")) {
+        if (fixed_dt) |fdt| if (screenshot_req) |req| {
+            capture_frame = window.captureFrameFor(req.after_sec, fdt);
+        };
+    }
+
+{{preview_setup}}{{init_code}}
+    // Start the screenshot delay clock HERE, after the project's setup and
+    // scene load have run — not before them. Scene/plugin init on a device is
+    // slow (asset upload, script VM boot), and a baseline taken ahead of it
+    // spends the delay on work the capture was never meant to measure: with
+    // `--after=2` and a 1.5 s init, the capture lands 0.5 s into the run. The
+    // fixed-timestep path is unaffected either way (it counts SIMULATED frames
+    // from the first tick, and never reads this clock), which is exactly why
+    // the wall-clock path has to be anchored to the same instant: the first
+    // frame.
+    loop_start_ns = engine.nowNs();
+}
 
 // Per-frame tick: advance the engine, then render through bgfx. Mirrors
 // the desktop template's loop body (tick → beginFrame → render →
@@ -151,13 +374,14 @@ fn gameFrame() callconv(.c) void {
     // a fixed 0.016, so game speed doesn't drift if the device renders below
     // its target rate. Clamp to 4 frames at target_fps so a stall (app
     // backgrounded, GC pause) can't explode physics. Mirrors desktop.txt.
-    // No `LABELLE_FIXED_DT` override here (labelle-bgfx#59), unlike the desktop
-    // and wasm templates: an Android activity is launched by the system with no
-    // environment to inherit, so `window.fixedDt()` is hard-wired to null on
-    // this platform (same reason `envTruthy`/`headlessTicks` fold to their
-    // defaults there) — wiring it in would be provably dead code. Deterministic
-    // tick-indexed capture is a desktop/CI concern anyway.
-    const dt: f32 = @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
+    // `fixed_dt` (LABELLE_FIXED_DT, labelle-bgfx#59 / labelle-assembler#737)
+    // short-circuits the measurement when the caller has explicitly asked for a
+    // reproducible run; it is null on every normal run and on every release
+    // APK, so the measured branch below stays the default.
+    const dt: f32 = fixed_dt orelse @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / @as(f32, @floatFromInt(@max(target_fps, 1))));
+    // Count the frame whose tick is about to run, so the capture gate below
+    // (which sits AFTER `g.tick`) sees a 1-based count of SIMULATED frames.
+    frame_index += 1;
     // Engine works in the DESIGN canvas (config height); the gfx backend
     // owns the design→surface aspect-fit below. Keep these consistent with
     // gameInit and the sokol Android template.
@@ -174,7 +398,36 @@ fn gameFrame() callconv(.c) void {
     window.clearBackground(245, 245, 245, 255);
     g.render();
     g.renderGizmos();
-{{gui_draw_code}}    window.endFrame();
+{{gui_draw_code}}
+    // Screenshot capture (labelle-assembler#737). bgfx's `requestScreenShot` is
+    // ASYNC and must be queued BEFORE the swap so it captures THIS frame, so the
+    // call sits between the draw calls and `endFrame` — exactly where the desktop
+    // template puts it. There is no surfaceless path on Android: the activity
+    // always has a real ANativeWindow surface, so `captureHeadless` (offscreen
+    // framebuffer readback) does not apply here.
+    //
+    // One-shot: `screenshot_req` is cleared on the capture frame. We deliberately
+    // do NOT quit afterwards — an Android activity has no `--ticks` exit, and the
+    // harness stops the app once the file has landed.
+    if (comptime @hasDecl(window, "takeScreenshot")) {
+        if (screenshot_req) |req| {
+            const fire = if (capture_frame) |target|
+                // Fixed-timestep run: fire on the frame the delay was translated
+                // into, so the captured world state is identical every run. No
+                // clock is consulted at all — this is what makes two captures at
+                // the same fixed sim time byte-identical on device.
+                frame_index >= target
+            else blk: {
+                const elapsed_sec: f32 = @as(f32, @floatFromInt(engine.nowNs() - loop_start_ns)) / 1_000_000_000.0;
+                break :blk elapsed_sec >= req.after_sec;
+            };
+            if (fire) {
+                window.takeScreenshot(req.path);
+                screenshot_req = null;
+            }
+        }
+    }
+    window.endFrame();
 }
 
 // GPU-context-loss trampolines (epic #386 Phase 4). On Android,
