@@ -239,6 +239,70 @@ fn cacheWrite(_this: *CallbackInterface, id: u64, data: [*c]u8, size: u32) callc
     _ = .{ _this, id, data, size };
 }
 
+/// Does a bgfx capture of `format` need R and B swapped to become TGA's native
+/// B,G,R,A byte order?
+///
+/// Split out as a pure function so the decision is unit-testable without a GPU:
+/// the thing that can regress here is WHICH renderers get swizzled, and a test
+/// that merely checked some bytes came out would not catch it.
+///
+/// Only the explicitly RGBA-ordered 8-bit formats are swapped. Everything else —
+/// BGRA8 (Metal / D3D / Vulkan backbuffers, already TGA order) and any format
+/// bgfx might add later — is written verbatim, preserving the previous
+/// behaviour rather than guessing at an unknown layout.
+fn needsChannelSwap(format: bgfx.TextureFormat) bool {
+    return switch (format) {
+        .RGBA8 => true,
+        else => false,
+    };
+}
+
+/// Staging buffer size for the swizzling writer, in BYTES. A whole number of
+/// 4-byte pixels by construction — asserted below, because that is precisely
+/// what stops a pixel straddling a chunk boundary and getting the wrong two
+/// bytes exchanged.
+const swizzle_chunk = 1024 * 4;
+
+comptime {
+    std.debug.assert(swizzle_chunk % 4 == 0);
+}
+
+/// Exchange byte 0 and byte 2 of every whole 4-byte pixel in `buf` — RGBA→BGRA,
+/// which is its own inverse. Bytes 1 and 3 (G and A) are untouched, and a
+/// trailing partial pixel is left alone rather than half-swapped.
+///
+/// Pure and allocation-free so it can be tested directly on every target this
+/// backend builds for, including `aarch64-linux-android` (whose compile-check
+/// has no filesystem to write to).
+fn swapRedBlue(buf: []u8) void {
+    var i: usize = 0;
+    while (i + 3 < buf.len) : (i += 4) {
+        std.mem.swap(u8, &buf[i], &buf[i + 2]);
+    }
+}
+
+/// Write `len` bytes of one BGRA-ordered TGA row, swapping R and B on the way
+/// if the source is RGBA-ordered.
+///
+/// Chunked through a fixed stack buffer rather than an allocated row: this runs
+/// on bgfx's RENDER thread with no allocator in hand (the same constraint that
+/// makes the writer plain `fwrite`), and a fixed chunk keeps the stack frame
+/// bounded no matter how wide the surface is.
+fn writeRow(file: *std.c.FILE, row: [*]const u8, len: usize, swap: bool) bool {
+    if (!swap) return fwrite(row, 1, len, file) == len;
+
+    var chunk: [swizzle_chunk]u8 = undefined;
+    var off: usize = 0;
+    while (off < len) {
+        const n = @min(chunk.len, len - off);
+        @memcpy(chunk[0..n], row[off..][0..n]);
+        swapRedBlue(chunk[0..n]);
+        if (fwrite(&chunk, 1, n, file) != n) return false;
+        off += n;
+    }
+    return true;
+}
+
 /// Fulfil an async `bgfx::requestScreenShot` by writing `<file_path>.tga` as an
 /// uncompressed 32-bit TGA.
 ///
@@ -251,11 +315,21 @@ fn cacheWrite(_this: *CallbackInterface, id: u64, data: [*c]u8, size: u32) callc
 /// bottom-up (`yflip`, the OpenGL-style backends) or top-down, honouring a
 /// `pitch` that may exceed `width * 4`.
 ///
-/// `format` is accepted and IGNORED, exactly as `imageWriteTga` ignores it: bgfx
-/// hands back BGRA8 for a backbuffer capture, which is already TGA's native
-/// channel order, so there is no swizzle here (unlike `window.captureHeadless`,
-/// whose `readTexture` source is RGBA). Ignoring it also keeps the output
-/// byte-identical to the pre-#61 stub for any format bgfx might pass.
+/// `format` is HONOURED for channel order, and this is the one place the old
+/// code was wrong. TGA stores 32-bit pixels as B,G,R,A bytes, so a BGRA8
+/// capture can be written verbatim — which is what bgfx's Metal, Direct3D and
+/// Vulkan backbuffer readbacks hand over, and why this went unnoticed. The
+/// OpenGL/OpenGLES backbuffer readback is `glReadPixels(GL_RGBA, ...)` and bgfx
+/// reports it as `RGBA8`; written verbatim that lands R and B swapped on disk.
+/// Verified on a Galaxy Tab A7 (Adreno 610, OpenGLES): a pure-RED clear wrote a
+/// pure-BLUE TGA.
+///
+/// So the swizzle is decided per capture from `format` (see `needsChannelSwap`)
+/// rather than blanket-applied: the renderers that were already correct keep
+/// producing byte-identical output, and only the RGBA-ordered ones are fixed.
+/// Note this path is NOT the one the golden harnesses use — they capture via
+/// `window.captureHeadless`, which does its own R/B swap on its own `readTexture`
+/// source. The goldens are therefore untouched by this change.
 fn screenShot(
     _this: *CallbackInterface,
     file_path: [*:0]const u8,
@@ -267,7 +341,8 @@ fn screenShot(
     size: u32,
     yflip: bool,
 ) callconv(.c) void {
-    _ = .{ _this, format, size };
+    _ = .{ _this, size };
+    const swap = needsChannelSwap(format);
     const src: [*]const u8 = @ptrCast(data orelse return);
     if (width == 0 or height == 0) return;
 
@@ -313,7 +388,7 @@ fn screenShot(
         // `yflip` means the source's FIRST row is the image's BOTTOM row, so
         // walk it backwards to land a top-down TGA on disk.
         const src_row = if (yflip) height - 1 - row else row;
-        if (fwrite(src + src_row * src_pitch, 1, dst_pitch, file) != dst_pitch) {
+        if (!writeRow(file, src + src_row * src_pitch, dst_pitch, swap)) {
             log.err("screenshot: failed writing pixels to {s}", .{out_path});
             return;
         }
@@ -432,4 +507,49 @@ test "the assert policy defaults to breaking and only 'continue' opts out" {
     // process environment (which would leak into every later test in the run).
     try testing.expect(!std.ascii.eqlIgnoreCase("continue", "break"));
     try testing.expect(std.ascii.eqlIgnoreCase("continue", "CONTINUE"));
+}
+
+test "the screenshot swizzle is decided by FORMAT, not applied blanket" {
+    // The defect this guards: the callback used to ignore `format` entirely and
+    // write every capture verbatim, which is only correct for BGRA-ordered
+    // sources. Assert the DECISION per renderer family — a test that only
+    // checked "some swap happens" would pass a blanket swap, which would break
+    // the Metal/D3D/Vulkan captures that were already correct.
+    //
+    // RGBA8 is what bgfx's OpenGL/OpenGLES backbuffer readback reports, and the
+    // only case that must be swizzled.
+    try testing.expect(needsChannelSwap(.RGBA8));
+    // BGRA8 is what Metal / Direct3D / Vulkan report; already TGA's byte order.
+    try testing.expect(!needsChannelSwap(.BGRA8));
+    // Anything else keeps the pre-existing verbatim behaviour rather than
+    // guessing at a layout we have not verified.
+    try testing.expect(!needsChannelSwap(.RGBA16F));
+    try testing.expect(!needsChannelSwap(.RGB8));
+}
+
+test "swapRedBlue exchanges R and B per pixel and leaves G and A alone" {
+    // All four channels distinct so a swap of the WRONG pair would still fail.
+    var px = [_]u8{ 1, 2, 3, 4, 10, 20, 30, 40 };
+    swapRedBlue(&px);
+    try testing.expectEqualSlices(u8, &.{ 3, 2, 1, 4, 30, 20, 10, 40 }, &px);
+    // Its own inverse — applying it twice restores the original, which is what
+    // makes "swap only the RGBA renderers" a safe, reversible narrow fix.
+    swapRedBlue(&px);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 10, 20, 30, 40 }, &px);
+}
+
+test "swapRedBlue leaves a trailing partial pixel alone" {
+    // A row length is always a multiple of 4 in practice, but a half-swapped
+    // tail would be a silent corruption rather than a loud failure, so pin it.
+    var px = [_]u8{ 1, 2, 3, 4, 9, 9, 9 };
+    swapRedBlue(&px);
+    try testing.expectEqualSlices(u8, &.{ 3, 2, 1, 4, 9, 9, 9 }, &px);
+}
+
+test "the swizzle staging chunk holds whole pixels, so none can straddle it" {
+    // The chunked writer's one real risk is a pixel split across two `fwrite`
+    // chunks, which would exchange the wrong two bytes. That cannot happen while
+    // the chunk is a whole number of pixels — assert the property directly
+    // rather than trying to observe it through a file.
+    try testing.expectEqual(@as(usize, 0), swizzle_chunk % 4);
 }

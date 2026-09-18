@@ -209,6 +209,54 @@ var wasm_primary_pending: bool = false;
 // symbols are gated internally), but its state is only read on Android.
 const agp = @import("android_gamepad");
 
+// ── Link guarantee for the JNI translation unit (Android) ───────────
+//
+// `build.zig` compiles the shared `android_gamepad_jni.c` into THIS module on
+// Android — unconditionally, because the backend cannot know whether the game
+// above it will ever ask for a gamepad. That C file references four symbols it
+// does not define:
+//
+//   labelle_android_on_device_added / _removed        (labelle-core,
+//                                                      gamepad_source/android.zig)
+//   labelle_android_gamepad_state_added / _removed    (the shared
+//                                                      `android_gamepad` module)
+//
+// Both providers emit those symbols from a `comptime @export` block, and Zig
+// only analyzes — and therefore only EMITS — a file something REFERENCES. The
+// references used to live in `android.zig`, which is reached only through
+// `pub const android` at the bottom of this file: a decl that is itself only
+// analyzed when a consumer touches `input.android`. The generated engine main
+// does — but only along the paths that actually reach `input.android`, and any
+// game that never asks for a gamepad does NOT. The C reference then stays while
+// the referents vanish, and the resulting `libgame.so` carries UNDEFINED
+// symbols.
+//
+// A shared-library link ACCEPTS undefined symbols, so nothing fails at build
+// time — it fails at `dlopen`, on a device, as an `UnsatisfiedLinkError` before
+// the first frame. CI cannot see it.
+//
+// So the guarantee belongs to whoever links the referencing C, which is this
+// module. This is the repo's marker-decl/comptime-probe pattern rather than a
+// weak extern (weak externs are dead in this toolkit): a file-scope `comptime`
+// block is analyzed whenever this module is, which on Android is always — the
+// JNI TU is in this module's own compilation. Referencing the two provider
+// files here therefore pins their exports into every Android link, gamepad game
+// or not.
+//
+// `android.zig` keeps its own equivalent block: it is correct there too, and it
+// documents the requirement at the seam that motivates it. This one is the
+// unconditional backstop.
+comptime {
+    if (is_android) {
+        // Forces `labelle-core`'s `gamepad_source/android.zig` to be analyzed,
+        // emitting `labelle_android_on_device_added` / `_removed`.
+        _ = core.gamepad_source.platform;
+        // Forces the shared state module's `comptime @export` block, emitting
+        // `labelle_android_gamepad_state_added` / `_removed`.
+        _ = agp;
+    }
+}
+
 // Desktop gamepad source toggle (core#28 slice 5), forwarded from the backend
 // build.zig. When true (default, `.gamepad = .auto`) the shared windowless-SDL
 // desktop gamepad source is wired in and the DESKTOP gamepad getters below route
