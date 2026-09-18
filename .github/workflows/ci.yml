@@ -66,6 +66,10 @@ jobs:
       # `zig build pixel-water-golden-bless` after an intentional shader change.
       - name: Pixel-water golden (levels, waves, ripples, mask, scaling)
         run: zig build pixel-water-golden
+      - name: COND-07 real-art water, drops and foreground verification
+        run: python3 test/condenser_capture.py
+      - name: Build the interactive COND-07 scene
+        run: zig build condenser-demo-build
       # Post-fx seam golden (labelle-gfx#305 P2 Slice B, RFC §2.4 / §6): render the
       # fixed scene, run a bloom→crt stack through applyPostPass (render-target
       # ping-pong), composite onto the primary, and diff the surfaceless capture
@@ -378,3 +382,8 @@ jobs:
             echo "::endgroup::"
           done
           exit $fail
+      - name: COND-07 real-art water and drops (Vulkan, no display)
+        env:
+          DISPLAY: ""
+          WAYLAND_DISPLAY: ""
+        run: python3 test/condenser_capture.py

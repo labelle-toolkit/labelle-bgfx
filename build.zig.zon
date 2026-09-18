@@ -124,5 +124,7 @@
         // Standalone wasm/WebGL smoke example built by `zig build wasm-example`
         // (bgfx-wasm #8).
         "example",
+        "condenser_demo.zig",
+        "docs/issue-references/condenser-100/layers",
     },
 }

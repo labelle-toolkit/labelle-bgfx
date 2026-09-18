@@ -23,12 +23,11 @@
 //!      sheet, so `u_water_rect` is exercised at something other than (0,0,1,1);
 //!      then a level-1.0 reservoir whose mask reaches the TOP logical row
 //!
-//! FIXTURE CAVEAT: the real COND-07 condenser artwork is NOT in this repository
-//! (`docs/issue-references/condenser-100/` does not exist here), so every
-//! texture below is a small PROCEDURAL STAND-IN — a slab of reservoir "art", a
+//! FIXTURE CAVEAT: every texture below is a small PROCEDURAL STAND-IN, rather
+//! than the real COND-07 layered assets — a slab of reservoir "art", a
 //! bevelled silhouette mask and a banded reflection. They exercise every code
 //! path the real art will, but they are explicitly NOT the condenser. Wiring the
-//! real artwork into a runnable example is a later PR (RFC plan phases 2 and 6).
+//! real artwork has its own `condenser-demo` and `condenser-capture` targets.
 //!
 //! Beyond the image diff, the capture is checked for four SEMANTIC invariants
 //! that a value-only golden would happily bless away (both run in bless mode

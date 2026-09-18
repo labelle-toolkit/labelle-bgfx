@@ -191,10 +191,13 @@ machine the run exits `7` (`PIXEL_WATER_UNSUPPORTED`) instead of capturing — a
 static-fallback scene must never reach the golden, least of all through bless
 mode. Regenerate with `zig build pixel-water-golden-bless`.
 
-> **Fixture caveat.** The real COND-07 artwork is not in this repository, so the
-> golden's mask, reflection and reservoir art are small procedural stand-ins. They
-> exercise every code path the real art will; wiring the actual condenser into a
-> runnable example is later work (RFC plan phases 2 and 6).
+> **Fixture caveat.** The shader matrix golden uses procedural stand-ins. The
+> actual layered COND-07 artwork has a separate runnable scene and capture checks.
+
+Run `zig build condenser-demo` for the actual condenser with bottom water, falling
+drops, fading impact ripples and independent mist. `zig build condenser-capture`
+writes a deterministic GPU capture. See [the condenser example](example/CONDENSER.md)
+for fill, scale, animation captures and verification commands.
 
 ## Texture filtering seam (point/nearest sampling, #77)
 

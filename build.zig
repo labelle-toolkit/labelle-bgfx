@@ -596,6 +596,44 @@ pub fn build(b: *std.Build) void {
     const sampling_probe = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "texture_sampling_probe", "src/texture_sampling_probe.zig", false);
     b.step("texture-sampling-probe", "Verify point and linear filtering through real sprite/material draws").dependOn(&sampling_probe.step);
 
+    if (targetIsDesktop(target.result)) {
+        const capture_time = b.option(f32, "condenser-time", "Fixed simulation time for the condenser capture") orelse 1.4;
+        const level = b.option(f32, "condenser-level", "Reservoir fill level, 0..1") orelse 0.8;
+        const scale = b.option(u16, "condenser-scale", "Integer enlargement of the 103x55 asset canvas") orelse 8;
+        const fallback = b.option(bool, "condenser-fallback", "Draw the static reservoir as a negative control") orelse false;
+        const frames = b.option(u16, "condenser-frames", "Capture 1..180 frames at 30 fps") orelse 1;
+        if (!std.math.isFinite(capture_time) or capture_time < 0 or
+            !std.math.isFinite(level) or level < 0 or level > 1 or scale < 1 or scale > 32 or frames < 1 or frames > 180)
+            @panic("invalid condenser options: time >= 0, level 0..1, scale 1..32, frames 1..180");
+        inline for (.{ false, true }) |capture| {
+            const opts = b.addOptions();
+            opts.addOption(bool, "capture", capture);
+            opts.addOption(f32, "time", capture_time);
+            opts.addOption(f32, "level", level);
+            opts.addOption(u16, "scale", scale);
+            opts.addOption(bool, "fallback", fallback);
+            opts.addOption(u16, "frames", frames);
+            const exe = b.addExecutable(.{
+                .name = if (capture) "condenser_capture" else "condenser_demo",
+                .root_module = b.createModule(.{ .root_source_file = b.path("condenser_demo.zig"), .target = target, .optimize = optimize, .link_libc = true }),
+            });
+            exe.root_module.addImport("zbgfx", zbgfx_mod);
+            exe.root_module.addImport("gfx", gfx_mod);
+            exe.root_module.addImport("window", window_mod);
+            exe.root_module.addOptions("condenser_options", opts);
+            exe.root_module.linkLibrary(bgfx_artifact);
+            if (glfw_artifact) |a| exe.root_module.linkLibrary(a);
+            if (target.result.os.tag == .windows) {
+                exe.root_module.linkSystemLibrary("gdi32", .{});
+                exe.root_module.linkSystemLibrary("user32", .{});
+            }
+            const run = b.addRunArtifact(exe);
+            run.setCwd(b.path("."));
+            b.step(if (capture) "condenser-capture" else "condenser-demo", if (capture) "Capture the real COND-07 reservoir at a fixed time" else "Run COND-07 with drops and reactive water").dependOn(&run.step);
+            b.step(if (capture) "condenser-capture-build" else "condenser-demo-build", "Compile the COND-07 example").dependOn(&exe.step);
+        }
+    }
+
     const golden_check = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "material_golden", "src/material_golden.zig", false);
     const golden_step = b.step("material-golden", "Diff the material flash + palette_swap + dissolve + outline scene against the committed golden (#305)");
     golden_step.dependOn(&golden_check.step);
@@ -716,6 +754,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const test_step = b.step("test", "Run bgfx backend unit tests");
+    const sim_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/condenser_sim.zig"),
+        .target = host_target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(sim_tests).step);
     test_step.dependOn(&b.addRunArtifact(platform_tests).step);
 
     // ── Unit tests for the window-icon frame builder (labelle-cli#359) ──
