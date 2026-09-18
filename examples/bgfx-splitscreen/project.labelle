@@ -18,7 +18,13 @@
     // seeding (#761 Phase 2, engine#770) + the tagged multi-camera seeding;
     // gfx ≥ 1.26 has the tagged camera manager + per-layer camera binding
     // (camera-bound layers RFC #723 Phase 1).
-    .core_version = "1.28.0",
+    // core >= 1.32.0: `backend_contract.zig` carries the pixel-water payload
+    // (`MaterialEffect.pixel_water` + `PixelWaterDraw`) this backend implements
+    // (COND-07, #100), and `GizmoDraw.text`, which engine 2.11 / gfx 1.30 below
+    // already require. The generated build overrides the backend gfx module's
+    // core with THIS one (build_fragments/backend_dep.txt), so it is the pin
+    // that actually decides what the backend compiles against.
+    .core_version = "1.32.0",
     .engine_version = "2.11.0",
     .gfx_version = "1.30.0",
     // Local dev checkouts, resolved as siblings of the main labelle-bgfx
