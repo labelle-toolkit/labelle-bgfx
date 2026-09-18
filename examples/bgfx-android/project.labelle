@@ -53,12 +53,19 @@
         .min_sdk_version = 28,
         .target_sdk_version = 34,
     },
-    // core >= 1.32.0: `backend_contract.zig` carries the pixel-water payload
-    // (`MaterialEffect.pixel_water` + `PixelWaterDraw`) this backend implements
-    // (COND-07, #100), and `GizmoDraw.text`, which engine 2.11 / gfx 1.30 below
-    // already require. The generated build overrides the backend gfx module's
-    // core with THIS one (build_fragments/backend_dep.txt), so it is the pin
-    // that actually decides what the backend compiles against.
+    // The generated build overrides the backend gfx module's core with THIS one
+    // (build_fragments/backend_dep.txt), so this pin is what actually decides
+    // what the backend compiles against.
+    //
+    // ⚠ STALE PENDING RELEASES: the backend now requires core's game-owned
+    // `shader_material` contract + `backend_contract.Material.shader`
+    // (labelle-core#79), and the matching labelle-gfx#361 / labelle-engine#882.
+    // v1.32.0 predates all three, so this example does not build until core,
+    // gfx and engine ship their releases; bump core/gfx/engine together then.
+    // The backend itself still COMPILES against an older app core — the curated
+    // `MaterialEffect` switches in `src/gfx/texture.zig` and
+    // `src/gfx/programs.zig` are deliberately non-exhaustive — it is the
+    // shader-material contract types that are the hard floor.
     .core_version = "1.32.0",
     .engine_version = "2.11.0",
     .gfx_version = "1.30.0",

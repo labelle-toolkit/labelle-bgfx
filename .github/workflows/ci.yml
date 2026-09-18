@@ -352,12 +352,18 @@ jobs:
           # Prove it's truly display-less: no X/Wayland available to fall back on.
           DISPLAY: ""
           WAYLAND_DISPLAY: ""
+        # GitHub's default `run` shell is `bash -e`; `set -uo pipefail` does NOT
+        # clear that, so the FIRST failing probe used to abort the step before
+        # its captured output was ever echoed (the group showed empty). `set +e`
+        # restores the loop's documented intent: every probe runs, every failure
+        # prints, and `fail` decides the exit status.
         run: |
+          set +e
           set -uo pipefail
           fail=0
           for step in headless-probe mirror-probe screenshot-probe surfaceless-scale-probe; do
             echo "::group::$step"
-            # No `set -e`, so a non-zero build/run doesn't abort the loop — but
+            # `set +e` above, so a non-zero build/run doesn't abort the loop — but
             # capture the exit code and FOLD it into `fail` (a probe that printed
             # OK then crashed must still fail the job), alongside the OK-marker
             # check (which catches a build that produced no output at all).

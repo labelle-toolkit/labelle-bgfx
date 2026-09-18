@@ -382,13 +382,21 @@ fn buildMaterialProgram(fs_data: []const u8) bgfx.ProgramHandle {
 }
 
 /// The material program backing `effect` (invalid sentinel for `none`/unbuilt).
+///
+/// Non-exhaustive for the same reason as `texture.materialSupported`: a
+/// generated game overrides this module's `labelle-core` with the app's, whose
+/// `MaterialEffect` may carry members this pin does not (e.g. the retired
+/// `.pixel_water`). `texture.zig`'s comptime tripwire fails the build if core
+/// gains a curated effect neither list knows about.
 fn programForEffect(effect: MaterialEffect) bgfx.ProgramHandle {
     return switch (effect) {
         .flash => flash_program,
         .palette_swap => palette_program,
         .dissolve => dissolve_program,
         .outline => outline_program,
-        .none => .{ .idx = std.math.maxInt(u16) },
+        // `.none`, plus any effect this backend does not implement on the app's
+        // core — a stray draw must never pick up an unrelated program.
+        else => .{ .idx = std.math.maxInt(u16) },
     };
 }
 

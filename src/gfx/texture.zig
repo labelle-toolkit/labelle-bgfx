@@ -529,11 +529,50 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
 
 /// Curated effects implemented by this backend. Generic materials are queried
 /// separately through shaderMaterialSupported.
+///
+/// The prong list is DELIBERATELY non-exhaustive (`else => false`). A generated
+/// game's build replaces this module's `labelle-core` with the APP's core
+/// (`build_fragments/backend_dep.txt` — `overrideImport(backend_gfx,
+/// "labelle-core", core_mod)`), so the `MaterialEffect` this compiles against is
+/// the app's, not this repo's pin. Every sprite draw reaches this function
+/// through `core.Backend(Impl).materialSupported` (labelle-gfx
+/// `retained_engine/draw.zig`), so an exhaustive switch makes the WHOLE backend
+/// fail to compile against any core whose enum differs from the pin — including
+/// the pre-shader-material cores that still carry `.pixel_water`. A backend must
+/// degrade against a differently-versioned app core, never break its build.
+/// The comptime tripwire below puts the "core gained a NEW curated effect" build
+/// failure back, which the `else` prong would otherwise swallow.
 pub fn materialSupported(effect: MaterialEffect) bool {
     return switch (effect) {
         .flash, .palette_swap, .dissolve, .outline => true,
-        .none => false,
+        // `.none` (the no-material fast path), plus any effect this backend does
+        // not implement on the app's core (e.g. the retired `.pixel_water`).
+        else => false,
     };
+}
+
+// Exhaustiveness tripwire for the `MaterialEffect` switches here and in
+// `programs.programForEffect`. Both give up their exhaustive prong lists so a
+// differently-versioned app core still compiles (see above), which would
+// otherwise mean a NEW curated effect landing in labelle-core silently reading
+// as "unsupported" here instead of failing the build. This puts that failure
+// back. `pixel_water` is listed as KNOWN-but-unimplemented: cores predating the
+// game-owned shader materials still declare it, and this backend now answers
+// `false` for it (games own the effect through `createShaderMaterial`).
+comptime {
+    for (std.enums.values(MaterialEffect)) |eff| {
+        const name = @tagName(eff);
+        const known = std.mem.eql(u8, name, "none") or
+            std.mem.eql(u8, name, "flash") or
+            std.mem.eql(u8, name, "palette_swap") or
+            std.mem.eql(u8, name, "dissolve") or
+            std.mem.eql(u8, name, "outline") or
+            std.mem.eql(u8, name, "pixel_water");
+        if (!known) @compileError(
+            "bgfx: labelle-core gained MaterialEffect." ++ name ++
+                " — handle it in texture.materialSupported and programs.programForEffect",
+        );
+    }
 }
 
 /// Material-aware sprite draw — the bgfx impl of labelle-core's optional
