@@ -20,7 +20,7 @@ for i in range(_gif.n_frames):
 F = np.stack(_fr)
 # --- measured grid (README: "The native grid") ---
 CELL = 6          # measured block size of the animated overlay
-OX, OY = 2, 0     # detail-px origin of the grid-aligned canvas (room grid phase 0)
+OX, OY = 2, 0     # detail-px origin of the grid-aligned overlay canvas
 NW, NH = 103, 55  # native canvas, cells
 
 MED=np.median(F,axis=0)

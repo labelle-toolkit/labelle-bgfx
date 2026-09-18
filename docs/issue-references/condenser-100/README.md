@@ -11,12 +11,11 @@ file exists. Read "What is solid and what is not" before treating any of it as g
 | File | What it is |
 |------|------------|
 | `condenser-detail.gif` | 620x330, 72 frames. The approved reference, preserved unmodified. |
-| `condenser-room.gif` | 1792x1008, 72 frames. The full room the detail is cropped from. |
 | `layers/*.png` | Derived layers, native art resolution, RGBA. |
 
-`condenser-detail.gif` is a **1:1 pixel crop** of `condenser-room.gif` at offset (100, 390).
-Verified by template match: mean abs error 0.38/255 per channel over the whole 620x330 region.
-It is not a zoom — both GIFs are at the same pixel scale.
+Only the cropped condenser reference is included. The wider room reference is
+excluded because it contains other artwork that is not available for use here.
+The extraction script requires only `condenser-detail.gif`.
 
 ## The native grid: measured, not assumed
 
@@ -25,7 +24,7 @@ Issue #100's preview uses 6x6 screen-pixel effect cells. That number turns out t
 
 ### Method
 
-Four independent measurements on frame 0 of both GIFs:
+The asset investigation used four independent measurements:
 
 1. **Run lengths.** In a nearest-neighbour enlargement of a k-px canvas, every horizontal
    and vertical run of identical pixels is a multiple of k. Here run length **1** dominates
@@ -38,30 +37,29 @@ Four independent measurements on frame 0 of both GIFs:
 3. **Edge spacing.** Column- and row-summed absolute gradient, peaks above mean+1.2σ.
    The spacings are overwhelmingly **6** (and 5 or 7), with larger gaps at near-multiples
    of 6 (13, 19, 26, 32, 51, 77). So a ~6 px block *brush* is real.
-4. **Phase stability.** Splitting the room GIF into eight vertical and six horizontal bands
-   and fitting the best k=6 phase per band gives phases 3,0,1,3,3,1,1,1 (X) and 4,0,0,2,0,3 (Y),
-   with a contrast (best phase / mean phase) of only 1.08..1.76.
+4. **Phase stability.** The original investigation's band-by-band fits found
+   inconsistent k=6 phases, with a contrast (best phase / mean phase) of only 1.08..1.76.
    **Control:** a genuine 6x nearest upscale of the same image scores contrast **6.00**,
    with all five non-boundary phases at exactly **0.00**.
 
 ### Conclusion
 
-> There is no true native pixel grid in this artwork. It is a 1792x1008 raster painted
+> There is no true native pixel grid in this artwork. It is a raster painted
 > in a pixel-art *style*, with a characteristic ~6 px block size, no globally phase-locked
 > grid, and full-resolution grain on top. "6x6" is a property of the effect overlay
 > that was animated on top of it, not of the art.
 
 The **animated layer does** sit on a clean grid. All five drop columns are exactly 6 px
 wide and all five start at the same phase: detail x = 152, 194, 284, 332, 416
-(all ≡ 2 mod 6), which is **x ≡ 0 mod 6 in room coordinates**. Drop trails also terminate
+(all ≡ 2 mod 6 in the cropped reference). Drop trails also terminate
 on exact 6 px boundaries (e.g. y = 204).
 
 ### Working native canvas adopted here
 
-Anchored to the overlay's grid, phase 0 in room coordinates:
+Anchored to the overlay's grid in the cropped condenser reference:
 
 * cell size **6x6 screen px**
-* origin: room px (102, 390) = detail px (2, 0)
+* origin: detail px (2, 0)
 * canvas **103 x 55 native px** (detail px x ∈ [2, 620), y ∈ [0, 330))
 
 Per-cell **median** downsample. Cost of resampling an unaligned image:
