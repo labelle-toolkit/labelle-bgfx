@@ -55,6 +55,17 @@ jobs:
       # intentional shader change.
       - name: Material golden (flash + palette_swap + dissolve + outline)
         run: zig build material-golden
+      # Pixel-water golden (COND-07, #100 / RFC-PIXEL-WATER §4): render the
+      # fixed-TIME reservoir matrix — fill levels, the waves flag, ripple
+      # start/mid/expired, edge impacts, masked-out pixels, grid quantization,
+      # native/2x/4x nearest scaling and two independent reservoirs — surfaceless,
+      # and diff it against its OWN committed golden (never the material one).
+      # The harness additionally asserts two semantic invariants (an expired
+      # ripple and a ripple past `ripple_count` must both contribute nothing),
+      # which it also enforces in bless mode. Regenerate with
+      # `zig build pixel-water-golden-bless` after an intentional shader change.
+      - name: Pixel-water golden (levels, waves, ripples, mask, scaling)
+        run: zig build pixel-water-golden
       # Post-fx seam golden (labelle-gfx#305 P2 Slice B, RFC §2.4 / §6): render the
       # fixed scene, run a bloom→crt stack through applyPostPass (render-target
       # ping-pong), composite onto the primary, and diff the surfaceless capture

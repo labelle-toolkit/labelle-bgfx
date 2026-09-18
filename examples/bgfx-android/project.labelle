@@ -21,6 +21,18 @@
     .height = 600,
     .target_fps = 60,
     .backend = .bgfx,
+    // Resolve the bgfx backend from THIS repo, exactly like the two desktop
+    // examples. Without it the builtin `.backend = .bgfx` provider pins a stale
+    // RELEASED tag, and CI's "bgfx-android example .so cross-build" job — the
+    // one job that is supposed to prove this backend works end-to-end through
+    // the toolkit — fetched `backend bgfx 0.6.6 (remote)` and never compiled a
+    // line of the PR under test (found while investigating #100 review round 2;
+    // the workflow comment already claimed this example used `local:../..`).
+    .backend_package = .{
+        .name = "bgfx",
+        .repo = "local:../..",
+        .version = "0.19.0",
+    },
     .y_axis = .up,
     .ecs = .mock,
     .initial_prefab = "main",
@@ -41,7 +53,13 @@
         .min_sdk_version = 28,
         .target_sdk_version = 34,
     },
-    .core_version = "1.28.0",
+    // core >= 1.32.0: `backend_contract.zig` carries the pixel-water payload
+    // (`MaterialEffect.pixel_water` + `PixelWaterDraw`) this backend implements
+    // (COND-07, #100), and `GizmoDraw.text`, which engine 2.11 / gfx 1.30 below
+    // already require. The generated build overrides the backend gfx module's
+    // core with THIS one (build_fragments/backend_dep.txt), so it is the pin
+    // that actually decides what the backend compiles against.
+    .core_version = "1.32.0",
     .engine_version = "2.11.0",
     .gfx_version = "1.30.0",
     .labelle_version = "local:../../../labelle-cli",
