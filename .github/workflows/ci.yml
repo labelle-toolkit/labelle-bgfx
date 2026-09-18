@@ -54,6 +54,12 @@ jobs:
       # when ffmpeg is missing).
       - name: Desktop video decode test really ran (not skipped)
         run: |
+          # GitHub's default `run` shell is `bash -e`, and `set -uo pipefail`
+          # does NOT clear that (see the surfaceless-probe step below). Without
+          # `set +e` the capture assignment aborts the step the moment the
+          # command fails — before the output is echoed and before the explicit
+          # status check runs — so a genuine failure shows up as an empty group.
+          set +e
           set -uo pipefail
           out=$(zig build test-video-desktop --summary all 2>&1); rc=$?
           echo "$out"
@@ -371,6 +377,12 @@ jobs:
           DISPLAY: ""
           WAYLAND_DISPLAY: ""
         run: |
+          # GitHub's default `run` shell is `bash -e`, and `set -uo pipefail`
+          # does NOT clear that (see the surfaceless-probe step below). Without
+          # `set +e` the capture assignment aborts the step the moment the
+          # command fails — before the output is echoed and before the explicit
+          # status check runs — so a genuine failure shows up as an empty group.
+          set +e
           set -uo pipefail
           cd labelle-bgfx/examples/bgfx-android
           # Desktop target (no --platform): same project.labelle, same scenes/,
