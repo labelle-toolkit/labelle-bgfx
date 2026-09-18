@@ -405,7 +405,8 @@ fn initWindowWasm(w: i32, h: i32) void {
     init.platformData.type = .Default;
     bgfx_callback.install(&init);
 
-    _ = bgfx.init(&init);
+    if (!bgfx.init(&init)) return;
+    gfx.shaderMaterialContextStarted();
 
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
     bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));
@@ -443,7 +444,8 @@ fn initWindowAndroid(w: i32, h: i32) void {
     init.platformData.type = .Default;
     bgfx_callback.install(&init);
 
-    _ = bgfx.init(&init);
+    if (!bgfx.init(&init)) return;
+    gfx.shaderMaterialContextStarted();
 
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
     bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));
@@ -588,6 +590,7 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
         }
     }
 
+    gfx.shaderMaterialContextStarted();
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
     bgfx.setViewRect(0, 0, 0, @intCast(screen_w), @intCast(screen_h));
 
@@ -693,6 +696,8 @@ pub fn initHeadless(w: i32, h: i32) bool {
         bgfx.shutdown();
         return false;
     }
+
+    gfx.shaderMaterialContextStarted();
 
     // Both init and the framebuffer succeeded — commit the window globals now.
     screen_w = w;

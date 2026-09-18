@@ -14,7 +14,6 @@ const astc = @import("astc.zig");
 
 const MaterialEffect = core.backend_contract.MaterialEffect;
 const Material = core.backend_contract.Material;
-const PixelWaterDraw = core.backend_contract.PixelWaterDraw;
 
 // stb_image goes through a tiny shim that empties out clang's nullability
 // qualifiers before include. Zig 0.16's translate-c rejects `_Nonnull` on
@@ -123,6 +122,7 @@ fn findFreeTextureSlot() ?u32 {
 pub fn destroyAllTextures() void {
     for (0..MAX_TEXTURES) |i| {
         if (texture_handles[i].idx != std.math.maxInt(u16)) {
+            @import("shader_material.zig").invalidateTexture(@enumFromInt(i));
             bgfx.destroyTexture(texture_handles[i]);
             texture_handles[i] = .{ .idx = std.math.maxInt(u16) };
         }
@@ -422,6 +422,7 @@ pub fn unloadTexture(texture: Texture) void {
     if (texture.id.toInt() < MAX_TEXTURES) {
         const handle = texture_handles[texture.id.toInt()];
         if (handle.idx != std.math.maxInt(u16)) {
+            @import("shader_material.zig").invalidateTexture(texture.id);
             bgfx.destroyTexture(handle);
             texture_handles[texture.id.toInt()] = .{ .idx = std.math.maxInt(u16) };
         }
@@ -526,62 +527,13 @@ pub fn drawTexturePro(texture: Texture, source: Rectangle, dest: Rectangle, orig
     programs.submitTexturedTriangles(&vertices, handle);
 }
 
-/// Which curated material effects this bgfx backend implements (labelle-gfx#305).
-/// The fine-grained gate `core.Backend(Impl).drawTextureProMaterial` consults
-/// before dispatching: the full curated set — `flash`, `palette_swap`,
-/// `dissolve`, `outline` — is implemented, plus `pixel_water` (#100) through its
-/// own draw decl; only `none` (the no-material fast path) returns false. Kept in
-/// sync with `programs.submitMaterialTriangles`'s effect switch,
-/// `programs.submitPixelWaterTriangles` + the `.material_effects` capability
-/// manifests.
-///
-/// `pixel_water` is reached BY NAME rather than as a literal switch prong. A
-/// generated game's build replaces this module's `labelle-core` with the APP's
-/// core (`build_fragments/backend_dep.txt` — `overrideImport(backend_gfx,
-/// "labelle-core", core_mod)`), so the `MaterialEffect` this compiles against is
-/// the app's, not this repo's pin. On an app core older than v1.32 that enum has
-/// no `.pixel_water` member, and a literal prong would make THIS function — which
-/// every sprite draw reaches through `core.Backend(Impl).materialSupported`
-/// (labelle-gfx `retained_engine/draw.zig`) — fail to compile there. A backend
-/// must degrade against an older app core, never break its build; the water path
-/// is simply invisible to a core that has no name for it. Verified by generating
-/// `examples/bgfx` against core v1.28.0.
+/// Curated effects implemented by this backend. Generic materials are queried
+/// separately through shaderMaterialSupported.
 pub fn materialSupported(effect: MaterialEffect) bool {
-    // `pixel_water` (#100) is the ONE effect whose support is not implied by
-    // `drawTextureProMaterial`: it rides its own `drawTextureProPixelWater` decl,
-    // and the contract additionally requires this to go false once the water
-    // program has failed to build on THIS renderer. `waterProgramAvailable`
-    // reports exactly that (and never forces a build — see programs.zig).
-    if (@hasField(MaterialEffect, "pixel_water")) {
-        if (effect == @field(MaterialEffect, "pixel_water")) return programs.waterProgramAvailable();
-    }
     return switch (effect) {
         .flash, .palette_swap, .dissolve, .outline => true,
-        // `.none` (the no-material fast path), plus `.pixel_water` on a core that
-        // has it — handled above, so this prong is never its answer.
-        else => false,
+        .none => false,
     };
-}
-
-// Exhaustiveness tripwire for the two `MaterialEffect` switches above and in
-// `programs.programForEffect`. Both had to give up their exhaustive prong lists
-// so an older app core still compiles (see `materialSupported`), which would
-// otherwise mean a NEW curated effect landing in labelle-core silently reads as
-// "unsupported" here instead of failing the build. This puts that failure back.
-comptime {
-    for (std.enums.values(MaterialEffect)) |eff| {
-        const name = @tagName(eff);
-        const known = std.mem.eql(u8, name, "none") or
-            std.mem.eql(u8, name, "flash") or
-            std.mem.eql(u8, name, "palette_swap") or
-            std.mem.eql(u8, name, "dissolve") or
-            std.mem.eql(u8, name, "outline") or
-            std.mem.eql(u8, name, "pixel_water");
-        if (!known) @compileError(
-            "bgfx: labelle-core gained MaterialEffect." ++ name ++
-                " — handle it in texture.materialSupported and programs.programForEffect",
-        );
-    }
 }
 
 /// Material-aware sprite draw — the bgfx impl of labelle-core's optional
@@ -609,6 +561,17 @@ pub fn drawTextureProMaterial(
     if (texture.id.toInt() >= MAX_TEXTURES) return;
     const handle = texture_handles[texture.id.toInt()];
     if (handle.idx == std.math.maxInt(u16)) return;
+
+    if (material.shader != .none) {
+        if (texture.width <= 0 or texture.height <= 0) return;
+        const tw: f32 = @floatFromInt(texture.width);
+        const th: f32 = @floatFromInt(texture.height);
+        const rect = [4]f32{ source.x / tw, source.y / th, (source.x + @abs(source.width)) / tw, (source.y + @abs(source.height)) / th };
+        const vertices = buildQuadVertices(@intCast(texture.width), @intCast(texture.height), source, dest, origin, rotation, tint.toAbgr());
+        if (!programs.submitShaderMaterialTriangles(&vertices, handle, material.shader, rect))
+            drawTexturePro(texture, source, dest, origin, rotation, tint);
+        return;
+    }
 
     // Per-effect runtime gate: `materialSupported` says bgfx IMPLEMENTS this
     // effect, but its program may have failed to link on THIS renderer while the
@@ -691,84 +654,6 @@ pub fn drawTextureProMaterial(
         ),
         else => programs.submitTexturedTriangles(&vertices, handle),
     }
-}
-
-/// Pixel-water sprite draw — the bgfx impl of labelle-core's optional
-/// `drawTextureProPixelWater` contract (COND-07, #100 / RFC-PIXEL-WATER). Same
-/// quad-build, blending, source-rect/flip handling, transform and view order as
-/// `drawTexturePro`; only the program and uniforms differ (see
-/// `programs.submitPixelWaterTriangles`).
-///
-/// DEGRADES to a plain sprite — the authored STATIC reservoir art, which is
-/// exactly the fallback the RFC specifies — when either:
-///   * the water program failed to build/link on this renderer, or
-///   * `mask_texture` is absent/out of range/dead. The mask is not optional:
-///     without a silhouette there is nothing to clip the water to, and the
-///     contract already expects authoring-time validation to have caught it.
-/// The REFLECTION is optional: an absent/dead handle binds the sprite's own
-/// texture as a harmless dummy (unit 2 must never be an unbound-sampler read)
-/// and zeroes `has_reflection`, so the body colours render on their own.
-pub fn drawTextureProPixelWater(
-    texture: Texture,
-    source: Rectangle,
-    dest: Rectangle,
-    origin: Vector2,
-    rotation: f32,
-    tint: Color,
-    water: PixelWaterDraw,
-) void {
-    if (texture.id.toInt() >= MAX_TEXTURES) return;
-    const handle = texture_handles[texture.id.toInt()];
-    if (handle.idx == std.math.maxInt(u16)) return;
-
-    // Program gate first: a renderer whose driver rejects fs_pixel_water leaves
-    // every OTHER effect untouched and only water falls back here.
-    if (!programs.waterProgramReady()) {
-        drawTexturePro(texture, source, dest, origin, rotation, tint);
-        return;
-    }
-
-    // The mask is required (see the doc comment).
-    const mask_id = water.mask_texture;
-    if (mask_id == 0 or mask_id >= MAX_TEXTURES) {
-        drawTexturePro(texture, source, dest, origin, rotation, tint);
-        return;
-    }
-    const mask_handle = texture_handles[mask_id];
-    if (mask_handle.idx == std.math.maxInt(u16)) {
-        drawTexturePro(texture, source, dest, origin, rotation, tint);
-        return;
-    }
-
-    // The reflection is optional — same normalisation shape as `dissolve`'s
-    // optional noise texture: bind a valid dummy and clear the id so the shader
-    // gate (`has_reflection`) goes to 0.
-    var w = water;
-    var reflect_handle = handle;
-    const reflect_id = water.reflection_texture;
-    if (reflect_id != 0 and reflect_id < MAX_TEXTURES and
-        texture_handles[reflect_id].idx != std.math.maxInt(u16))
-    {
-        reflect_handle = texture_handles[reflect_id];
-    } else {
-        w.reflection_texture = 0;
-    }
-
-    // The sprite's source frame in whole-atlas UV space (u0, v0, u1, v1) — the
-    // shader turns the atlas UV into reservoir-local art pixels with it.
-    // Absolute extents so the flip convention (negative source dims) can't
-    // invert the bounds. (0,0,1,1) for a standalone texture.
-    const tw: f32 = @floatFromInt(texture.width);
-    const th: f32 = @floatFromInt(texture.height);
-    const rect = [4]f32{
-        source.x / tw,
-        source.y / th,
-        (source.x + @abs(source.width)) / tw,
-        (source.y + @abs(source.height)) / th,
-    };
-
-    const vertices = buildQuadVertices(@intCast(texture.width), @intCast(texture.height), source, dest, origin, rotation, tint.toAbgr());
-    programs.submitPixelWaterTriangles(&vertices, handle, mask_handle, reflect_handle, w, rect);
 }
 
 /// Draw an externally-owned bgfx texture — one NOT in this module's pool —

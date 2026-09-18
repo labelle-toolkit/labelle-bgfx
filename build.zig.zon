@@ -69,11 +69,9 @@
         // (`window_contract.zig` - width/height/frameDuration/requestQuit), the
         // unification target for the beginDrawing->beginFrame / getScreenWidth->
         // width / windowShouldClose->shouldQuit renames in this backend.
-        // FLOOR IS NOW v1.32.0: `backend_contract.zig` gained the pixel-water
-        // payload types (`PixelWaterDraw` / `PixelWaterRipple` / `PixelWaterRgba`
-        // / `PIXEL_WATER_MAX_RIPPLES` / `PIXEL_WATER_FLAG_WAVES`) that
-        // `src/gfx.zig` re-exports and `drawTextureProPixelWater` consumes
-        // (COND-07, #100). An older pin will not compile.
+        // Generic materials require the core.shader_material contract. Until its
+        // release is pinned here, use -Dcore-source=/path/to/core/src/root.zig
+        // or the generated application's unified labelle-core import.
         .labelle_core = .{
             .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v1.32.0.tar.gz",
             .hash = "labelle_core-1.32.0-OauRcEK_BwBqC6MEsf3Bxqdo_kGeF2DRrwJbJWqspkoT",

@@ -269,7 +269,11 @@ pub fn build(b: *std.Build) void {
     // a real type-crossing case). The single `core_mod` is shared by `input_mod`
     // and `window_mod` so they reference one module instance.
     const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
-    const core_mod = core_dep.module("labelle-core");
+    const core_mod = if (b.option([]const u8, "core-source", "Path to labelle-core src/root.zig for unreleased contract integration")) |path|
+        b.createModule(.{ .root_source_file = .{ .cwd_relative = path }, .target = target, .optimize = optimize })
+    else
+        core_dep.module("labelle-core");
+    if (sdl_gp_mod) |m| m.addImport("labelle_core", core_mod);
     input_mod.addImport("labelle-core", core_mod);
     // gfx.zig asserts the render contract (`core.assertBackend`) at comptime.
     gfx_mod.addImport("labelle-core", core_mod);
@@ -438,6 +442,21 @@ pub fn build(b: *std.Build) void {
     }
     // Same as the feasibility probe: build + run only on demand via its step, not
     // installed on a plain `zig build` (keeps cross targets + GPU-less CI green).
+    const shader_probe = b.addExecutable(.{
+        .name = "shader_material_probe",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/shader_material_probe.zig"), .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    shader_probe.root_module.addImport("gfx", gfx_mod);
+    shader_probe.root_module.addImport("window", window_mod);
+    shader_probe.root_module.addImport("labelle-core", core_mod);
+    shader_probe.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| shader_probe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        shader_probe.root_module.linkSystemLibrary("gdi32", .{});
+        shader_probe.root_module.linkSystemLibrary("user32", .{});
+    }
+    b.step("shader-material-probe", "Verify generic shader material pixels, reflection, fallback and context recreation on a GPU").dependOn(&b.addRunArtifact(shader_probe).step);
+
     const mprobe_step = b.step("mirror-probe", "Run the headless + mirror validation probe (#36 + mirror)");
     mprobe_step.dependOn(&b.addRunArtifact(mprobe).step);
 
@@ -604,23 +623,6 @@ pub fn build(b: *std.Build) void {
     const golden_bless_step = b.step("material-golden-bless", "Regenerate the material golden TGA (#305)");
     golden_bless_step.dependOn(&golden_bless_run.step);
 
-    // ── Pixel-water golden harness (COND-07, #100 / RFC-PIXEL-WATER §4) ──────
-    // `zig build pixel-water-golden`       — render the fixed-TIME reservoir
-    //     matrix (levels, waves on/off, ripple start/mid/expired, edge impacts,
-    //     masked-out pixels, grid quantization, native/2x/4x scaling, two
-    //     independent reservoirs) headless and DIFF it against the committed
-    //     golden TGA (CI gate).
-    // `zig build pixel-water-golden-bless` — regenerate + overwrite the golden.
-    // DELIBERATELY its own capture: the water effect must never be able to pass
-    // by re-blessing the material golden. See src/pixel_water_golden.zig.
-    const water_golden_check = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "pixel_water_golden", "src/pixel_water_golden.zig", false);
-    const water_golden_step = b.step("pixel-water-golden", "Diff the pixel-water reservoir matrix against the committed golden (#100)");
-    water_golden_step.dependOn(&water_golden_check.step);
-
-    const water_golden_bless_run = GoldenBuild.make(b, target, optimize, zbgfx_mod, gfx_mod, window_mod, bgfx_artifact, glfw_artifact, "pixel_water_golden", "src/pixel_water_golden.zig", true);
-    const water_golden_bless_step = b.step("pixel-water-golden-bless", "Regenerate the pixel-water golden TGA (#100)");
-    water_golden_bless_step.dependOn(&water_golden_bless_run.step);
-
     // ── Post-fx golden harness (labelle-gfx#305 P2 Slice B, RFC §2.4 / §6) ────
     // `zig build post-fx-golden`       — render the fixed scene, run a bloom→crt
     //     stack through applyPostPass (render-target ping-pong), and DIFF the
@@ -716,6 +718,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const test_step = b.step("test", "Run bgfx backend unit tests");
+    const shader_material_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/shader_material_tests.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "labelle-core", .module = core_mod }},
+    }) });
+    const shader_material_run = b.addRunArtifact(shader_material_tests);
+    test_step.dependOn(&shader_material_run.step);
+    b.step("test-shader-material", "Run generic shader material ownership, validation and lifecycle tests").dependOn(&shader_material_run.step);
+
     test_step.dependOn(&b.addRunArtifact(platform_tests).step);
 
     // ── Unit tests for the window-icon frame builder (labelle-cli#359) ──
@@ -1199,7 +1211,10 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // desktop/android). No core type crosses the engine seam through these
     // modules, so the backend's own pin resolves it.
     const core_dep = b.dependency("labelle_core", .{ .target = target, .optimize = optimize });
-    const core_mod = core_dep.module("labelle-core");
+    const core_mod = if (b.option([]const u8, "core-source", "Path to labelle-core src/root.zig for unreleased contract integration")) |path|
+        b.createModule(.{ .root_source_file = .{ .cwd_relative = path }, .target = target, .optimize = optimize })
+    else
+        core_dep.module("labelle-core");
 
     // ── Gfx backend module ──────────────────────────────────────────
     // `link_libc = true` for stb_image (malloc/free/memcpy) + gfx/texture.zig's
