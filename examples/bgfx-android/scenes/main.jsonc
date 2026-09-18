@@ -12,7 +12,10 @@
     // which would defer the scene until a loading controller advances it.
     // The "icons" atlas comes from project.labelle's `.resources`.
     "name": "main",
-    "entities": [
+    // Flat top-level "children" (RFC #560 / engine #592). The legacy
+    // "entities" key was REMOVED in engine v2.0 — the loader now hard-errors
+    // on it, which aborted this app during gameInit on device (#104).
+    "children": [
         {
             "name": "rect",
             "components": {

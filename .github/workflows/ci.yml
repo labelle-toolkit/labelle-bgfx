@@ -86,7 +86,7 @@ jobs:
   # externalUsesEnumPath fix are unreleased, so build them from main). Build-only —
   # produces the aarch64 NativeActivity libgame.so; no device/emulator/APK.
   android-example:
-    name: bgfx-android example .so cross-build
+    name: bgfx-android example — .so cross-build + host scene-load smoke
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -245,6 +245,21 @@ jobs:
         with:
           version: 0.16.0
 
+      # For the HOST smoke below (labelle-bgfx#104): the same desktop build the
+      # `headless-linux` job needs — GLFW's X11/Wayland headers to link, plus
+      # Mesa **lavapipe** so `--headless` (which forces Vulkan) has a software
+      # device with no display server. Kept identical to that job's list on
+      # purpose; they provision the same thing.
+      - name: Install desktop build + Vulkan (lavapipe) deps for the host smoke
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libsdl2-dev \
+            libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev \
+            libvulkan-dev libvulkan1 mesa-vulkan-drivers
+
       - name: Set up Android NDK
         id: ndk
         uses: nttld/setup-ndk@v1
@@ -258,6 +273,7 @@ jobs:
           path: |
             ~/.cache/zig
             labelle-bgfx/examples/bgfx-android/.labelle/bgfx_android/.zig-cache
+            labelle-bgfx/examples/bgfx-android/.labelle/bgfx_desktop/.zig-cache
           key: bgfx-android-${{ env.LABELLE_CLI_TAG }}-${{ env.LABELLE_ASSEMBLER_TAG }}-${{ hashFiles('labelle-bgfx/examples/bgfx-android/project.labelle', 'labelle-bgfx/build.zig.zon') }}
           restore-keys: |
             bgfx-android-
@@ -296,6 +312,61 @@ jobs:
           file "$so" | grep -q 'ELF 64-bit.*ARM aarch64' || { echo "FAIL: not an aarch64 ELF"; exit 1; }
           nm -D "$so" | grep -q 'android_main' || { echo "FAIL: android_main not exported"; exit 1; }
           nm -D "$so" | grep -q 'ANativeActivity_onCreate' || { echo "FAIL: ANativeActivity_onCreate not exported"; exit 1; }
+
+      # ── The gap this job had (labelle-bgfx#104) ──────────────────────
+      # Everything above only CROSS-COMPILES. An .so that aborts in `gameInit`
+      # is byte-for-byte as convincing as one that renders perfectly, which is
+      # exactly how this example shipped broken: its scene still opened with
+      # the legacy `"entities"` key, removed in engine v2.0 (labelle-engine#592),
+      # so the loader hard-errored and the app SIGABRT'd on launch on a real
+      # Galaxy Tab A7 while this job stayed green.
+      #
+      # An emulator lane is heavy and Android-specific; the failure is not.
+      # `"entities"` was rejected by the ENGINE's scene loader, which is the
+      # same code on every platform — so generate the SAME project for the
+      # host, build it, and run it windowless for a few frames. That executes
+      # `gameInit` -> `setScene("main")` -> the unified-format parse for real,
+      # and generalises: any init-time abort (a bad component, a missing asset
+      # reference, a contract drift) now fails CI instead of hiding behind a
+      # successful cross-compile.
+      #
+      # ⚠ `labelle run` EXITS 0 even when the game it launched exits non-zero
+      # (verified locally: the game printed the unified-format error, `labelle:
+      # process exited with code 1`, and the CLI still returned 0). So the exit
+      # status is checked AND the output is scanned — neither alone is enough.
+      - name: Host smoke — the example's scene actually loads (init abort fails CI)
+        env:
+          LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
+          # Prove it is truly display-less, like the headless-linux job.
+          DISPLAY: ""
+          WAYLAND_DISPLAY: ""
+        run: |
+          set -uo pipefail
+          cd labelle-bgfx/examples/bgfx-android
+          # Desktop target (no --platform): same project.labelle, same scenes/,
+          # same engine — only the window/backend platform differs.
+          out=$($GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle run --headless --ticks=30 2>&1); rc=$?
+          echo "$out"
+          fail=0
+          if [ "$rc" -ne 0 ]; then echo "FAIL: labelle run exited non-zero ($rc)"; fail=1; fi
+          # The CLI relays the game's own exit code as a line, not as its status.
+          if printf '%s\n' "$out" | grep -q 'process exited with code [^0]'; then
+            echo "FAIL: the game process exited non-zero — it did not survive init."
+            fail=1
+          fi
+          # Belt and braces for the specific class that caused #104: any
+          # unified-format hard error is an aborting scene parse.
+          if printf '%s\n' "$out" | grep -q 'ERROR \[unified-format\]'; then
+            echo "FAIL: the scene was rejected by the unified-format loader."
+            echo "      Run \`labelle migrate unified\` in examples/bgfx-android."
+            fail=1
+          fi
+          # A run that produced no engine output at all is not a pass either.
+          if ! printf '%s\n' "$out" | grep -q 'sprite shaders initialized'; then
+            echo "FAIL: the renderer never initialized — the smoke proved nothing."
+            fail=1
+          fi
+          exit $fail
 
   # Prove the surfaceless render + capture path (labelle-bgfx#36) works with NO
   # display server and NO real GPU — the exact CI scenario `labelle run
