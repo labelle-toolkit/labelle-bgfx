@@ -216,17 +216,11 @@ pub fn nativeTextureHandle(id: core.BackendTextureId) u16 {
 // decls: `core.Backend(Impl).drawTextureProMaterial` dispatches here for a
 // supported non-`none` effect, and `materialSupported` is the fine-grained gate.
 // bgfx implements the whole curated set through `drawTextureProMaterial` —
-// `flash`, `palette_swap`, `dissolve` and `outline`; `pixel_water` rides the
-// separate `drawTextureProPixelWater` contract below. Nothing here is
+// `flash`, `palette_swap`, `dissolve` and `outline`. Nothing here is
 // unimplemented: an effect degrades to a plain sprite only when ITS program
 // fails to link on the running renderer, or a required input is missing.
 pub const drawTextureProMaterial = texture.drawTextureProMaterial;
 pub const materialSupported = texture.materialSupported;
-// Pixel water (COND-07, #100). Its own optional contract decl — declaring it is
-// what makes `core.materialCapabilities` advertise `pixel_water` — because the
-// per-instance payload (colour ramps, wave/ripple tuning, eight live impacts) is
-// 8x `MaterialUniforms` and does not belong inline on every ordinary sprite.
-pub const drawTextureProPixelWater = texture.drawTextureProPixelWater;
 // GPU-compressed (ASTC) upload — the labelle-gfx `loadTextureFromMemory` seam
 // dispatches to these via `@hasDecl` when the blob is compressed (#341).
 pub const isCompressed = texture.isCompressed;
@@ -385,15 +379,6 @@ pub fn clearViewport() void {
 }
 // Re-export the post-fx value types so consumers (and the golden harness) can
 // build a `PostPass` without importing labelle-core directly.
-// Pixel-water payload types (COND-07, #100), re-exported so a consumer of THIS
-// module (the golden harness, examples) can build a `PixelWaterDraw` without
-// separately depending on labelle-core — the same courtesy the post-fx types get.
-pub const PixelWaterDraw = core.backend_contract.PixelWaterDraw;
-pub const PixelWaterRipple = core.backend_contract.PixelWaterRipple;
-pub const PixelWaterRgba = core.backend_contract.PixelWaterRgba;
-pub const PIXEL_WATER_MAX_RIPPLES = core.backend_contract.PIXEL_WATER_MAX_RIPPLES;
-pub const PIXEL_WATER_FLAG_WAVES = core.backend_contract.PIXEL_WATER_FLAG_WAVES;
-
 pub const PostPass = core.backend_contract.PostPass;
 pub const PostPassKind = core.backend_contract.PostPassKind;
 pub const PostPassUniforms = core.backend_contract.PostPassUniforms;
@@ -551,7 +536,6 @@ test "compile probe: the texture surface is analysed" {
         texture.drawTexturePro(t, undefined, undefined, undefined, 0, undefined);
         _ = texture.materialSupported(undefined);
         texture.drawTextureProMaterial(t, undefined, undefined, undefined, 0, undefined, undefined);
-        texture.drawTextureProPixelWater(t, undefined, undefined, undefined, 0, undefined, undefined);
         texture.drawExternalTexture(undefined, 0, 0, undefined, undefined, undefined, 0, undefined);
         _ = texture.yuvProgramReady();
         _ = try texture.createPlaneTextures(undefined, undefined);
@@ -633,4 +617,25 @@ test "the default filter is linear, and setTextureFilter drives it" {
     try std.testing.expectEqual(TextureFilter.point, textureFilter());
     setTextureFilter(.linear);
     try std.testing.expectEqual(TextureFilter.linear, textureFilter());
+}
+
+// Game-owned shader material contract (render-thread-only).
+const shader_materials = @import("gfx/shader_material.zig");
+pub const createShaderMaterial = shader_materials.create;
+pub const setShaderParameter = shader_materials.setParameter;
+pub const setShaderTexture = shader_materials.setTexture;
+pub const destroyShaderMaterial = shader_materials.destroy;
+pub const shaderMaterialSupported = shader_materials.supported;
+pub const shaderMaterialContextStarted = shader_materials.contextStarted;
+
+test "compile probe: generic shader material GPU paths" {
+    var never = false;
+    _ = &never;
+    if (never) {
+        const id = try createShaderMaterial(undefined);
+        try setShaderParameter(id, "u_value", &.{1});
+        try setShaderTexture(id, "s_aux", .none);
+        destroyShaderMaterial(id);
+        _ = shaderMaterialSupported();
+    }
 }

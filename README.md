@@ -42,15 +42,106 @@ and [`labelle-android-gamepad`](https://github.com/labelle-toolkit/labelle-andro
 | `src/` | gfx / window / input / audio modules + the bgfx/glfw/Android glue. |
 | `libs/miniaudio/` | desktop audio device backend. |
 
+## Game-owned shader materials
+
+`gfx.createShaderMaterial(core.shader_material.Descriptor)` creates an instance
+from game-supplied **fragment** shader binaries. The backend supplies its existing
+sprite vertex shader/layout. Assign the returned `Id` to `Material.shader`; a
+non-`none` shader takes precedence over the curated effect field.
+
+The renderer selects `glsl`, `essl`, `spv`, or `mtl`. Empty selected variants return
+`error.Unsupported`; no other renderer's binary is substituted. Direct3D is not
+advertised: this backend has no matching sprite vertex binary for it yet. The
+binaries must come from the pinned bgfx shaderc (v11 container). Metal uses its
+normal source-containing output, not an opaque precompiled metallib.
+
+```zig
+const sm = core.shader_material;
+const id = try gfx.createShaderMaterial(.{
+    .label = "color-mix",
+    .shaders = .{ .spv = @embedFile("fs_color_mix.spv.bin") },
+    .parameters = &.{
+        .{ .name = "u_mix", .kind = .scalar, .defaults = &.{0.5} },
+        .{ .name = "u_tint", .kind = .vec4, .defaults = &.{1, 0, 0, 1} },
+    },
+});
+defer gfx.destroyShaderMaterial(id);
+try gfx.setShaderParameter(id, "u_mix", &.{0.8});
+// Render with Material{ .shader = id }.
+```
+
+Descriptor slices are borrowed only during creation. Each instance copies names,
+parameter defaults and texture bindings; cached programs own their selected binary.
+The label is diagnostic input and is not retained. Program cache identity includes
+binary bytes, ordered parameter/texture schema, sampler modes and blend mode;
+parameter values and texture IDs remain per-instance. Last-instance destruction
+releases the program. All operations, including destruction, run on the render
+thread.
+
+Parameter `count` is an array-element count. Values are tightly packed:
+`count * channels(kind)` floats. Scalar/vec2/vec3 values are zero-padded into vec4
+registers for bgfx; declare corresponding shader uniforms as `vec4` arrays and
+read the appropriate channels. Mat4 uses 16 column-major floats per element.
+Defaults may be empty (all zeros); updates must have the exact shape and finite
+values. Binding names, duplicate names, counts, capacity and reserved bgfx names
+are checked by the core contract. There are at most 256 live instances, 16 named
+parameters, 4 auxiliary textures, and 64 uniform registers including the automatic
+rect. Exhausted generations retire their slot rather than wrapping.
+
+Creation also checks shader metadata and `getShaderUniforms`/`getUniformInfo`.
+Every descriptor binding must survive shader compilation with matching type and
+count. Misspelled, optimized-out, undeclared and incompatible bindings fail;
+incompatible global bgfx uniform names are rejected across instances and against
+the remaining curated programs. Do not declare unused parameters in a descriptor.
+
+The shader may use these automatic bindings without listing them in the descriptor:
+
+- `SAMPLER2D(s_tex, 0)` receives the sprite's texture and inherits its filter.
+- `uniform vec4 u_material_rect` receives atlas UV bounds `{u0,v0,u1,v1}`.
+  It may be absent or optimized out. Source flips retain positive atlas bounds.
+- Auxiliary texture descriptors are ordered: entry 0 uses stage 1, entry 1 stage 2,
+  and so on. Author `SAMPLER2D` declarations with those ordinals. Vulkan register
+  metadata and Metal texture/sampler annotations are checked for agreement;
+  reordered descriptors fail instead of silently sampling different images.
+  GLSL/ESSL use bgfx's dynamic named sampler mapping. Point and linear modes both
+  clamp at texture edges.
+
+Texture IDs are borrowed backend IDs. Unloading a texture invalidates every
+material binding to it before its pool slot is reused. Explicitly set a replacement
+with `setShaderTexture`; an old binding never starts sampling a new occupant.
+A stale material ID or invalidated texture draws the ordinary sprite. A missing
+variant or failed synchronous shader/program creation returns an error. bgfx's
+asynchronous renderer/driver compilation errors are reported through its callback;
+a valid API handle is not a guarantee of successful later driver compilation.
+
+`shutdownPrograms` destroys all instances and invalidates their IDs. Generation
+counters survive shutdown, so old IDs cannot alias new instances after context
+recreation. The window lifecycle enables `shaderMaterialSupported` only after a
+successful context initialization. Hosts managing bgfx directly must call
+`shaderMaterialContextStarted` after successful init and `shutdownPrograms` before
+bgfx shutdown, then recreate their materials.
+
+### Validation
+
+`zig build test` includes the CPU ownership, validation, caching and lifecycle
+suite; `zig build test-shader-material` runs it separately. The GPU-dependent
+`zig build shader-material-probe` checks rendered independent instances, named
+reflection, texture-unload/reuse fallback, state isolation and context recreation.
+CI runs this probe in addition to the remaining curated-effect goldens. Visual
+coverage for game-authored effects belongs in the game integration suite.
+
+This branch needs the new core contract. Until a release containing it is pinned
+in `build.zig.zon`, pass `-Dcore-source=/path/to/labelle-core/src/root.zig` for local
+builds, or supply the generated game's unified core module. On Windows without an
+SDL2 SDK, add `-Dgamepad_enabled=false` for renderer-only validation.
+
 ## Material seam (curated per-draw effects, labelle-gfx#305)
 
 bgfx implements the whole curated material set — `flash`, `palette_swap`,
 `dissolve` and `outline` through the optional `drawTextureProMaterial` /
-`materialSupported` contract decls in labelle-core, plus `pixel_water` through
-its own `drawTextureProPixelWater` decl and its own program (see "Pixel water"
-below). Every one is authored the same way as the GPU-YUV video one-off: a `.sc`
+`materialSupported` contract decls in labelle-core. Every one is authored the same way as the GPU-YUV video one-off: a `.sc`
 fragment shader (`src/shaders/fs_flash.sc`, `fs_palette.sc`, `fs_dissolve.sc`,
-`fs_outline.sc`, `fs_pixel_water.sc`) compiled by bgfx `shaderc` to per-renderer
+`fs_outline.sc`) compiled by bgfx `shaderc` to per-renderer
 bytecode (Metal / SPIR-V / GLSL / ESSL) embedded in `src/shaders.zig`, built into
 a program alongside the sprite program (`src/gfx/programs.zig`). Nothing here is
 unimplemented; the only degrade-to-a-plain-sprite path left is a RENDERER-SPECIFIC
@@ -66,11 +157,6 @@ affected effect. See `RFC-MATERIAL-POSTFX.md` (labelle-gfx).
   `aux_texture` (or a dead handle) falls back to built-in procedural noise, so
   this effect never degrades to a plain sprite.
 - **outline** — composites a coloured border around the sprite's alpha edge.
-- **pixel_water** — the COND-07 reactive reservoir (#100), its own draw path and
-  program; a missing mask, or a renderer that will not link `fs_pixel_water`,
-  degrades to the authored static sprite and flips
-  `materialSupported(.pixel_water)` to false.
-
 ### Regenerating the material shaders
 
 The embedded bytecode in `src/shaders.zig` is produced offline (there is no
@@ -100,101 +186,6 @@ on a machine with a Metal/Vulkan device:
 ```shell
 zig build material-golden-bless   # overwrites test/golden/material_flash_palette.tga
 ```
-
-## Pixel water (COND-07, #100 / RFC-PIXEL-WATER)
-
-`pixel_water` is a fifth curated effect, and the only one whose support is **not**
-implied by `drawTextureProMaterial`. Its per-instance payload (three colour ramps,
-wave/ripple tuning and eight live impacts) is 8x a `MaterialUniforms` block, so it
-rides its own optional contract decl — `drawTextureProPixelWater(texture, source,
-dest, origin, rotation, tint, water: PixelWaterDraw)` — taking labelle-core's flat
-256-byte `PixelWaterDraw` **by value**. Declaring that decl is what makes
-`core.materialCapabilities` advertise `pixel_water`; `materialSupported(.pixel_water)`
-additionally goes false once `fs_pixel_water` has failed to link on this renderer.
-
-Units, in one line each:
-
-- Local coordinates are **native art pixels**, origin at the reservoir rectangle's
-  top-left, +X right, +Y **down**.
-- `level` is the fraction filled from the **bottom**: `surface_y = logical_height *
-  (1 - level)`. Level 0 renders no water at all.
-- `grid_pixels` is native art pixels per effect cell. Every sample position is the
-  logical cell centre and every displacement is quantized to whole grid increments.
-  The reference scene's 6 screen pixels per cell is integer *enlargement* of the
-  art — not this value, and not an engine constant.
-- A ripple's age is `time - start_time`; an age outside
-  `[0, ripple_duration_seconds)` contributes nothing, and entries at or past
-  `ripple_count` are ignored (they are not guaranteed zeroed). `time` is
-  **simulation** seconds, never a wall clock.
-- `PIXEL_WATER_FLAG_WAVES` toggles surface waves without destroying the authored
-  amplitude.
-
-### Sampler slots and uniform registers
-
-Slots are fixed. Units 1 and 2 are bound with point+clamp sampler flags at draw
-time, so nearest/clamped sampling is a property of the effect, not of how the
-asset happened to be uploaded.
-
-| slot | uniform | content | colour space |
-|------|---------|---------|--------------|
-| 0 | `s_tex` | the reservoir sprite's own texture (also the fallback art) | authored, sampled exactly like a plain sprite (x vertex tint) |
-| 1 | `s_water_mask` | reservoir silhouette, standalone (never atlased) | coverage **data**: alpha x max(rgb), never gamma-converted. White-on-transparent and white-on-black both read correctly |
-| 2 | `s_water_reflect` | the **supplied** reflection, standalone, reservoir-local | authored, used as-is: not flipped, not captured from the scene |
-
-| register | uniform | content |
-|----------|---------|---------|
-| 0 | `u_water_rect` | `(u0, v0, u1, v1)` — the sprite's source frame in whole-atlas UV space; `(0,0,1,1)` standalone |
-| 1–2 | `u_water_head[2]` | `(logical_width, logical_height, grid_pixels, ripple_count)`, then `(waves_enabled, has_mask, has_reflection, raw_flags)`. The u32 header widened to float, with `flags` decoded on the Zig side so the shader never does bitwise arithmetic on a float |
-| 3–5 | `u_water_color[3]` | `deep` / `surface` / `highlight`, **linear** 0..1 rgba — already converted out of the authored sRGB by the engine. Nothing converts again |
-| 6–8 | `u_water_params[3]` | `(level, time, wave_amplitude_px, wave_period_s)`, `(distortion_px, reflection_opacity, ripple_duration_s, ripple_radius_px)`, `(ripple_strength_px, _, _, _)` |
-| 9–16 | `u_water_ripples[8]` | one impact per slot: `(x, start_time, strength, _)` |
-
-The three colour/param/ripple blocks are uploaded straight off the locked
-`PixelWaterDraw` layout (colours at byte 32, params at 80, ripples at 128 — exactly
-3 + 3 + 8 consecutive `vec4`s); only the integer header is repacked.
-
-`PIXEL_WATER_MAX_RIPPLES` is 8 and **fixed**: the shader's ripple loop needs a
-comptime trip count, because a dynamically-bounded loop is a portability hazard on
-ESSL 3.00 / WebGL2.
-
-### Program lifetime
-
-The water program and its uniforms are built and destroyed **independently** of the
-four material programs (`initWaterProgram` / `waterProgramReady` /
-`waterProgramAvailable` / `destroyWaterProgram` in `src/gfx/programs.zig`), following
-the same lazy-build + latch-failure pattern. A water link failure degrades only
-water — to the authored static reservoir sprite — and leaves flash / palette_swap /
-dissolve / outline untouched; the converse also holds. Nothing is created per frame,
-and every owned handle is released in `shutdownPrograms` (so an Android surface cycle
-gets one more honest attempt).
-
-`fs_pixel_water.sc` is compiled and embedded with the same offline shaderc recipe as
-the other material shaders (see above), in all four variants. **ESSL 3.00 is not
-optional**: it is what WebGL2 and Android GLES select.
-
-### Headless golden (`zig build pixel-water-golden`)
-
-`src/pixel_water_golden.zig` renders a fixed-simulation-time matrix — fill levels,
-the waves flag, ripple start/mid/expired, edge impacts, a live entry parked past
-`ripple_count`, masked-out pixels, zero amplitude, a one-native-pixel displacement,
-a coarse grid, native/2x/4x nearest scaling, two independent reservoirs, an
-ATLAS sub-rect frame and a level-1.0 reservoir masked to its TOP row — into its
-**own** golden (`test/golden/pixel_water.tga`), never the material one. It also
-asserts four semantic invariants region-for-region (expired ripple == no ripple;
-a ripple past the count == ignored; an atlas sub-rect frame == the same art
-standalone; a full reservoir leaves no dry cell, top row included) in check
-**and** bless mode, so a regression cannot be blessed in. The capture ALWAYS
-lands on the candidate first: bless replaces the committed golden only after
-every invariant has passed, so a violating shader cannot leave a bad image on
-disk for someone to commit. If the water program does not link on the capturing
-machine the run exits `7` (`PIXEL_WATER_UNSUPPORTED`) instead of capturing — a
-static-fallback scene must never reach the golden, least of all through bless
-mode. Regenerate with `zig build pixel-water-golden-bless`.
-
-> **Fixture caveat.** The real COND-07 artwork is not in this repository, so the
-> golden's mask, reflection and reservoir art are small procedural stand-ins. They
-> exercise every code path the real art will; wiring the actual condenser into a
-> runnable example is later work (RFC plan phases 2 and 6).
 
 ## Texture filtering seam (point/nearest sampling, #77)
 

@@ -12,8 +12,6 @@ const transient_budget = @import("transient_budget.zig");
 
 const MaterialEffect = core.backend_contract.MaterialEffect;
 const MaterialUniforms = core.backend_contract.MaterialUniforms;
-const PixelWaterDraw = core.backend_contract.PixelWaterDraw;
-const PIXEL_WATER_MAX_RIPPLES = core.backend_contract.PIXEL_WATER_MAX_RIPPLES;
 const PostPassKind = core.backend_contract.PostPassKind;
 const PostPassUniforms = core.backend_contract.PostPassUniforms;
 
@@ -385,30 +383,20 @@ fn buildMaterialProgram(fs_data: []const u8) bgfx.ProgramHandle {
 
 /// The material program backing `effect` (invalid sentinel for `none`/unbuilt).
 ///
-/// `pixel_water` is matched BY NAME, not as a literal prong, for the same reason
-/// as `texture.materialSupported`: a generated game overrides this module's
-/// `labelle-core` with the app's, and an app core older than v1.32 has no
-/// `.pixel_water` member to name. See the note there.
+/// Non-exhaustive for the same reason as `texture.materialSupported`: a
+/// generated game overrides this module's `labelle-core` with the app's, whose
+/// `MaterialEffect` may carry members this pin does not (e.g. the retired
+/// `.pixel_water`). `texture.zig`'s comptime tripwire fails the build if core
+/// gains a curated effect neither list knows about.
 fn programForEffect(effect: MaterialEffect) bgfx.ProgramHandle {
-    const invalid_program = bgfx.ProgramHandle{ .idx = std.math.maxInt(u16) };
-    // `pixel_water` is deliberately NOT in this group. It has its own
-    // independently built program + uniforms (see the pixel-water section below)
-    // so neither group's link failure can disable the other, and it is submitted
-    // by `submitPixelWaterTriangles`, never by `submitMaterialTriangles` —
-    // returning the invalid sentinel here keeps a stray material draw from ever
-    // picking up the water program.
-    if (@hasField(MaterialEffect, "pixel_water")) {
-        if (effect == @field(MaterialEffect, "pixel_water")) return invalid_program;
-    }
     return switch (effect) {
         .flash => flash_program,
         .palette_swap => palette_program,
         .dissolve => dissolve_program,
         .outline => outline_program,
-        // `.none`, plus `.pixel_water` on a core that has it (handled above).
-        // `texture.zig`'s comptime tripwire fails the build if core gains a
-        // curated effect neither list knows about.
-        else => invalid_program,
+        // `.none`, plus any effect this backend does not implement on the app's
+        // core — a stray draw must never pick up an unrelated program.
+        else => .{ .idx = std.math.maxInt(u16) },
     };
 }
 
@@ -580,233 +568,6 @@ pub fn submitMaterialTriangles(
     if (effect == .palette_swap or effect == .dissolve) bgfx.setTexture(1, s_lut_uniform, lut_handle, 0);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
     bgfx.submit(active_view, program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
-}
-
-// ── Pixel-water program (COND-07, labelle-bgfx#100 / RFC-PIXEL-WATER) ─────────
-// The reactive reservoir effect (`MaterialEffect.pixel_water`) — `vs_sprite` +
-// `fs_pixel_water`. It is built and torn down INDEPENDENTLY of the four curated
-// material programs above: water carries its OWN uniforms (no `u_material_*`
-// sharing) precisely so a water link failure degrades ONLY water and can never
-// take palette_swap / flash / dissolve / outline down with it, and vice versa.
-//
-// Why its own uniforms rather than the material group's: the material group
-// treats its shared uniforms as one hard, latched failure (if they die, EVERY
-// material degrades). Hanging water off that group would couple the two
-// lifetimes in both directions. Water's group is the same shape, scoped to
-// water alone.
-//
-// ── FIXED sampler slots and their colour-space expectations ──────────────────
-//   unit 0 — `s_tex`: the reservoir SPRITE's own texture (shared with the sprite
-//            program, hence `ensureShadersInitialized` below). AUTHORED colour
-//            space, sampled exactly like a plain sprite (x vertex tint). This is
-//            also what the unsupported-renderer fallback draws on its own.
-//   unit 1 — `s_water_mask`: the reservoir silhouette mask. A STANDALONE (never
-//            atlased) texture spanning exactly the logical rectangle, so there
-//            is no atlas-edge bleed. Treated as COVERAGE DATA, not colour: the
-//            shader reads alpha x max(rgb) and never gamma-converts it. Bound
-//            with point+clamp sampler flags below, overriding whatever filter
-//            the texture was uploaded with — the RFC requires nearest/clamped.
-//   unit 2 — `s_water_reflect`: the SUPPLIED reflection texture, also standalone
-//            and reservoir-local. AUTHORED colour space, used as-is: not
-//            flipped, not captured from the scene, and never gamma-converted
-//            here. Also forced to point+clamp.
-//
-// ── Uniform registers (16 vec4s == core's 256-byte PixelWaterDraw) ───────────
-//   `u_water_rect`       (u0, v0, u1, v1) — the sprite's source frame in
-//                        whole-atlas UV space, so the shader can turn an atlas
-//                        UV into reservoir-local art pixels. (0,0,1,1) for a
-//                        standalone texture. Water's OWN copy of the idea behind
-//                        `u_material_rect` — deliberately not shared, see above.
-//   `u_water_head[2]`    the u32 header, widened to float here: (logical_width,
-//                        logical_height, grid_pixels, ripple_count) and
-//                        (waves_enabled, has_mask, has_reflection, raw_flags).
-//                        `flags` is DECODED on this side so the shader never
-//                        does bitwise arithmetic on a float (ESSL portability).
-//   `u_water_color[3]`   deep / surface / highlight — uploaded STRAIGHT out of
-//                        `PixelWaterDraw`, which is already LINEAR 0..1 (the
-//                        engine converted the authored sRGB hex once). Nothing
-//                        here converts again.
-//   `u_water_params[3]`  (level, time, wave_amplitude_px, wave_period_s),
-//                        (distortion_px, reflection_opacity, ripple_duration_s,
-//                        ripple_radius_px), (ripple_strength_px, _, _, _) —
-//                        also uploaded straight from the struct.
-//   `u_water_ripples[8]` the fixed eight impact slots, (x, start_time, strength,
-//                        _) each. PIXEL_WATER_MAX_RIPPLES is fixed so the
-//                        shader's loop has a comptime trip count.
-//
-// The three verbatim blocks are uploaded by pointing bgfx AT the `PixelWaterDraw`
-// value's own bytes — the layout core locks (colours at 32, params at 80,
-// ripples at 128) is exactly 3 + 3 + 8 consecutive vec4s. Only the header is
-// repacked, because it is integers.
-var water_program: bgfx.ProgramHandle = .{ .idx = std.math.maxInt(u16) };
-var s_water_mask_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
-var s_water_reflect_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
-var u_water_rect_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
-var u_water_head_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
-var u_water_color_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
-var u_water_params_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
-var u_water_ripples_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
-var water_initialized: bool = false;
-/// Latches a build/link failure so the program is attempted at most ONCE
-/// (mirrors `material_failed` / `yuv_failed`): a per-frame re-create would leak
-/// handles and eventually exhaust bgfx's pool. Cleared by `shutdownPrograms` so
-/// a fresh Android surface gets one more honest try.
-var water_failed: bool = false;
-
-/// Nearest + clamped on both water sampler slots, overriding whatever filter the
-/// mask/reflection textures happen to have been uploaded with. The RFC makes
-/// nearest/clamped a requirement of the effect, not of the asset.
-const WATER_SAMPLER_FLAGS: u32 = bgfx.SamplerFlags_MinPoint | bgfx.SamplerFlags_MagPoint |
-    bgfx.SamplerFlags_MipPoint | bgfx.SamplerFlags_UClamp | bgfx.SamplerFlags_VClamp;
-
-fn initWaterProgram() void {
-    if (water_initialized) return;
-
-    water_program = buildMaterialProgram(materialFsData("fs_pixel_water"));
-    if (!isValidProgram(water_program)) {
-        // Not fatal to anything else: only pixel_water degrades (to the authored
-        // static reservoir sprite). `materialSupported(.pixel_water)` reports
-        // false from here on, per the contract.
-        std.log.warn("bgfx: fs_pixel_water failed to link on this renderer ({}); pixel_water degrades to a static sprite", .{bgfx.getRendererType()});
-        water_failed = true;
-        return;
-    }
-
-    s_water_mask_uniform = bgfx.createUniform("s_water_mask", .Sampler, 1);
-    s_water_reflect_uniform = bgfx.createUniform("s_water_reflect", .Sampler, 1);
-    u_water_rect_uniform = bgfx.createUniform("u_water_rect", .Vec4, 1);
-    u_water_head_uniform = bgfx.createUniform("u_water_head", .Vec4, 2);
-    u_water_color_uniform = bgfx.createUniform("u_water_color", .Vec4, 3);
-    u_water_params_uniform = bgfx.createUniform("u_water_params", .Vec4, 3);
-    u_water_ripples_uniform = bgfx.createUniform("u_water_ripples", .Vec4, PIXEL_WATER_MAX_RIPPLES);
-    if (!isValidHandle(s_water_mask_uniform.idx) or !isValidHandle(s_water_reflect_uniform.idx) or
-        !isValidHandle(u_water_rect_uniform.idx) or !isValidHandle(u_water_head_uniform.idx) or
-        !isValidHandle(u_water_color_uniform.idx) or !isValidHandle(u_water_params_uniform.idx) or
-        !isValidHandle(u_water_ripples_uniform.idx))
-    {
-        std.log.err("bgfx: failed to create pixel-water uniforms; pixel_water degrades to a static sprite", .{});
-        destroyWaterProgram();
-        water_failed = true;
-        return;
-    }
-
-    water_initialized = true;
-    std.log.info("bgfx: pixel-water program initialized (renderer: {})", .{bgfx.getRendererType()});
-}
-
-/// True when the water program + its uniforms are live on this renderer. Forces
-/// the (at most one) lazy build, so call it from a draw site with bgfx up.
-pub fn waterProgramReady() bool {
-    if (!water_initialized) {
-        if (water_failed) return false;
-        initWaterProgram();
-    }
-    return water_initialized and isValidProgram(water_program);
-}
-
-/// Capability answer for `materialSupported(.pixel_water)`: false ONLY once a
-/// build has been attempted and failed. Deliberately does NOT force a build —
-/// capability queries can run before a draw (and `materialSupported` is a pure
-/// switch for every other effect), so an optimistic "yes, bgfx implements this"
-/// before the first water draw matches the other effects' behaviour, while a
-/// real link failure on this renderer flips it to false for good.
-pub fn waterProgramAvailable() bool {
-    return !water_failed;
-}
-
-fn destroyWaterProgram() void {
-    if (isValidProgram(water_program)) bgfx.destroyProgram(water_program);
-    water_program = .{ .idx = std.math.maxInt(u16) };
-    inline for (.{
-        &s_water_mask_uniform,    &s_water_reflect_uniform, &u_water_rect_uniform,
-        &u_water_head_uniform,    &u_water_color_uniform,   &u_water_params_uniform,
-        &u_water_ripples_uniform,
-    }) |u| {
-        if (isValidHandle(u.*.idx)) bgfx.destroyUniform(u.*);
-        u.* = .{ .idx = std.math.maxInt(u16) };
-    }
-    water_initialized = false;
-}
-
-/// Submit a pixel-water-shaded textured quad — the bgfx impl of labelle-core's
-/// optional `drawTextureProPixelWater` contract. Sibling of
-/// `submitMaterialTriangles`: identical quad/transient-buffer/blend/view
-/// handling (so blending, source rects, transform and layer/view order are the
-/// ordinary sprite ones), differing only in the program it selects and the
-/// uniforms it uploads.
-///
-/// `mask_handle` and `reflect_handle` are bound at the fixed units 1 and 2. Both
-/// must be VALID handles: the caller resolves them (and degrades to a plain
-/// sprite when the mask is absent), binding the sprite's own texture as a
-/// harmless dummy for a missing reflection with `has_reflection = 0` — an
-/// unbound sampler read is undefined on several of the four targets.
-/// `rect` is the sprite's source frame in whole-atlas UV space (u0, v0, u1, v1).
-/// No-ops (leaving the sprite undrawn) only if the program failed to build; the
-/// draw site gates on `waterProgramReady` first — see
-/// `texture.drawTextureProPixelWater`.
-pub fn submitPixelWaterTriangles(
-    vertices: []const PosTexColorVertex,
-    texture_handle: bgfx.TextureHandle,
-    mask_handle: bgfx.TextureHandle,
-    reflect_handle: bgfx.TextureHandle,
-    water: PixelWaterDraw,
-    rect: [4]f32,
-) void {
-    // Shares `s_tex` with the sprite path, which may not be up yet if a water
-    // sprite is the very first draw. Idempotent.
-    ensureShadersInitialized();
-    if (!isValidHandle(s_tex_uniform.idx)) return;
-    if (!waterProgramReady()) return;
-    ensureLayouts();
-
-    const identity = [16]f32{
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0,
-        0.0, 0.0, 0.0, 1.0,
-    };
-    bgfx.setViewTransform(active_view, &identity, &identity);
-
-    // Header: the only repacked block (u32 -> f32), plus the decoded flag bits
-    // and the two "is this sampler real" gates the shader multiplies by.
-    const head = [8]f32{
-        @floatFromInt(water.logical_width),
-        @floatFromInt(water.logical_height),
-        @floatFromInt(water.grid_pixels),
-        @floatFromInt(@min(water.ripple_count, PIXEL_WATER_MAX_RIPPLES)),
-        if (water.flags & core.backend_contract.PIXEL_WATER_FLAG_WAVES != 0) 1.0 else 0.0,
-        if (water.mask_texture != 0) 1.0 else 0.0,
-        if (water.reflection_texture != 0) 1.0 else 0.0,
-        @floatFromInt(water.flags),
-    };
-    bgfx.setUniform(u_water_head_uniform, &head, 2);
-    bgfx.setUniform(u_water_rect_uniform, &rect, 1);
-    // The three verbatim blocks, straight off the locked `PixelWaterDraw` layout
-    // (colours at byte 32, params at 80, ripples at 128 — all vec4-shaped).
-    bgfx.setUniform(u_water_color_uniform, @ptrCast(&water.deep), 3);
-    bgfx.setUniform(u_water_params_uniform, @ptrCast(&water.level), 3);
-    bgfx.setUniform(u_water_ripples_uniform, @ptrCast(&water.ripples), PIXEL_WATER_MAX_RIPPLES);
-
-    const num: u32 = @intCast(vertices.len);
-    if (!transient_budget.fits(num, bgfx.getAvailTransientVertexBuffer(num, &vertex_layout))) {
-        noteTransientDrop("pixel-water triangles", "vertex", num);
-        return;
-    }
-    var tvb: bgfx.TransientVertexBuffer = undefined;
-    bgfx.allocTransientVertexBuffer(&tvb, num, &vertex_layout);
-    const dest_ptr: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
-    @memcpy(dest_ptr[0..vertices.len], vertices);
-
-    bgfx.setTransientVertexBuffer(0, &tvb, 0, num);
-    // Unit 0 inherits the sprite texture's stored sampler flags (UINT32_MAX), so
-    // a point-uploaded atlas stays point. Units 1 and 2 are FORCED to
-    // point+clamp: nearest/clamped sampling of the standalone mask/reflection is
-    // part of the effect's contract.
-    bgfx.setTexture(0, s_tex_uniform, texture_handle, std.math.maxInt(u32));
-    bgfx.setTexture(1, s_water_mask_uniform, mask_handle, WATER_SAMPLER_FLAGS);
-    bgfx.setTexture(2, s_water_reflect_uniform, reflect_handle, WATER_SAMPLER_FLAGS);
-    bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
-    bgfx.submit(active_view, water_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
 }
 
 // ── Post-fx programs (full-screen passes, labelle-gfx#305 P2 Slice B) ──────────
@@ -1059,6 +820,8 @@ pub fn submitFullscreenBlit(src_color: bgfx.TextureHandle) void {
 
 /// Destroy shader programs, uniforms, and textures, resetting to invalid sentinels.
 pub fn shutdownPrograms() void {
+    @import("shader_material.zig").shutdown();
+    layouts_initialized = false;
     if (isValidProgram(sprite_program)) {
         bgfx.destroyProgram(sprite_program);
         sprite_program = .{ .idx = std.math.maxInt(u16) };
@@ -1100,12 +863,6 @@ pub fn shutdownPrograms() void {
     // Android surface cycle re-creates them lazily on the next material draw.
     destroyMaterialPrograms();
     material_failed = false;
-
-    // Pixel water (#100) tears down on its own, independently of the material
-    // group, so an Android surface cycle re-creates it lazily on the next water
-    // draw and a fresh surface gets one more honest link attempt.
-    destroyWaterProgram();
-    water_failed = false;
 
     // Post-fx programs (labelle-gfx#305 P2) share the same teardown so an Android
     // surface cycle re-creates them lazily on the next post-fx pass.
@@ -1397,4 +1154,29 @@ pub fn submitYuvTriangles(
     bgfx.setTexture(2, s_texV_uniform, v_handle, 0);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
     bgfx.submit(active_view, yuv_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+}
+
+/// Returns false only for an unavailable material, selecting sprite fallback.
+/// Transient exhaustion drops the whole quad without leaving uniform state.
+pub fn submitShaderMaterialTriangles(vertices: []const PosTexColorVertex, texture_handle: bgfx.TextureHandle, id: core.shader_material.Id, rect: [4]f32) bool {
+    const materials = @import("shader_material.zig");
+    const instance = materials.resolve(id) orelse return false;
+    ensureLayouts();
+    const num: u32 = @intCast(vertices.len);
+    if (!transient_budget.fits(num, bgfx.getAvailTransientVertexBuffer(num, &vertex_layout))) {
+        noteTransientDrop("shader material quad", "vertex", num);
+        return true;
+    }
+    var tvb: bgfx.TransientVertexBuffer = undefined;
+    bgfx.allocTransientVertexBuffer(&tvb, num, &vertex_layout);
+    const dest: [*]PosTexColorVertex = @ptrCast(@alignCast(tvb.data));
+    @memcpy(dest[0..vertices.len], vertices);
+    const identity = [16]f32{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    bgfx.setViewTransform(active_view, &identity, &identity);
+    bgfx.setTransientVertexBuffer(0, &tvb, 0, num);
+    materials.bind(instance, texture_handle, rect);
+    const blend = if (instance.blend == .alpha) STATE_BLEND_ALPHA else stateBlendFuncSeparate(bgfx.StateFlags_BlendSrcAlpha, bgfx.StateFlags_BlendOne, bgfx.StateFlags_BlendSrcAlpha, bgfx.StateFlags_BlendOne);
+    bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | blend, 0);
+    bgfx.submit(active_view, .{ .idx = instance.program.handle }, 0, @intCast(bgfx.DiscardFlags_All));
+    return true;
 }
