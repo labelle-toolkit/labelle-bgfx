@@ -24,6 +24,12 @@ jobs:
       # The shared SDL desktop gamepad source (labelle-sdl-gamepad) links SDL2.
       - name: Install SDL2
         run: brew install sdl2
+      # `src/video/desktop.zig` decodes by shelling out to ffmpeg. Its test
+      # SKIPS cleanly when there is no ffmpeg — which would make the coverage
+      # this job claims vacuous — so install one and assert below that it did
+      # NOT skip (labelle-bgfx#102).
+      - name: Install ffmpeg (desktop video decode test fixture)
+        run: brew install ffmpeg
       # zbgfx C/C++ is heavy; cache the global + project zig caches keyed on the zon.
       - name: Cache Zig artifacts
         uses: actions/cache@v4
@@ -36,7 +42,31 @@ jobs:
           restore-keys: |
             bgfx-${{ runner.os }}-
       - name: Build + test
-        run: zig build test
+        run: zig build test --summary all
+      # A green suite is not evidence a test RAN. `src/video/desktop.zig`'s one
+      # test was invisible to the runner for its whole life (labelle-bgfx#102):
+      # `gfx.zig` re-exports the module through a comptime-gated
+      # `pub const X = if (is_wasm) struct {} else @import(...)`, which
+      # references a decl and never pulls the file's `test` blocks into any test
+      # binary — making the test return an error left `zig build test` at exit 0.
+      # It now has its own host artifact, and this step pins BOTH halves: the
+      # run passes, and it reports 1/1 rather than a skip (the test skips itself
+      # when ffmpeg is missing).
+      - name: Desktop video decode test really ran (not skipped)
+        run: |
+          set -uo pipefail
+          out=$(zig build test-video-desktop --summary all 2>&1); rc=$?
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then
+            echo "FAIL: test-video-desktop exited non-zero ($rc)"; exit 1
+          fi
+          # Separate check, separate exit status — never `cmd | grep` here.
+          if ! printf '%s\n' "$out" | grep -q '1/1 tests passed'; then
+            echo "FAIL: the desktop video decode test did not RUN (skipped, or not discovered)."
+            echo "      Expect '1/1 tests passed'. A skip means ffmpeg is missing on the"
+            echo "      runner; no test at all means the artifact wiring in build.zig broke."
+            exit 1
+          fi
       - name: Generic shader materials (GPU pixels, reflection, lifecycle and fallback)
         run: zig build shader-material-probe
       - name: Texture sampling (rendered point versus linear pixels)
