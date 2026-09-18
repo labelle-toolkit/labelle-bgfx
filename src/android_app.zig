@@ -114,11 +114,16 @@ pub const ANativeActivityCallbacks = extern struct {
 /// pointer, so the offset is correct.
 pub const ANativeActivity = extern struct {
     callbacks: *ANativeActivityCallbacks,
-    /// `JavaVM* vm`, `JNIEnv* env`, `jobject clazz` — untyped, we never touch
-    /// them from here (the JNI bridge goes through `getNativeActivity`).
-    _vm: ?*anyopaque,
+    /// `JavaVM* vm` — handed to the JNI helper that reads this process's own
+    /// `ApplicationInfo.FLAG_DEBUGGABLE` (see `isDebuggable`).
+    vm: ?*anyopaque,
+    /// `JNIEnv* env` — the UI thread's env. Deliberately untyped and unused:
+    /// `android_main` runs on the glue's own thread, where this env is NOT
+    /// valid; the helper attaches its own.
     _env: ?*anyopaque,
-    _clazz: ?*anyopaque,
+    /// `jobject clazz` — the NativeActivity's own Java object, the receiver
+    /// for the `getApplicationInfo()` call in `isDebuggable`.
+    clazz: ?*anyopaque,
     /// `const char* internalDataPath` — the app's OWN private directory
     /// (`/data/data/<package>/files`). The only filesystem location a
     /// NativeActivity can always write to, and the one `run-as <package> cat`
@@ -821,6 +826,39 @@ pub fn getNativeActivity() ?*anyopaque {
 pub fn internalDataPath() ?[*:0]const u8 {
     const activity = native_activity orelse return null;
     return activity.internal_data_path;
+}
+
+/// JNI side of `isDebuggable` — `src/android_debuggable.c`, compiled into this
+/// module on Android and an empty TU everywhere else. Declared unconditionally
+/// (extern decls are only linked when referenced) so the non-Android path below
+/// folds away without a comptime block around the declaration.
+extern "c" fn labelle_bgfx_app_is_debuggable(vm: ?*anyopaque, clazz: ?*anyopaque) c_int;
+
+/// Cache: the flag cannot change for the life of the process, and the query is
+/// a JNI attach + four lookups. `null` = not asked yet.
+var is_debuggable_cached: ?bool = null;
+
+/// Is the RUNNING apk marked `android:debuggable`? (labelle-assembler#737)
+///
+/// This gates the `labelle_env` knob-file channel. `adb shell run-as
+/// <package>` — the only way to CREATE that file — is granted only for a
+/// debuggable APK, but `run-as` says nothing about the runtime READ: install a
+/// debuggable build, drop a knob file, then update to a release build, and the
+/// file is still sitting there and would still be honoured. Asking the process
+/// about its own `ApplicationInfo.FLAG_DEBUGGABLE` closes that, so a release
+/// build ignores a stale file.
+///
+/// Fails CLOSED: no activity, no VM, or any JNI failure answers `false`. A
+/// verification aid that cannot prove it is allowed must stay off.
+pub fn isDebuggable() bool {
+    // `comptime` so the extern is not even referenced off Android, where the C
+    // TU compiles to an empty object and the symbol does not exist.
+    if (comptime !is_android) return false;
+    if (is_debuggable_cached) |cached| return cached;
+    const activity = native_activity orelse return false; // not cached: asked too early
+    const result = labelle_bgfx_app_is_debuggable(activity.vm, activity.clazz) != 0;
+    is_debuggable_cached = result;
+    return result;
 }
 
 /// C-ABI accessor the bgfx Android backend adapter binds `extern "c"` (see

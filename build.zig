@@ -1013,6 +1013,19 @@ pub fn build(b: *std.Build) void {
             .flags = &.{ "-std=c11", "-Wall" },
         });
 
+        // JNI helper for `android_app.isDebuggable()` (labelle-assembler#737):
+        // `activity.getApplicationInfo().flags & FLAG_DEBUGGABLE`, which gates
+        // the device knob-file channel on the RUNNING apk rather than on
+        // whatever `run-as` allowed at the time the file was written. In C
+        // because <jni.h> already declares the JNI vtables; the NDK sysroot is
+        // wired onto this module just above. `#ifdef __ANDROID__`-gated, so it
+        // emits an empty object off Android (same convention as
+        // `android_gamepad_jni.c`).
+        android_app_mod.addCSourceFile(.{
+            .file = b.path("src/android_debuggable.c"),
+            .flags = &.{ "-std=c11", "-Wall" },
+        });
+
         // Declare the android libs the shell references for the eventual
         // (phase-4) link. These are recorded on the module's link inputs;
         // the compile-check below depends only on object emission, so a
