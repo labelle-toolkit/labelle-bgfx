@@ -23,7 +23,6 @@ extern "c" fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
 extern "c" fn pclose(stream: *anyopaque) c_int;
 extern "c" fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *anyopaque) usize;
 extern "c" fn system(command: [*:0]const u8) c_int;
-extern "c" fn unlink(path: [*:0]const u8) c_int;
 
 /// `popen` mode for reading ffmpeg's raw binary output (PCM audio / I420 video).
 /// Only Windows needs the `"b"`: its C runtime otherwise CRLF-translates the
@@ -350,14 +349,31 @@ test "decodeAudioPcm: decodes a clip's audio track to 48k stereo PCM" {
         return error.SkipZigTest;
     }
 
-    // `/tmp` is fine: this backend (and its tests) only build on POSIX hosts
-    // (Linux/macOS) — bgfx here has no Windows target. Cleaned up after.
-    const clip = "/tmp/labelle_audio_decode_test.mp4";
+    // This test runs on EVERY host `zig build test` supports — Windows
+    // included (labelle-bgfx#102 gave the file its own host artifact, and
+    // `ffmpegAvailable`/`shellQuote`/`binary_read_mode` all have Windows
+    // branches). So the scratch clip must NOT be a hard-coded `/tmp/...`
+    // path, which cannot exist there. `std.testing.tmpDir` gives a
+    // per-run directory under the cache dir on any host, and cleans it
+    // (clip included) up for us — no `unlink` needed.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // `tmpDir` creates `.zig-cache/tmp/<sub_path>/` relative to the CWD the
+    // test binary was launched with, and `cleanup` deletes the whole tree —
+    // so naming the clip inside it needs neither `realPath` (which std itself
+    // flags as poorly supported across platforms) nor an `unlink`. The path
+    // stays relative on purpose: ffmpeg inherits our CWD, and
+    // `std.fs.path.join` uses the host's own separator.
+    const clip = try std.fs.path.join(
+        alloc,
+        &.{ ".zig-cache", "tmp", &tmp.sub_path, "labelle_audio_decode_test.mp4" },
+    );
+    defer alloc.free(clip);
+
     // generateTestClip writes a 6 s clip with a 440 Hz sine audio track.
     // NOT a skip: ffmpeg exists, so a failure here is a real defect (or an
     // ffmpeg build with no libx264/aac) and must be seen, not swallowed.
     try VideoDecoder.generateTestClip(alloc, clip, 320, 240);
-    defer _ = unlink(clip);
 
     const pcm = VideoDecoder.decodeAudioPcm(alloc, clip) orelse return error.NoAudioDecoded;
     defer alloc.free(pcm);
