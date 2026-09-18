@@ -1029,62 +1029,26 @@ pub fn build(b: *std.Build) void {
         const android_app_tests = b.addTest(.{ .root_module = android_app_mod });
         test_step.dependOn(&android_app_tests.step);
 
-        // ── Phase 4 (#303): full Android app link → libgame.so ──────────
-        // Standalone bgfx-Android video demo (FP#549) proving the VideoPlayer
-        // draws through bgfx on-device. Reuses the compile-verified module graph
-        // and adds the EGL / GLESv3 link the compile-checks above deferred.
-        const app_mod = b.createModule(.{
-            .root_source_file = b.path("example/android_video.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        // Android audio-track decoder module (FP#549 audio): decodes the
-        // mp4's AAC track via AMediaExtractor/AMediaCodec → 48k stereo PCM.
-        // Needs the NDK sysroot (Bionic headers) and links mediandk, same as
-        // the rest of the Android media path.
-        const android_audio_mod = b.addModule("android_audio", .{
-            .root_source_file = b.path("src/video/android_audio.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        applyNdkSysroot(android_audio_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
-        android_audio_mod.linkSystemLibrary("mediandk", .{});
-
-        app_mod.addImport("backend_app", android_app_mod);
-        app_mod.addImport("backend_gfx", gfx_mod);
-        app_mod.addImport("window", window_mod);
-        app_mod.addImport("audio", audio_mod);
-        app_mod.addImport("android_audio", android_audio_mod);
-        applyNdkSysroot(app_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
-        app_mod.linkSystemLibrary("android", .{});
-        app_mod.linkSystemLibrary("log", .{});
-        app_mod.linkSystemLibrary("mediandk", .{});
-        app_mod.linkSystemLibrary("aaudio", .{});
-        app_mod.linkSystemLibrary("EGL", .{});
-        app_mod.linkSystemLibrary("GLESv3", .{});
-
-        app_mod.linkLibrary(bgfx_artifact);
-        const app_lib = b.addLibrary(.{
-            .name = "game",
-            .linkage = .dynamic,
-            .root_module = app_mod,
-        });
-        // Zig won't self-provide bionic libc — point the link at the NDK's
-        // libc (headers + crt objects) via a generated libc paths file.
-        // include_dir + sys_include_dir carry the TWO NDK header roots
-        // (usr/include and usr/include/<triple>) so zig's bundled libc++ build
-        // finds both <linux/types.h> and the arch <asm/types.h>.
-        const libc_conf = b.fmt(
-            "include_dir={s}\nsys_include_dir={s}\ncrt_dir={s}\nmsvc_lib_dir=\nkernel32_lib_dir=\ngcc_dir=\n",
-            .{ n.inc_arch, n.inc_common, n.lib_path },
-        );
-        const libc_wf = b.addWriteFiles();
-        app_lib.setLibCFile(libc_wf.add("android-libc.txt", libc_conf));
-
-        const app_step = b.step("android-app", "Link the bgfx-Android video demo (libgame.so)");
-        app_step.dependOn(&b.addInstallArtifact(app_lib, .{}).step);
+        // ── No `android-app` step here (REMOVED) ────────────────────────
+        // There used to be a `zig build android-app` step that linked a
+        // standalone `libgame.so` from `example/android_video.zig`. That file
+        // was NEVER committed — `git log --all -- example/android_video.zig`
+        // returns nothing — so the step could not build on any checkout since
+        // the day it was written, and nothing in CI exercised it.
+        //
+        // It is not being repaired, because it should not exist: an Android app
+        // in this toolkit is built by the labelle CLI, which drives the
+        // assembler's generate → build → package flow over a `project.labelle`
+        // (see `examples/bgfx-android`, which CI's `android-example` job DOES
+        // cross-build). A backend repo carrying its own bespoke Android app
+        // target duplicates that pipeline and drifts from it.
+        //
+        // What stays is the Android COMPILE-CHECK above (`android_app_tests`):
+        // it proves this backend's Android module graph — shell +
+        // native_app_glue + window/input — still compiles for
+        // aarch64-linux-android on every `zig build test`, which is the part
+        // that genuinely belongs to the backend. The link, package and deploy
+        // belong to the CLI.
     }
 
     // ── Audio backend tests ─────────────────────────────────────────
