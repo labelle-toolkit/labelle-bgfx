@@ -19,10 +19,35 @@ const builtin = @import("builtin");
 const yuv = @import("yuv.zig");
 const planes = @import("planes.zig");
 
-extern "c" fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
-extern "c" fn pclose(stream: *anyopaque) c_int;
 extern "c" fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *anyopaque) usize;
 extern "c" fn system(command: [*:0]const u8) c_int;
+
+/// `popen`/`pclose`, under the name the target's C RUNTIME actually exports
+/// (labelle-bgfx#102).
+///
+/// `fread`/`system` above are ISO C and are spelled the same everywhere, but
+/// `popen` is POSIX, and the Windows CRT exports it as `_popen`/`_pclose`.
+/// `<stdio.h>` papers over that with `#define popen _popen`-style macros — and
+/// a hand-written Zig `extern` bypasses the preprocessor entirely, so a plain
+/// `extern "c" fn popen` is an undefined symbol at link time on a native
+/// Windows (MSVC) host. Since labelle-bgfx#102 gave this file its own
+/// unconditional host test artifact, that is a LINK failure of `zig build test`
+/// on Windows — before the test can either run or take its ffmpeg skip.
+///
+/// So the symbol NAME is selected by OS, the same way `binary_read_mode` below
+/// selects the mode string. The underscored spelling is used for every Windows
+/// ABI, not just `-msvc`: mingw-w64 exports `_popen`/`_pclose` from msvcrt as
+/// well (its `popen` is the alias, not the other way round), so one branch is
+/// correct for `windows-gnu` and `windows-msvc` alike.
+const is_windows = builtin.os.tag == .windows;
+const popen = @extern(*const fn (command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*anyopaque, .{
+    .name = if (is_windows) "_popen" else "popen",
+    .library_name = "c",
+});
+const pclose = @extern(*const fn (stream: *anyopaque) callconv(.c) c_int, .{
+    .name = if (is_windows) "_pclose" else "pclose",
+    .library_name = "c",
+});
 
 /// `popen` mode for reading ffmpeg's raw binary output (PCM audio / I420 video).
 /// Only Windows needs the `"b"`: its C runtime otherwise CRLF-translates the
