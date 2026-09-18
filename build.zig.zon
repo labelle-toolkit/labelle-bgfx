@@ -76,7 +76,6 @@
         // `texture.drawTextureProMaterial` all require. v1.32.0 has neither and
         // will not compile.
         //
-        // ⚠ TEMPORARY COMMIT PIN — labelle-core#79 (`feat/game-shader-materials`)
         // is not released yet. This is a real, hash-verified pin (same shape as
         // the zbgfx pin above), NOT a path override, so CI resolves it; but it
         // MUST be replaced with the release tag once core#79 merges and ships:
@@ -85,8 +84,8 @@
         // For local integration against a working copy of core, prefer
         // `-Dcore-source=/path/to/labelle-core/src/root.zig`.
         .labelle_core = .{
-            .url = "https://github.com/labelle-toolkit/labelle-core/archive/e9422c6a253960782defc1565117b1a0db6a3de3.tar.gz",
-            .hash = "labelle_core-1.32.0-OauRcIKiBwDE6O0GbPIjhCtQhpvUBd0bnvONzDvY_rmz",
+            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v2.0.0.tar.gz",
+            .hash = "labelle_core-2.0.0-OauRcPGlBwCXfrDJneAcTZoHhXiFnsO3pCCBA3L0_Nup",
         },
         // Shared audio engine (pluggable-backends RFC, Phase 2). The bgfx
         // backend's `src/audio.zig` collapses its duplicated WAV decode + PCM
