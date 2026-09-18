@@ -114,8 +114,29 @@ pub const ANativeActivityCallbacks = extern struct {
 /// pointer, so the offset is correct.
 pub const ANativeActivity = extern struct {
     callbacks: *ANativeActivityCallbacks,
-    _tail: [11]?*anyopaque,
+    /// `JavaVM* vm`, `JNIEnv* env`, `jobject clazz` — untyped, we never touch
+    /// them from here (the JNI bridge goes through `getNativeActivity`).
+    _vm: ?*anyopaque,
+    _env: ?*anyopaque,
+    _clazz: ?*anyopaque,
+    /// `const char* internalDataPath` — the app's OWN private directory
+    /// (`/data/data/<package>/files`). The only filesystem location a
+    /// NativeActivity can always write to, and the one `run-as <package> cat`
+    /// / `adb pull` can read back on a debuggable build.
+    internal_data_path: ?[*:0]const u8,
+    /// The remaining tail (`externalDataPath`, `sdkVersion` + its padding,
+    /// `instance`, `assetManager`, `obbPath`) stays opaque. Total size is
+    /// unchanged: 4 pointer slots replaced the first 4 `_tail` entries.
+    _tail: [7]?*anyopaque,
 };
+
+comptime {
+    // The struct is only ever used through a pointer the framework gives us,
+    // so a layout drift would read the wrong field silently. Pin the size.
+    if (@sizeOf(ANativeActivity) != 12 * @sizeOf(?*anyopaque)) {
+        @compileError("ANativeActivity layout drifted");
+    }
+}
 
 /// One poll source returned by `ALooper_pollOnce`. The glue fills
 /// `process` with its own `process_cmd` / `process_input`; we just call
@@ -784,6 +805,22 @@ comptime {
 /// to populate core's `AndroidBackendContext.get_native_activity`.
 pub fn getNativeActivity() ?*anyopaque {
     return @ptrCast(native_activity);
+}
+
+/// The app's private internal data directory (`/data/data/<package>/files`),
+/// or null before the activity exists (labelle-assembler#737).
+///
+/// Exists so the generated `main.zig` can resolve a RELATIVE
+/// `LABELLE_SCREENSHOT_PATH` against a directory the process can actually
+/// write. A NativeActivity has no usable cwd and no write access to
+/// `/data/local/tmp`, and the Android property that carries the environment
+/// (`wrap.<package>`, the only channel into a debuggable app) caps its value
+/// at 92 bytes — an absolute path to this directory alone eats two thirds of
+/// that. Relative paths keep the knob short and land the capture exactly where
+/// `run-as <package> cat files/<name>` can fetch it.
+pub fn internalDataPath() ?[*:0]const u8 {
+    const activity = native_activity orelse return null;
+    return activity.internal_data_path;
 }
 
 /// C-ABI accessor the bgfx Android backend adapter binds `extern "c"` (see
