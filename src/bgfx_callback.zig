@@ -196,6 +196,23 @@ fn traceVargs(
     // release mode, both AFTER this change. Making it work there would mean
     // building bgfx with `BGFX_CONFIG_DEBUG=1`, which is a different decision
     // with a real runtime cost.
+    //
+    // …EXCEPT on emscripten, where `std.debug.print` is not an option at all:
+    // Zig 0.16.0's debug Io (`std.Io.Threaded`) drags in the child-process wait
+    // path, and `posix.W.STOPSIG` returns a `u32` there while `statusToTerm`
+    // wants the SIG enum — so the file does not COMPILE for wasm32-emscripten
+    // (labelle-bgfx#105). It is the same std regression `example/wasm_demo.zig`
+    // dodges with its panic + log overrides; this callback simply was not
+    // covered, because no CI job built `wasm-example`. On emscripten we route
+    // through `std.log` instead, which the wasm entry point overrides onto
+    // `emscripten_console_log` — the browser console is the only sink there
+    // anyway, and bgfx elides its own trace calls in release, so the severity
+    // filter this comment warns about costs nothing on the one target that
+    // needs the detour.
+    if (comptime builtin.target.os.tag == .emscripten) {
+        std.log.info("bgfx trace: {s}:{d}: {s}", .{ std.mem.span(file_path), line, buf[0..len] });
+        return;
+    }
     std.debug.print("bgfx trace: {s}:{d}: {s}\n", .{ std.mem.span(file_path), line, buf[0..len] });
 }
 

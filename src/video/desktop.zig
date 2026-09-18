@@ -19,11 +19,35 @@ const builtin = @import("builtin");
 const yuv = @import("yuv.zig");
 const planes = @import("planes.zig");
 
-extern "c" fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
-extern "c" fn pclose(stream: *anyopaque) c_int;
 extern "c" fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *anyopaque) usize;
 extern "c" fn system(command: [*:0]const u8) c_int;
-extern "c" fn unlink(path: [*:0]const u8) c_int;
+
+/// `popen`/`pclose`, under the name the target's C RUNTIME actually exports
+/// (labelle-bgfx#102).
+///
+/// `fread`/`system` above are ISO C and are spelled the same everywhere, but
+/// `popen` is POSIX, and the Windows CRT exports it as `_popen`/`_pclose`.
+/// `<stdio.h>` papers over that with `#define popen _popen`-style macros — and
+/// a hand-written Zig `extern` bypasses the preprocessor entirely, so a plain
+/// `extern "c" fn popen` is an undefined symbol at link time on a native
+/// Windows (MSVC) host. Since labelle-bgfx#102 gave this file its own
+/// unconditional host test artifact, that is a LINK failure of `zig build test`
+/// on Windows — before the test can either run or take its ffmpeg skip.
+///
+/// So the symbol NAME is selected by OS, the same way `binary_read_mode` below
+/// selects the mode string. The underscored spelling is used for every Windows
+/// ABI, not just `-msvc`: mingw-w64 exports `_popen`/`_pclose` from msvcrt as
+/// well (its `popen` is the alias, not the other way round), so one branch is
+/// correct for `windows-gnu` and `windows-msvc` alike.
+const is_windows = builtin.os.tag == .windows;
+const popen = @extern(*const fn (command: [*:0]const u8, mode: [*:0]const u8) callconv(.c) ?*anyopaque, .{
+    .name = if (is_windows) "_popen" else "popen",
+    .library_name = "c",
+});
+const pclose = @extern(*const fn (stream: *anyopaque) callconv(.c) c_int, .{
+    .name = if (is_windows) "_pclose" else "pclose",
+    .library_name = "c",
+});
 
 /// `popen` mode for reading ffmpeg's raw binary output (PCM audio / I420 video).
 /// Only Windows needs the `"b"`: its C runtime otherwise CRLF-translates the
@@ -92,10 +116,8 @@ pub const Info = struct { w: u32, h: u32, fps: f32 };
 pub fn probe(allocator: std.mem.Allocator, path: []const u8) ?Info {
     const qpath = shellQuote(allocator, path) catch return null;
     defer allocator.free(qpath);
-    const cmd = std.fmt.allocPrintSentinel(allocator,
-        "ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate " ++
-        "-of csv=p=0:s=x {s}",
-        .{qpath}, 0) catch return null;
+    const cmd = std.fmt.allocPrintSentinel(allocator, "ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate " ++
+        "-of csv=p=0:s=x {s}", .{qpath}, 0) catch return null;
     defer allocator.free(cmd);
     const stream = popen(cmd.ptr, "r") orelse return null;
     defer _ = pclose(stream);
@@ -131,17 +153,34 @@ pub const VideoDecoder = struct {
     path_buf: [512]u8 = undefined, // stored for replay() (re-spawn)
     path_len: usize = 0,
 
+    /// Is a usable `ffmpeg` on PATH?
+    ///
+    /// Every decode path in this file shells out to `ffmpeg`, so on a host that
+    /// has none, the tests below have nothing to exercise and must SKIP rather
+    /// than fail — but they must skip *explicitly*, naming the reason, not by
+    /// being invisible to the test runner (labelle-bgfx#102: this file's one
+    /// test was hidden behind a comptime-gated re-export and never ran at all).
+    ///
+    /// `system` returns the shell's exit status, so a missing binary shows up as
+    /// non-zero (127 from `sh`). Output is redirected away so the probe is
+    /// silent on a normal run.
+    pub fn ffmpegAvailable() bool {
+        const version_cmd: [*:0]const u8 = if (builtin.os.tag == .windows)
+            "ffmpeg -version >NUL 2>&1"
+        else
+            "ffmpeg -version >/dev/null 2>&1";
+        return system(version_cmd) == 0;
+    }
+
     /// Generate a self-contained H.264 test clip *with an audio track* (a 440 Hz
     /// sine), so demos need no bundled asset and can exercise the audio path.
     pub fn generateTestClip(allocator: std.mem.Allocator, path: []const u8, w: u32, h: u32) !void {
         const qpath = try shellQuote(allocator, path);
         defer allocator.free(qpath);
-        const cmd = try std.fmt.allocPrintSentinel(allocator,
-            "ffmpeg -hide_banner -loglevel error -y " ++
+        const cmd = try std.fmt.allocPrintSentinel(allocator, "ffmpeg -hide_banner -loglevel error -y " ++
             "-f lavfi -i testsrc2=duration=6:size={d}x{d}:rate=24 " ++
             "-f lavfi -i sine=frequency=440:duration=6 " ++
-            "-c:v libx264 -pix_fmt yuv420p -c:a aac -shortest {s}",
-            .{ w, h, qpath }, 0);
+            "-c:v libx264 -pix_fmt yuv420p -c:a aac -shortest {s}", .{ w, h, qpath }, 0);
         defer allocator.free(cmd);
         if (system(cmd.ptr) != 0) return error.FfmpegEncodeFailed;
     }
@@ -155,10 +194,8 @@ pub const VideoDecoder = struct {
         defer allocator.free(qclip);
         const qwav = try shellQuote(allocator, wav_path);
         defer allocator.free(qwav);
-        const cmd = try std.fmt.allocPrintSentinel(allocator,
-            "ffmpeg -hide_banner -loglevel error -y -i {s} " ++
-            "-vn -ar 48000 -ac 2 -c:a pcm_s16le {s}",
-            .{ qclip, qwav }, 0);
+        const cmd = try std.fmt.allocPrintSentinel(allocator, "ffmpeg -hide_banner -loglevel error -y -i {s} " ++
+            "-vn -ar 48000 -ac 2 -c:a pcm_s16le {s}", .{ qclip, qwav }, 0);
         defer allocator.free(cmd);
         if (system(cmd.ptr) != 0) return error.FfmpegAudioExtractFailed;
     }
@@ -171,9 +208,7 @@ pub const VideoDecoder = struct {
     pub fn decodeAudioPcm(allocator: std.mem.Allocator, path: []const u8) ?[]i16 {
         const qpath = shellQuote(allocator, path) catch return null;
         defer allocator.free(qpath);
-        const cmd = std.fmt.allocPrintSentinel(allocator,
-            "ffmpeg -hide_banner -loglevel error -i {s} -vn -f s16le -ar 48000 -ac 2 pipe:1",
-            .{qpath}, 0) catch return null;
+        const cmd = std.fmt.allocPrintSentinel(allocator, "ffmpeg -hide_banner -loglevel error -i {s} -vn -f s16le -ar 48000 -ac 2 pipe:1", .{qpath}, 0) catch return null;
         defer allocator.free(cmd);
         // BINARY read: raw s16le PCM. See `spawn` — a text-mode pipe on Windows
         // CRLF-translates and EOFs on the first 0x1A byte, corrupting/truncating
@@ -230,10 +265,8 @@ pub const VideoDecoder = struct {
         const qpath = try shellQuote(allocator, path);
         defer allocator.free(qpath);
         // Raw I420 (planar YUV 4:2:0): Y plane (w*h) then U then V (each cw*ch).
-        const cmd = try std.fmt.allocPrintSentinel(allocator,
-            "ffmpeg -hide_banner -loglevel error -i {s} " ++
-            "-f rawvideo -pix_fmt yuv420p -s {d}x{d} pipe:1",
-            .{ qpath, w, h }, 0);
+        const cmd = try std.fmt.allocPrintSentinel(allocator, "ffmpeg -hide_banner -loglevel error -i {s} " ++
+            "-f rawvideo -pix_fmt yuv420p -s {d}x{d} pipe:1", .{ qpath, w, h }, 0);
         defer allocator.free(cmd);
         // BINARY read: the pipe carries raw I420 frames. On Windows a text-mode
         // ("r") pipe does CRLF translation and treats the first 0x1A byte as EOF,
@@ -331,12 +364,41 @@ pub const VideoDecoder = struct {
 
 test "decodeAudioPcm: decodes a clip's audio track to 48k stereo PCM" {
     const alloc = std.testing.allocator;
-    // `/tmp` is fine: this backend (and its tests) only build on POSIX hosts
-    // (Linux/macOS) — bgfx here has no Windows target. Cleaned up after.
-    const clip = "/tmp/labelle_audio_decode_test.mp4";
+
+    // The whole decode path is `ffmpeg` shelled out through libc. With no
+    // ffmpeg there is nothing to test, so SKIP — loudly and by name, so a run
+    // that skipped is distinguishable from a run that passed. CI installs
+    // ffmpeg and asserts this does NOT skip (labelle-bgfx#102).
+    if (!VideoDecoder.ffmpegAvailable()) {
+        std.debug.print("SKIP: no `ffmpeg` on PATH (install it to cover the desktop video decode path)\n", .{});
+        return error.SkipZigTest;
+    }
+
+    // This test runs on EVERY host `zig build test` supports — Windows
+    // included (labelle-bgfx#102 gave the file its own host artifact, and
+    // `ffmpegAvailable`/`shellQuote`/`binary_read_mode` all have Windows
+    // branches). So the scratch clip must NOT be a hard-coded `/tmp/...`
+    // path, which cannot exist there. `std.testing.tmpDir` gives a
+    // per-run directory under the cache dir on any host, and cleans it
+    // (clip included) up for us — no `unlink` needed.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // `tmpDir` creates `.zig-cache/tmp/<sub_path>/` relative to the CWD the
+    // test binary was launched with, and `cleanup` deletes the whole tree —
+    // so naming the clip inside it needs neither `realPath` (which std itself
+    // flags as poorly supported across platforms) nor an `unlink`. The path
+    // stays relative on purpose: ffmpeg inherits our CWD, and
+    // `std.fs.path.join` uses the host's own separator.
+    const clip = try std.fs.path.join(
+        alloc,
+        &.{ ".zig-cache", "tmp", &tmp.sub_path, "labelle_audio_decode_test.mp4" },
+    );
+    defer alloc.free(clip);
+
     // generateTestClip writes a 6 s clip with a 440 Hz sine audio track.
+    // NOT a skip: ffmpeg exists, so a failure here is a real defect (or an
+    // ffmpeg build with no libx264/aac) and must be seen, not swallowed.
     try VideoDecoder.generateTestClip(alloc, clip, 320, 240);
-    defer _ = unlink(clip);
 
     const pcm = VideoDecoder.decodeAudioPcm(alloc, clip) orelse return error.NoAudioDecoded;
     defer alloc.free(pcm);

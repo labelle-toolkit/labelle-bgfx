@@ -886,6 +886,40 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(web_video_run).step);
 
+    // Desktop video decode (`video/desktop.zig`) — the ffmpeg-over-`popen`
+    // decoder — needs its OWN host artifact (labelle-bgfx#102).
+    //
+    // It had none, and it is NOT reachable as a test from anywhere else:
+    // `gfx.zig` re-exports it as
+    //   `pub const DesktopVideoDecoder = if (is_wasm) struct {} else @import("video/desktop.zig")…`
+    // and a comptime-gated re-export like that references a DECL, not the file
+    // container — so Zig never collects the file's `test` blocks into
+    // `gfx_run`. Proof the gap was real: making the one test in that file
+    // return an error left `zig build test` green at exit 0. Same trap the
+    // `font_tests.zig` comment above describes, hit from the other side.
+    //
+    // Host-only and libc-linked: the decoder is libc `popen`/`system`/`fread`
+    // externs plus pure Zig; no zbgfx, no NDK, nothing to link from bgfx. The
+    // test itself SKIPS (`error.SkipZigTest`) when no `ffmpeg` is on PATH — CI
+    // installs one and asserts the run does not skip, so "green" cannot mean
+    // "skipped everywhere".
+    const desktop_video_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/video/desktop.zig"),
+            .target = host_target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const desktop_video_run_step = b.addRunArtifact(desktop_video_run);
+    test_step.dependOn(&desktop_video_run_step.step);
+    // Standalone step so CI can run JUST this and assert on its summary
+    // (passed, not skipped) without reading the whole suite's totals.
+    b.step(
+        "test-video-desktop",
+        "Run the desktop (ffmpeg) video decoder tests (labelle-bgfx#102)",
+    ).dependOn(&desktop_video_run_step.step);
+
     // ── Compile-check window.zig (+ input.zig via its import) ───────
     // window.zig does the real comptime dispatch on builtin.target — both
     // the per-OS desktop branches and the Android `is_android` path — so

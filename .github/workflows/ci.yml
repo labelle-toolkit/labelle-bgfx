@@ -24,6 +24,12 @@ jobs:
       # The shared SDL desktop gamepad source (labelle-sdl-gamepad) links SDL2.
       - name: Install SDL2
         run: brew install sdl2
+      # `src/video/desktop.zig` decodes by shelling out to ffmpeg. Its test
+      # SKIPS cleanly when there is no ffmpeg — which would make the coverage
+      # this job claims vacuous — so install one and assert below that it did
+      # NOT skip (labelle-bgfx#102).
+      - name: Install ffmpeg (desktop video decode test fixture)
+        run: brew install ffmpeg
       # zbgfx C/C++ is heavy; cache the global + project zig caches keyed on the zon.
       - name: Cache Zig artifacts
         uses: actions/cache@v4
@@ -36,7 +42,37 @@ jobs:
           restore-keys: |
             bgfx-${{ runner.os }}-
       - name: Build + test
-        run: zig build test
+        run: zig build test --summary all
+      # A green suite is not evidence a test RAN. `src/video/desktop.zig`'s one
+      # test was invisible to the runner for its whole life (labelle-bgfx#102):
+      # `gfx.zig` re-exports the module through a comptime-gated
+      # `pub const X = if (is_wasm) struct {} else @import(...)`, which
+      # references a decl and never pulls the file's `test` blocks into any test
+      # binary — making the test return an error left `zig build test` at exit 0.
+      # It now has its own host artifact, and this step pins BOTH halves: the
+      # run passes, and it reports 1/1 rather than a skip (the test skips itself
+      # when ffmpeg is missing).
+      - name: Desktop video decode test really ran (not skipped)
+        run: |
+          # GitHub's default `run` shell is `bash -e`, and `set -uo pipefail`
+          # does NOT clear that (see the surfaceless-probe step below). Without
+          # `set +e` the capture assignment aborts the step the moment the
+          # command fails — before the output is echoed and before the explicit
+          # status check runs — so a genuine failure shows up as an empty group.
+          set +e
+          set -uo pipefail
+          out=$(zig build test-video-desktop --summary all 2>&1); rc=$?
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then
+            echo "FAIL: test-video-desktop exited non-zero ($rc)"; exit 1
+          fi
+          # Separate check, separate exit status — never `cmd | grep` here.
+          if ! printf '%s\n' "$out" | grep -q '1/1 tests passed'; then
+            echo "FAIL: the desktop video decode test did not RUN (skipped, or not discovered)."
+            echo "      Expect '1/1 tests passed'. A skip means ffmpeg is missing on the"
+            echo "      runner; no test at all means the artifact wiring in build.zig broke."
+            exit 1
+          fi
       - name: Generic shader materials (GPU pixels, reflection, lifecycle and fallback)
         run: zig build shader-material-probe
       - name: Texture sampling (rendered point versus linear pixels)
@@ -86,7 +122,7 @@ jobs:
   # externalUsesEnumPath fix are unreleased, so build them from main). Build-only —
   # produces the aarch64 NativeActivity libgame.so; no device/emulator/APK.
   android-example:
-    name: bgfx-android example .so cross-build
+    name: bgfx-android example — .so cross-build + host scene-load smoke
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -245,6 +281,21 @@ jobs:
         with:
           version: 0.16.0
 
+      # For the HOST smoke below (labelle-bgfx#104): the same desktop build the
+      # `headless-linux` job needs — GLFW's X11/Wayland headers to link, plus
+      # Mesa **lavapipe** so `--headless` (which forces Vulkan) has a software
+      # device with no display server. Kept identical to that job's list on
+      # purpose; they provision the same thing.
+      - name: Install desktop build + Vulkan (lavapipe) deps for the host smoke
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libsdl2-dev \
+            libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev \
+            libvulkan-dev libvulkan1 mesa-vulkan-drivers
+
       - name: Set up Android NDK
         id: ndk
         uses: nttld/setup-ndk@v1
@@ -258,6 +309,7 @@ jobs:
           path: |
             ~/.cache/zig
             labelle-bgfx/examples/bgfx-android/.labelle/bgfx_android/.zig-cache
+            labelle-bgfx/examples/bgfx-android/.labelle/bgfx_desktop/.zig-cache
           key: bgfx-android-${{ env.LABELLE_CLI_TAG }}-${{ env.LABELLE_ASSEMBLER_TAG }}-${{ hashFiles('labelle-bgfx/examples/bgfx-android/project.labelle', 'labelle-bgfx/build.zig.zon') }}
           restore-keys: |
             bgfx-android-
@@ -296,6 +348,126 @@ jobs:
           file "$so" | grep -q 'ELF 64-bit.*ARM aarch64' || { echo "FAIL: not an aarch64 ELF"; exit 1; }
           nm -D "$so" | grep -q 'android_main' || { echo "FAIL: android_main not exported"; exit 1; }
           nm -D "$so" | grep -q 'ANativeActivity_onCreate' || { echo "FAIL: ANativeActivity_onCreate not exported"; exit 1; }
+
+      # ── The gap this job had (labelle-bgfx#104) ──────────────────────
+      # Everything above only CROSS-COMPILES. An .so that aborts in `gameInit`
+      # is byte-for-byte as convincing as one that renders perfectly, which is
+      # exactly how this example shipped broken: its scene still opened with
+      # the legacy `"entities"` key, removed in engine v2.0 (labelle-engine#592),
+      # so the loader hard-errored and the app SIGABRT'd on launch on a real
+      # Galaxy Tab A7 while this job stayed green.
+      #
+      # An emulator lane is heavy and Android-specific; the failure is not.
+      # `"entities"` was rejected by the ENGINE's scene loader, which is the
+      # same code on every platform — so generate the SAME project for the
+      # host, build it, and run it windowless for a few frames. That executes
+      # `gameInit` -> `setScene("main")` -> the unified-format parse for real,
+      # and generalises: any init-time abort (a bad component, a missing asset
+      # reference, a contract drift) now fails CI instead of hiding behind a
+      # successful cross-compile.
+      #
+      # ⚠ `labelle run` EXITS 0 even when the game it launched exits non-zero
+      # (verified locally: the game printed the unified-format error, `labelle:
+      # process exited with code 1`, and the CLI still returned 0). So the exit
+      # status is checked AND the output is scanned — neither alone is enough.
+      - name: Host smoke — the example's scene actually loads (init abort fails CI)
+        env:
+          LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
+          # Prove it is truly display-less, like the headless-linux job.
+          DISPLAY: ""
+          WAYLAND_DISPLAY: ""
+        run: |
+          # GitHub's default `run` shell is `bash -e`, and `set -uo pipefail`
+          # does NOT clear that (see the surfaceless-probe step below). Without
+          # `set +e` the capture assignment aborts the step the moment the
+          # command fails — before the output is echoed and before the explicit
+          # status check runs — so a genuine failure shows up as an empty group.
+          set +e
+          set -uo pipefail
+          cd labelle-bgfx/examples/bgfx-android
+          # Desktop target (no --platform): same project.labelle, same scenes/,
+          # same engine — only the window/backend platform differs.
+          out=$($GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle run --headless --ticks=30 2>&1); rc=$?
+          echo "$out"
+          fail=0
+          if [ "$rc" -ne 0 ]; then echo "FAIL: labelle run exited non-zero ($rc)"; fail=1; fi
+          # The CLI relays the game's own exit code as a line, not as its status.
+          if printf '%s\n' "$out" | grep -q 'process exited with code [^0]'; then
+            echo "FAIL: the game process exited non-zero — it did not survive init."
+            fail=1
+          fi
+          # Belt and braces for the specific class that caused #104: any
+          # unified-format hard error is an aborting scene parse.
+          if printf '%s\n' "$out" | grep -q 'ERROR \[unified-format\]'; then
+            echo "FAIL: the scene was rejected by the unified-format loader."
+            echo "      Run \`labelle migrate unified\` in examples/bgfx-android."
+            fail=1
+          fi
+          # A run that produced no engine output at all is not a pass either.
+          if ! printf '%s\n' "$out" | grep -q 'sprite shaders initialized'; then
+            echo "FAIL: the renderer never initialized — the smoke proved nothing."
+            fail=1
+          fi
+          exit $fail
+
+  # `zig build wasm-example` had NO CI job, and rotted (labelle-bgfx#105):
+  # `src/bgfx_callback.zig`'s trace hook called `std.debug.print`, which reaches
+  # `std.Io.Threaded`'s child-process wait path — and that does not compile for
+  # wasm32-emscripten on Zig 0.16.0 (`posix.W.STOPSIG` returns `u32` where
+  # `statusToTerm` wants the SIG enum). It is the same std regression the demo's
+  # own panic/log overrides were written to dodge; the callback simply was never
+  # built. Compiling the example is cheap, so compile it on every PR.
+  #
+  # No emsdk action and no second toolchain source: the wasm build provisions
+  # its OWN emscripten from the `emsdk` Zig PACKAGE (build.zig.zon) and runs
+  # `emsdk install/activate` through `emSdkSetupStep`, which is exactly what
+  # makes the build portable off a developer's Homebrew. All this job adds is
+  # the zig toolchain and a cache.
+  wasm-example:
+    name: wasm/WebGL example builds (emcc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      # emsdk's installer is Python; ubuntu-latest ships python3, assert it
+      # rather than discovering its absence 20 minutes into a C++ build.
+      - name: Check python3 (emsdk installer)
+        run: python3 --version
+      # bgfx/bx/bimg for wasm plus the emsdk package itself are the expensive
+      # parts. `zig-pkg/` holds the fetched emsdk (and its activated sysroot).
+      - name: Cache Zig + emsdk artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+            zig-pkg
+          key: bgfx-wasm-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            bgfx-wasm-${{ runner.os }}-
+      - name: Build the wasm/WebGL example
+        run: zig build -Dtarget=wasm32-emscripten wasm-example --summary all
+      # A green emcc step that emitted nothing would be the same kind of empty
+      # evidence this PR is about. Assert the three real artifacts exist and
+      # that the .wasm is not a stub.
+      - name: Verify the emitted wasm artifacts
+        run: |
+          set -euo pipefail
+          for f in zig-out/web/wasm_demo.html zig-out/web/wasm_demo.js zig-out/web/wasm_demo.wasm; do
+            [ -s "$f" ] || { echo "FAIL: missing or empty $f"; exit 1; }
+            ls -l "$f"
+          done
+          size=$(wc -c < zig-out/web/wasm_demo.wasm)
+          [ "$size" -gt 100000 ] || { echo "FAIL: wasm_demo.wasm is only $size bytes"; exit 1; }
+          # `tr -s ' '` normalizes od's column padding, which differs between
+          # GNU (single space) and BSD (double) od.
+          head -c 4 zig-out/web/wasm_demo.wasm | od -An -tx1 | tr -s ' ' | grep -q '00 61 73 6d' \
+            || { echo "FAIL: wasm_demo.wasm has no wasm magic"; exit 1; }
 
   # Prove the surfaceless render + capture path (labelle-bgfx#36) works with NO
   # display server and NO real GPU — the exact CI scenario `labelle run
