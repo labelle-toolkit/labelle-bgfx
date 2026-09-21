@@ -726,6 +726,24 @@ pub fn build(b: *std.Build) void {
     }) });
     const shader_material_run = b.addRunArtifact(shader_material_tests);
     test_step.dependOn(&shader_material_run.step);
+    // The material store does not need bgfx to compile. Type-check the same
+    // tests on a 32-bit WASM target even when CI runs on a 64-bit host.
+    // The WebGL example doesn't instantiate every material lifecycle path.
+    const material_wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
+    const material_wasm_core = b.createModule(.{
+        .root_source_file = core_mod.root_source_file,
+        .target = material_wasm_target,
+        .optimize = optimize,
+    });
+    const material_wasm_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/shader_material_tests.zig"),
+        .target = material_wasm_target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "labelle-core", .module = material_wasm_core }},
+    }) });
+    test_step.dependOn(&material_wasm_tests.step);
+    b.step("test-shader-material-wasm32", "Compile material lifecycle tests for 32-bit WASM").dependOn(&material_wasm_tests.step);
+
     b.step("test-shader-material", "Run generic shader material ownership, validation and lifecycle tests").dependOn(&shader_material_run.step);
 
     test_step.dependOn(&b.addRunArtifact(platform_tests).step);
