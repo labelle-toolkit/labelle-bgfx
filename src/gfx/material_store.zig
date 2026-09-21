@@ -49,7 +49,9 @@ pub fn Store(comptime Driver: type) type {
 
         pub fn get(self: *Self, id: sm.Id) sm.Error!*Instance {
             const bits = @intFromEnum(id);
-            const index = bits & 0xffffffff;
+            // Handles pack a u32 slot index below a u32 generation. Keep
+            // the index 32-bit so it can index slices on wasm32 too.
+            const index: u32 = @truncate(bits);
             if (index == 0 or index > capacity) return error.InvalidHandle;
             const slot = &self.slots[index - 1];
             if (bits >> 32 != slot.generation) return error.InvalidHandle;
@@ -199,7 +201,8 @@ pub fn Store(comptime Driver: type) type {
         }
         pub fn destroy(self: *Self, id: sm.Id) void {
             const instance = self.get(id) catch return;
-            self.slots[(@intFromEnum(id) & 0xffffffff) - 1].instance = null;
+            const index: u32 = @truncate(@intFromEnum(id));
+            self.slots[index - 1].instance = null;
             self.releaseUniforms(instance);
             self.release(instance.program);
             self.allocator.destroy(instance);

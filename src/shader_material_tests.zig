@@ -241,3 +241,18 @@ test "descriptor names, defaults and bindings are copied before create returns" 
     try std.testing.expectEqual(@as(u32, 1), (try store.get(id)).textures[0].id.toInt());
     try store.setParameter(id, "u_value", &.{ 5, 6, 7, 8 });
 }
+
+test "invalid packed indices cannot access or destroy a live material" {
+    var gpu = Fake{};
+    var store = Store(*Fake){ .allocator = std.testing.allocator, .driver = &gpu };
+    defer store.shutdown();
+    const live = try store.create(desc, "compiled");
+    const generation = @intFromEnum(live) & 0xffffffff00000000;
+    for ([_]u64{ 0, Store(*Fake).capacity + 1, 0xffffffff }) |index| {
+        const invalid: sm.Id = @enumFromInt(generation | index);
+        try std.testing.expectError(error.InvalidHandle, store.get(invalid));
+        store.destroy(invalid);
+        _ = try store.get(live);
+        try std.testing.expectEqual(@as(usize, 1), gpu.programs);
+    }
+}
