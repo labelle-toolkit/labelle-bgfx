@@ -461,6 +461,24 @@ pub const beginMode2D = state.beginMode2D;
 pub const endMode2D = state.endMode2D;
 pub const getScreenWidth = state.getScreenWidth;
 pub const getScreenHeight = state.getScreenHeight;
+
+// The PHYSICAL surface, as distinct from the two accessors above — which,
+// contract naming notwithstanding, report the DESIGN canvas (`design_w` /
+// `design_h`). Both pairs have existed in `state` since the design canvas
+// did; only the design pair was re-exported here, so from outside this
+// module the backend looked like one with no design/physical distinction
+// at all.
+//
+// That is not a cosmetic gap. labelle-gfx's `GfxRenderer.framebufferSize`
+// (gfx#353/#362) keys on `@hasDecl(BackendImpl, "physicalWidth")` and
+// falls back to the design pair when it is absent — a legitimate fallback
+// for raylib/SDL, whose window IS their canvas, but silently wrong here:
+// it made `framebufferSize()` and `designSize()` return the same number,
+// a fit scale of exactly 1.0, and a letterbox of exactly zero on a
+// backend that letterboxes for real. Games deriving the letterbox got
+// silence instead of an answer.
+pub const physicalWidth = state.physicalWidth;
+pub const physicalHeight = state.physicalHeight;
 pub const setDesignSize = state.setDesignSize;
 pub const screenToWorld = state.screenToWorld;
 pub const worldToScreen = state.worldToScreen;
@@ -637,5 +655,45 @@ test "compile probe: generic shader material GPU paths" {
         try setShaderTexture(id, "s_aux", .none);
         destroyShaderMaterial(id);
         _ = shaderMaterialSupported();
+    }
+}
+
+// The design/physical split must stay REACHABLE from the module root
+// (labelle-gfx#353).
+//
+// Both pairs have lived in `state` since the design canvas did, but only
+// the design pair was re-exported here — so from outside, this backend was
+// indistinguishable from one with no design/physical distinction at all.
+// labelle-gfx's `GfxRenderer.framebufferSize` keys on
+// `@hasDecl(BackendImpl, "physicalWidth")` and falls back to the design
+// pair when absent. That fallback is correct for raylib/SDL, whose window
+// IS their canvas; here it silently made `framebufferSize()` equal
+// `designSize()`, a fit scale of exactly 1.0, and a letterbox of exactly
+// zero on a backend that letterboxes for real.
+//
+// The failure had no symptom at the seam: it compiled, ran, and returned a
+// plausible number. It cost a released gfx version and a game-side fix that
+// looked like a no-op before anyone looked here. A missing `pub const` is
+// all it takes, so this probe makes dropping one a compile error.
+test "the physical surface is reachable from the module root" {
+    comptime {
+        for ([_][]const u8{ "physicalWidth", "physicalHeight" }) |name| {
+            if (!@hasDecl(@This(), name)) {
+                @compileError("bgfx must re-export " ++ name ++
+                    " at the module root — labelle-gfx's framebufferSize() keys on @hasDecl " ++
+                    "and silently falls back to the DESIGN canvas without it (labelle-gfx#353)");
+            }
+        }
+        // The design pair is what the contract requires; the physical pair is
+        // what distinguishes this backend from one with no canvas of its own.
+        // Both must be present, and they must be DIFFERENT functions — if a
+        // refactor ever aliased them, every letterbox derivation would
+        // silently collapse to zero again.
+        if (@TypeOf(physicalWidth) != @TypeOf(getScreenWidth)) {
+            @compileError("physicalWidth and getScreenWidth must share a signature");
+        }
+        if (&physicalWidth == &getScreenWidth or &physicalHeight == &getScreenHeight) {
+            @compileError("the physical and design accessors must not be the same function");
+        }
     }
 }
