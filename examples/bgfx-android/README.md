@@ -22,7 +22,21 @@ per-frame tick callback with the bgfx shell, then hands the event/frame loop to
 `android_app.run`. (The bgfx desktop template keeps its linear `pub fn main()`
 loop — unchanged.)
 
-## Build, package, deploy
+## Quick path: the labelle CLI
+
+```sh
+export ANDROID_HOME=~/Library/Android/sdk
+labelle android doctor          # every required SDK/NDK tool, checked
+labelle android run             # Debug: generate → build → package → install → launch
+labelle android run --release   # ReleaseFast — judge performance on this one only
+adb logcat -s labelle BGFX      # "bgfx: INIT_WINDOW surface WxH" → "sprite shaders initialized"
+```
+
+`labelle run`/`labelle android run` exit with the game's own status since
+labelle-cli v1.70.0, and the generated `main` routes `std.log` to logcat under
+the tag `labelle` in every optimize mode.
+
+## Build, package, deploy (by hand)
 
 ```sh
 export ANDROID_HOME=~/Library/Android/sdk          # NDK + build-tools + platforms
@@ -53,5 +67,16 @@ adb logcat | grep BGFX                             # "BGFX Init complete." on-de
   `labelle_android_gamepad_init`/`_shutdown`) so the engine/core Android paths —
   which assume sokol provides those symbols — resolve without sokol in the graph.
   Gamepad detection is inert on bgfx-Android for now (a separate ticket).
-- Run with the device **awake** — a dozing screen never creates the foreground
-  surface, so `INIT_WINDOW`/bgfx-init never fires.
+- Run with the device **awake and unlocked** — a dozing screen never creates
+  the foreground surface, so `INIT_WINDOW`/bgfx-init never fires: the activity
+  gets `Resume` → `Pause` → `Stop` within ~150 ms and then just sits there, alive
+  and blank. It is easy to cause by accident: a cold build takes longer than the
+  default 30 s screen-off timeout, so the screen is off again by the time the CLI
+  launches the app, and `svc power stayon usb` alone does not prevent it on
+  Samsung. For a test session:
+  `adb shell settings put system screen_off_timeout 1800000` (restore it after),
+  then `adb shell input keyevent KEYCODE_WAKEUP && adb shell wm dismiss-keyguard`.
+- A scene the engine rejects **aborts in `gameInit`** (SIGABRT ~2 s after launch,
+  "app has a bug" dialog). The reason is one `E/labelle` line above the
+  tombstone — e.g. `[unified-format] legacy "entities" key is no longer accepted`
+  (labelle-bgfx#104 / #114). Read `adb logcat -b crash` for the backtrace.

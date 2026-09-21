@@ -154,8 +154,8 @@ jobs:
     # pinned for the same reason, so this job is reproducible rather than
     # dependent on whatever landed on someone else's main this morning.
     env:
-      LABELLE_CLI_TAG: v1.61.2
-      LABELLE_ASSEMBLER_TAG: v0.99.1
+      LABELLE_CLI_TAG: v1.71.0
+      LABELLE_ASSEMBLER_TAG: v0.109.0
     steps:
       - name: Checkout labelle-bgfx
         uses: actions/checkout@v4
@@ -391,11 +391,10 @@ jobs:
           echo "$out"
           fail=0
           if [ "$rc" -ne 0 ]; then echo "FAIL: labelle run exited non-zero ($rc)"; fail=1; fi
-          # The CLI relays the game's own exit code as a line, not as its status.
-          if printf '%s\n' "$out" | grep -q 'process exited with code [^0]'; then
-            echo "FAIL: the game process exited non-zero — it did not survive init."
-            fail=1
-          fi
+          # Since labelle-cli v1.70.0 (cli#390) `$rc` above IS the game's own
+          # exit status — 134 for the SIGABRT an aborting scene parse raises —
+          # so the old scan for a "process exited with code N" LINE is gone.
+          # It existed only because `labelle run` used to exit 0 after a crash.
           # Belt and braces for the specific class that caused #104: any
           # unified-format hard error is an aborting scene parse.
           if printf '%s\n' "$out" | grep -q 'ERROR \[unified-format\]'; then
