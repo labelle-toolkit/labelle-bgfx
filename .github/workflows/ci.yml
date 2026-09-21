@@ -366,10 +366,14 @@ jobs:
       # reference, a contract drift) now fails CI instead of hiding behind a
       # successful cross-compile.
       #
-      # ⚠ `labelle run` EXITS 0 even when the game it launched exits non-zero
-      # (verified locally: the game printed the unified-format error, `labelle:
-      # process exited with code 1`, and the CLI still returned 0). So the exit
-      # status is checked AND the output is scanned — neither alone is enough.
+      # `labelle run`'s exit status IS the game's since labelle-cli v1.70.0
+      # (cli#390) — an aborting scene parse is 134 (128 + SIGABRT) — so `$rc`
+      # alone detects a game that did not survive init. It used to exit 0 after
+      # a crash, which is why this step once had to scan for a "process exited
+      # with code N" line; LABELLE_CLI_TAG must stay >= v1.70.0 for that to
+      # hold. The output scans that remain are DIAGNOSTIC (a friendlier hint for
+      # a rejected scene) or POSITIVE evidence (the renderer really came up) —
+      # a smoke that produced no engine output proved nothing, whatever it exited.
       - name: Host smoke — the example's scene actually loads (init abort fails CI)
         env:
           LABELLE_ASSEMBLER: ${{ github.workspace }}/labelle-assembler/zig-out/bin/labelle-assembler
