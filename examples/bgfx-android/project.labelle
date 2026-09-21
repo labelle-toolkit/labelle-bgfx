@@ -31,7 +31,7 @@
     .backend_package = .{
         .name = "bgfx",
         .repo = "local:../..",
-        .version = "0.19.0",
+        .version = "0.22.1",
     },
     .y_axis = .up,
     .ecs = .mock,
@@ -57,18 +57,21 @@
     // (build_fragments/backend_dep.txt), so this pin is what actually decides
     // what the backend compiles against.
     //
-    // ⚠ STALE PENDING RELEASES: the backend now requires core's game-owned
-    // `shader_material` contract + `backend_contract.Material.shader`
-    // (labelle-core#79), and the matching labelle-gfx#361 / labelle-engine#882.
-    // v1.32.0 predates all three, so this example does not build until core,
-    // gfx and engine ship their releases; bump core/gfx/engine together then.
-    // The backend itself still COMPILES against an older app core — the curated
-    // `MaterialEffect` switches in `src/gfx/texture.zig` and
-    // `src/gfx/programs.zig` are deliberately non-exhaustive — it is the
-    // shader-material contract types that are the hard floor.
+    // A COHERENT RELEASED SET, moved together: the backend requires core's
+    // game-owned `shader_material` contract (labelle-core#79, core 2.0.0) with
+    // the matching gfx 2.0.0 (labelle-gfx#361) and engine 3.x
+    // (labelle-engine#882). Keep the three on one line of the toolkit's
+    // version floors — since labelle-assembler 0.109.0 `generate` REFUSES a
+    // mixed set (this example sat on engine 2.11.0 / gfx 1.30.0 under core
+    // 2.0.0, and the current CLI could not build it at all: labelle-bgfx#114).
+    //
+    // Note that pins are not necessarily what gets compiled: the assembler
+    // prefers sibling checkouts (`../labelle-core`, …) when they exist and
+    // says so ("built from LOCAL sources"). CI has no siblings and fetches
+    // exactly these.
     .core_version = "2.0.0",
-    .engine_version = "2.11.0",
-    .gfx_version = "1.30.0",
+    .engine_version = "3.0.2",
+    .gfx_version = "2.0.0",
     .labelle_version = "local:../../../labelle-cli",
     .assembler_version = "local:../../../labelle-assembler",
 }

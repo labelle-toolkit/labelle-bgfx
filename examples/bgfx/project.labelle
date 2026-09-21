@@ -12,7 +12,7 @@
     .backend_package = .{
         .name = "bgfx",
         .repo = "local:../..",
-        .version = "0.11.0",
+        .version = "0.22.1",
     },
     .y_axis = .up,
     .ecs = .mock,
@@ -25,18 +25,15 @@
     // (build_fragments/backend_dep.txt), so this pin is what actually decides
     // what the backend compiles against.
     //
-    // ⚠ STALE PENDING RELEASES: the backend now requires core's game-owned
-    // `shader_material` contract + `backend_contract.Material.shader`
-    // (labelle-core#79), and the matching labelle-gfx#361 / labelle-engine#882.
-    // v1.32.0 predates all three, so this example does not build until core,
-    // gfx and engine ship their releases; bump core/gfx/engine together then.
-    // The backend itself still COMPILES against an older app core — the curated
-    // `MaterialEffect` switches in `src/gfx/texture.zig` and
-    // `src/gfx/programs.zig` are deliberately non-exhaustive — it is the
-    // shader-material contract types that are the hard floor.
+    // A COHERENT RELEASED SET, moved together (core 2.0.0 / gfx 2.0.0 / engine
+    // 3.x carry the game-owned `shader_material` contract this backend needs).
+    // Since labelle-assembler 0.109.0 `generate` REFUSES a mixed set — this
+    // example sat on engine 2.11.0 / gfx 1.30.0 under core 2.0.0 and the current
+    // CLI could not build it (labelle-bgfx#114). Nothing in CI builds this
+    // example through the CLI, which is how that went unnoticed.
     .core_version = "2.0.0",
-    .engine_version = "2.11.0",
-    .gfx_version = "1.30.0",
+    .engine_version = "3.0.2",
+    .gfx_version = "2.0.0",
     // Local dev checkouts, resolved as siblings of the main labelle-bgfx
     // checkout (the standard monorepo dev layout). Keep them on their
     // respective mains: cli >= 1.55.x, assembler >= 0.80.0 (the version that
