@@ -1078,6 +1078,13 @@ pub fn build(b: *std.Build) void {
             .file = b.path("src/android_debuggable.c"),
             .flags = &.{ "-std=c11", "-Wall" },
         });
+        // Forces a relayout when a restored window comes back 1x1 and
+        // never receives its resize (labelle-bgfx#127). Same JNI-in-C
+        // rationale and `__ANDROID__` gate as android_debuggable.c.
+        android_app_mod.addCSourceFile(.{
+            .file = b.path("src/android_window_relayout.c"),
+            .flags = &.{ "-std=c11", "-Wall" },
+        });
 
         // Declare the android libs the shell references for the eventual
         // (phase-4) link. These are recorded on the module's link inputs;

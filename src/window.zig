@@ -270,6 +270,22 @@ fn androidSurfaceSize() [2]i32 {
     return liveOrCached(live, .{ screen_w, screen_h });
 }
 
+/// A surface too small to be a real window: Android's placeholder for a
+/// restored window whose resize never arrived (labelle-bgfx#127, seen as 1x1).
+/// No real display surface is under 8 px on either side.
+pub fn isDegenerateSurface(size: [2]i32) bool {
+    return size[0] < 8 or size[1] < 8;
+}
+
+test "isDegenerateSurface: the 1x1 restore placeholder, not real surfaces (#127)" {
+    try std.testing.expect(isDegenerateSurface(.{ 1, 1 }));
+    try std.testing.expect(isDegenerateSurface(.{ 2000, 1 }));
+    try std.testing.expect(isDegenerateSurface(.{ 0, 0 }));
+    try std.testing.expect(!isDegenerateSurface(.{ 2000, 1200 }));
+    try std.testing.expect(!isDegenerateSurface(.{ 1200, 2000 }));
+    try std.testing.expect(!isDegenerateSurface(.{ 8, 8 }));
+}
+
 /// Pure half of `androidSurfaceSize`: a live query is authoritative only when
 /// both dimensions are positive; otherwise keep the cache.
 fn liveOrCached(live: [2]i32, cached: [2]i32) [2]i32 {

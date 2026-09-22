@@ -343,16 +343,41 @@ pub fn setImmersiveCallback(cb: ImmersiveCb) void {
 /// The NDK glue's original `onWindowFocusChanged`, saved so `focusHook`
 /// can forward to it. Set in `run()` before `focusHook` is installed.
 var glue_focus_cb: ?*const fn (*ANativeActivity, c_int) callconv(.c) void = null;
+/// The live ANativeWindow for the UI-thread degenerate check (`focusHook`).
+/// Written on the app thread at INIT_WINDOW, cleared at TERM_WINDOW, read on
+/// the UI thread, hence atomic. The pointer stays valid for that read: the
+/// window is destroyed from the UI thread itself (onNativeWindowDestroyed),
+/// which waits for the app thread to finish TERM_WINDOW.
+var window_for_ui: ?*ANativeWindow = null;
+
+/// UI-thread half of the stuck-surface recovery (labelle-bgfx#127):
+/// `src/android_window_relayout.c`.
+extern "c" fn labelle_bgfx_force_window_relayout(vm: ?*anyopaque, clazz: ?*anyopaque) c_int;
 
 /// Our chained `onWindowFocusChanged`. Runs on the UI thread, so the
 /// engine's `WindowInsetsController.hide()` (driven via `immersive_cb`)
-/// is thread-legal here. Forward to the glue first so its lifecycle
-/// bookkeeping is intact, then re-hide on focus gain.
+/// and the #127 relayout are thread-legal here. Forward to the glue first
+/// so its lifecycle bookkeeping is intact, then re-hide on focus gain.
 fn focusHook(activity: *ANativeActivity, has_focus: c_int) callconv(.c) void {
     if (glue_focus_cb) |cb| cb(activity, has_focus);
     if (has_focus != 0) {
         if (immersive_cb) |cb| cb();
+        recoverDegenerateWindow(activity);
     }
+}
+
+/// A restored window can come back 1x1 and never receive its resize
+/// (labelle-bgfx#127): the game then renders into one pixel stretched over the
+/// screen until the next surface cycle. Focus gain follows INIT_WINDOW on
+/// resume and runs on the UI thread, the only thread allowed to make the
+/// window relayout, so it is where a degenerate surface gets fixed. The
+/// resulting APP_CMD_WINDOW_RESIZED is reconciled by the usual path.
+fn recoverDegenerateWindow(activity: *ANativeActivity) void {
+    const w = @atomicLoad(?*ANativeWindow, &window_for_ui, .acquire) orelse return;
+    const size = [2]i32{ ANativeWindow_getWidth(w), ANativeWindow_getHeight(w) };
+    if (!window.isDegenerateSurface(size)) return;
+    const ok = labelle_bgfx_force_window_relayout(activity.vm, activity.clazz) != 0;
+    std.log.info("bgfx: restored window is {d}x{d}; forcing a relayout (#127): {s}", .{ size[0], size[1], if (ok) "requested" else "JNI failed" });
 }
 
 // ── ANativeActivity accessor (#310 Stage 4) ─────────────────────────
@@ -476,6 +501,7 @@ fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
             // A new ANativeWindow is ready. Hand it to the window module
             // and bring bgfx up against it.
             if (app.window) |w| {
+                @atomicStore(?*ANativeWindow, &window_for_ui, w, .release);
                 window.setAndroidNativeWindow(@ptrCast(w));
                 const width = ANativeWindow_getWidth(w);
                 const height = ANativeWindow_getHeight(w);
@@ -510,6 +536,7 @@ fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
             }
         },
         APP_CMD_TERM_WINDOW => {
+            @atomicStore(?*ANativeWindow, &window_for_ui, null, .release);
             // The surface is going away — bgfx destroys the GPU context AND
             // every texture/shader. Ordering is LOAD-BEARING: notify the
             // engine FIRST (`surface_lost_fn`) so it forgets its catalog
