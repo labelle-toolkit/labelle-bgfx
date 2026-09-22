@@ -274,8 +274,11 @@ fn openCameraSegment(x: u16, y: u16, w: u16, h: u16, scissored: bool) void {
     bgfx.setViewClear(v, bgfx.ClearFlags_None, 0, 1.0, 0);
     // `setViewRect` takes x/y as i16 since bgfx API 161 (upstream "Allow
     // negative x/y in bgfx::setViewRect"); this segment's are u16. Note
-    // `setViewScissor` below still takes u16 — only the rect moved.
-    bgfx.setViewRect(v, @intCast(x), @intCast(y), w, h, 0.0, 1.0);
+    // `setViewScissor` below still takes u16 — only the rect moved. Clamp
+    // rather than `@intCast`: an origin past 32767 (a >32k-pixel framebuffer)
+    // would panic in safe builds and wrap negative in unchecked ones.
+    const max_i16: u16 = std.math.maxInt(i16);
+    bgfx.setViewRect(v, @intCast(@min(x, max_i16)), @intCast(@min(y, max_i16)), w, h, 0.0, 1.0);
     if (scissored) {
         bgfx.setViewScissor(v, x, y, w, h);
     } else {

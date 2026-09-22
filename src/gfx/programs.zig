@@ -161,13 +161,15 @@ fn initShaders() void {
     // 300 es` variants — the desktop GLSL arrays are a different profile and
     // render blank on WebGL2. Desktop `.OpenGL` takes the glsl `else` arm.
     //
-    // That arm is `-p 330` (OpenGL 3.3), NOT the `-p 120` (OpenGL 2.1) it was
-    // through bgfx API 142. Upstream raised the minimum OpenGL version at API
-    // 155 and the shader compiler no longer offers a 120 profile at all — its
-    // GLSL profiles start at 330 — so the desktop-GL floor moved 2.1 -> 3.3
-    // with the API 161 vendor bump (labelle-bgfx#119). Only this arm is
-    // affected: Metal, Vulkan and GLES are unchanged, and essl was already at
-    // its own floor of `300_es`.
+    // That arm is compiled `-p 330`, NOT the `-p 120` it was through bgfx API
+    // 142: the API 161 shader compiler's GLSL profiles start at 330. The
+    // RUNTIME floor is higher still. bgfx's config.h clamps
+    // BGFX_CONFIG_RENDERER_OPENGL to >= 43, and the GL renderer replaces the
+    // blob's #version with `#version 430`. So since the API 161 vendor bump
+    // (labelle-bgfx#119) desktop OpenGL needs a **4.3** context: machines
+    // limited to GL 3.3-4.2 fail `bgfx.init` on the OpenGL path (Linux GL,
+    // the Windows GL fallback). macOS is unaffected (Metal). Metal, Vulkan and
+    // GLES are unchanged; essl was already at its own floor of `300_es`.
     const vs_data: []const u8 = switch (bgfx.getRendererType()) {
         .Metal => &shaders_data.vs_sprite_mtl,
         .Vulkan => &shaders_data.vs_sprite_spv,

@@ -90,6 +90,14 @@ this is likely acceptable — but it is a USER-VISIBLE COMPATIBILITY CHANGE
 that #119 and the plan do not mention, and it should be decided
 deliberately rather than absorbed silently.
 
+> **Correction (PR #123 review):** 3.3 is only the shader-*profile* floor.
+> The *runtime* floor is **OpenGL 4.3**, the number in upstream's own API-155
+> note quoted above. `config.h` clamps `BGFX_CONFIG_RENDERER_OPENGL` to `>= 43`,
+> and the GL renderer replaces each blob's `#version` with `#version 430`. So
+> the real blast radius is desktop OpenGL (Linux without Vulkan, the Windows GL
+> fallback) on GPUs limited to **GL 2.1-4.2**, not 2.1-3.2. macOS (Metal),
+> Vulkan, D3D and GLES/WebGL2 are unaffected.
+
 Good news: `fs_sprite.sc` compiles cleanly at `-p 330` (234 B emitted), so
 the shader SOURCES need no rewrite — bgfx's `bgfx_shader.sh` absorbs the
 dialect change.
