@@ -411,6 +411,26 @@ jobs:
             echo "FAIL: the renderer never initialized — the smoke proved nothing."
             fail=1
           fi
+
+          # ── ReleaseFast + an ACTIVE post-fx stack (labelle-bgfx#65) ──────
+          # The smoke above is a Debug build with no post-fx; until #65 nothing
+          # in CI ran post-fx in ReleaseFast at all, and that is the gap the bug
+          # lived in. This runs `examples/bgfx` (bloom + crt) headless in
+          # ReleaseFast so the combination is exercised every time. It is NOT
+          # a deterministic regression test for #65 itself: that bug was an
+          # UNINITIALISED read of the program handle, and the stale stack slot
+          # can hold a plausible value by luck (it did, headless on macOS; the
+          # windowed run got 130 and died). The guard that cannot pass by luck
+          # is the structural one in src/gfx/programs.zig — see `submitProgram`
+          # and its test.
+          cd ../bgfx
+          out=$($GITHUB_WORKSPACE/labelle-cli/zig-out/bin/labelle run --headless --ticks=30 --optimize=ReleaseFast 2>&1); rc=$?
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then echo "FAIL: ReleaseFast post-fx run exited non-zero ($rc)"; fail=1; fi
+          if ! printf '%s\n' "$out" | grep -q 'post-fx programs initialized'; then
+            echo "FAIL: the post-fx programs never initialized — the ReleaseFast smoke proved nothing."
+            fail=1
+          fi
           exit $fail
 
   # `zig build wasm-example` had NO CI job, and rotted (labelle-bgfx#105):

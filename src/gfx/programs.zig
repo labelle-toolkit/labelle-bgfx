@@ -480,6 +480,67 @@ fn destroyMaterialPrograms() void {
     material_initialized = false;
 }
 
+// ── Program submission — the one place a program handle crosses into C ──────
+//
+// Every `bgfx.submit` in this file goes through `submitProgram`, and it hands
+// the program to C as a plain `u16`, NOT as the binding's `ProgramHandle`
+// (`extern struct { idx: c_ushort }`). Zig 0.16.0 lowers a by-value extern
+// struct argument as "load the struct's memory as a register-sized integer" —
+// on aarch64 an 8-byte `ldr x1, [x19]` from a 2-byte object. When that object
+// is a STACK TEMPORARY (the `switch (kind)` in `submitPostPass` materialised
+// one per arm) LLVM treats the out-of-bounds load as undefined behaviour and
+// deletes the store that fed it, so the C side received an uninitialised
+// handle — 130, on the crash that found this. ReleaseFast only: Debug and
+// ReleaseSafe do not run that optimisation. The globals every other site
+// passed survived by accident (the over-read lands on neighbouring globals).
+//
+// Symptoms this produced, all with a non-empty `.post_fx` stack, all in
+// ReleaseFast (labelle-bgfx#65): desktop Metal SIGSEGV on the render thread
+// (`getPipelineState` dereferencing a program whose shaders were never
+// created); Android GLES a black slab or passes that drew nothing — the
+// garbage handle simply bound no program. Any submit of a non-global handle
+// (the shader-material path's `.{ .idx = … }` literal included) was exposed.
+//
+// A `struct { uint16_t }` and a `uint16_t` have the same calling convention
+// on every target this backend builds for: AAPCS64 (composite ≤ 8 bytes → one
+// register, low bits), SysV x86-64 (INTEGER class → one GPR), Win64 (1/2/4/8-
+// byte aggregates by value in a register) and wasm32 (a single-scalar struct
+// is passed as that scalar). So this declaration is not a cast around the
+// ABI; it IS the ABI, spelled so the compiler cannot get the load wrong.
+extern fn bgfx_submit(_id: bgfx.ViewId, _program: u16, _depth: u32, _flags: u8) void;
+
+/// Submit the current draw state to `view` with `program`, discarding all
+/// state afterwards. See the note above for why this exists.
+fn submitProgram(view: bgfx.ViewId, program: bgfx.ProgramHandle) void {
+    bgfx_submit(view, program.idx, 0, @intCast(bgfx.DiscardFlags_All));
+}
+
+// The guard for the above that cannot pass by luck. The defect was an
+// UNINITIALISED read, so a runtime smoke can hold a plausible handle in the
+// stale slot and pass (it did, headless); what must never come back is the
+// by-value struct crossing itself. Two checks: the extern really takes the
+// handle as a `u16`, and this file has no direct `bgfx.submit(` left — every
+// submit goes through `submitProgram`. The file scans its own source; a
+// mocked renderer could not see a call site.
+test "program handles cross into C as u16, never as a by-value struct (labelle-bgfx#65)" {
+    const info = @typeInfo(@TypeOf(bgfx_submit)).@"fn";
+    try std.testing.expectEqual(u16, info.params[1].type.?);
+    // Count CODE lines that call it — a line whose first non-blank text is a
+    // `//` comment (like this one) or a string literal is not a call site.
+    const src = @embedFile("programs.zig");
+    // Spelled in two pieces so this test's own source never contains the
+    // pattern it is looking for.
+    const needle = "bgfx." ++ "submit(";
+    var sites: usize = 0;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    while (lines.next()) |line| {
+        const code = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, code, "//")) continue;
+        if (std.mem.indexOf(u8, code, needle) != null) sites += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), sites);
+}
+
 /// Submit a material-shaded textured quad — the bgfx impl of labelle-core's
 /// optional `drawTextureProMaterial` contract. Mirrors `submitTexturedTriangles`
 /// but selects the effect's program, uploads the flat `MaterialUniforms` as two
@@ -567,7 +628,7 @@ pub fn submitMaterialTriangles(
     // palette_swap + dissolve sample the aux texture at unit 1 (`s_lut`).
     if (effect == .palette_swap or effect == .dissolve) bgfx.setTexture(1, s_lut_uniform, lut_handle, 0);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
-    bgfx.submit(active_view, program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+    submitProgram(active_view, program);
 }
 
 // ── Post-fx programs (full-screen passes, labelle-gfx#305 P2 Slice B) ──────────
@@ -780,7 +841,7 @@ pub fn submitPostPass(
     if (kind == .color_grade) bgfx.setTexture(1, s_postfx_lut_uniform, lut_handle, 0);
     // Opaque full-screen replace (no blend) — the pass owns every dst texel.
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA, 0);
-    bgfx.submit(active_view, program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+    submitProgram(active_view, program);
 }
 
 /// Blit `src_color` full-screen into the ACTIVE view (the already-`begin`d `dst`
@@ -815,7 +876,7 @@ pub fn submitFullscreenBlit(src_color: bgfx.TextureHandle) void {
     bgfx.setTransientVertexBuffer(0, &tvb, 0, @intCast(verts.len));
     bgfx.setTexture(0, s_tex_uniform, src_color, 0);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA, 0);
-    bgfx.submit(active_view, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+    submitProgram(active_view, sprite_program);
 }
 
 /// Destroy shader programs, uniforms, and textures, resetting to invalid sentinels.
@@ -998,7 +1059,7 @@ pub fn submitFlatTriangles(vertices: []const PosTexColorVertex) void {
         // Bind 1x1 white texture so the shader computes: white * vertex_color = vertex_color
         bgfx.setTexture(0, s_tex_uniform, white_texture, 0);
         bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
-        bgfx.submit(active_view, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+        submitProgram(active_view, sprite_program);
 
         offset += chunk;
     }
@@ -1041,7 +1102,7 @@ pub fn submitTexturedTriangles(vertices: []const PosTexColorVertex, texture_hand
         // created. Zero overrides them with linear/wrap, defeating point uploads.
         bgfx.setTexture(0, s_tex_uniform, texture_handle, std.math.maxInt(u32));
         bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
-        bgfx.submit(active_view, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+        submitProgram(active_view, sprite_program);
 
         offset += chunk;
     }
@@ -1111,7 +1172,7 @@ pub fn submitMesh(
     // created. Zero overrides them with linear/wrap, defeating point uploads.
     bgfx.setTexture(0, s_tex_uniform, texture_handle, std.math.maxInt(u32));
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | blend_state, 0);
-    bgfx.submit(active_view, sprite_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+    submitProgram(active_view, sprite_program);
 }
 
 /// Submit a textured quad converted from three YUV plane textures via the
@@ -1153,7 +1214,7 @@ pub fn submitYuvTriangles(
     bgfx.setTexture(1, s_texU_uniform, u_handle, 0);
     bgfx.setTexture(2, s_texV_uniform, v_handle, 0);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
-    bgfx.submit(active_view, yuv_program, 0, @as(u8, @intCast(bgfx.DiscardFlags_All)));
+    submitProgram(active_view, yuv_program);
 }
 
 /// Returns false only for an unavailable material, selecting sprite fallback.
@@ -1177,6 +1238,6 @@ pub fn submitShaderMaterialTriangles(vertices: []const PosTexColorVertex, textur
     materials.bind(instance, texture_handle, rect);
     const blend = if (instance.blend == .alpha) STATE_BLEND_ALPHA else stateBlendFuncSeparate(bgfx.StateFlags_BlendSrcAlpha, bgfx.StateFlags_BlendOne, bgfx.StateFlags_BlendSrcAlpha, bgfx.StateFlags_BlendOne);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | blend, 0);
-    bgfx.submit(active_view, .{ .idx = instance.program.handle }, 0, @intCast(bgfx.DiscardFlags_All));
+    submitProgram(active_view, .{ .idx = instance.program.handle });
     return true;
 }
