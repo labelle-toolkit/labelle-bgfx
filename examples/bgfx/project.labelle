@@ -32,8 +32,8 @@
     // CLI could not build it (labelle-bgfx#114). Nothing in CI builds this
     // example through the CLI, which is how that went unnoticed.
     .core_version = "2.0.0",
-    .engine_version = "3.0.2",
-    .gfx_version = "2.0.0",
+    .engine_version = "3.1.0",
+    .gfx_version = "2.2.0",
     // Local dev checkouts, resolved as siblings of the main labelle-bgfx
     // checkout (the standard monorepo dev layout). Keep them on their
     // respective mains: cli >= 1.55.x, assembler >= 0.80.0 (the version that
