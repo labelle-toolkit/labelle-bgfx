@@ -692,6 +692,7 @@ pub fn build(b: *std.Build) void {
             .{ .v = 2, .suffix = "", .desc = "EVEN bloom→crt (the bug case) vs the reference golden" },
             .{ .v = 1, .suffix = "-single", .desc = "odd length-1 (bloom only) — no-regression" },
             .{ .v = 3, .suffix = "-triple", .desc = "odd length-3 (bloom→vignette→crt) — no-regression" },
+            .{ .v = 4, .suffix = "-reset", .desc = "bloom→crt across a bgfx.reset — views re-bound (#125)" },
         };
         inline for (variants) |vv| {
             const check = IntegrationGolden.make(b, target, optimize, zbgfx_mod, gfx_mod, gfx_lib_m, window_mod, bgfx_artifact, glfw_artifact, vv.v, false);

@@ -352,6 +352,7 @@ fn resetCameraFrameImpl() void {
 /// only the per-camera viewport band (#51) and so left every OTHER unbound view
 /// — Dear ImGui's overlay view above all — pointing at nothing.
 pub const setBackbufferSubstitute = render_target.setBackbufferSubstitute;
+pub const rebindViewsAfterReset = render_target.rebindViewsAfterReset;
 
 // ── OPTIONAL viewport hooks the gfx renderer probes on the DRAW backend ──
 // The gfx renderer's per-camera `applyViewport` calls `@hasDecl(BackendImpl,

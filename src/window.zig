@@ -314,7 +314,16 @@ fn ensureSurface() void {
     // Everything else stays neutral and keeps its current value: `.Count`
     // formats inherit (the old `.Count` "no format change" argument), and
     // `nwh`/`ndt` are ignored for the main window because bgfx owns them.
-    bgfx.reset(current_reset, &mainSwapChain(screen_w, screen_h));
+    resetBackbuffer(current_reset, &mainSwapChain(screen_w, screen_h));
+}
+
+/// The ONLY place this backend calls `bgfx.reset` (labelle-bgfx#125; a test
+/// pins that). bgfx's reset unbinds every view's framebuffer, so each reset
+/// must be followed by `gfx.rebindViewsAfterReset`, or live render targets
+/// (the post-fx ping-pong pair, mirrors) silently stop receiving draws.
+pub fn resetBackbuffer(flags: u32, swap_chain: ?*const bgfx.SwapChain) void {
+    bgfx.reset(flags, swap_chain);
+    gfx.rebindViewsAfterReset();
 }
 
 /// A main-window swap-chain description carrying ONLY a new size.
@@ -1395,7 +1404,7 @@ pub fn setVsync(on: bool) void {
     // device/frame globals" — which is exactly what a vsync toggle wants. The
     // old signature forced us to re-pass `screen_w/h` here even though neither
     // changed, and that redundancy is what tripped #54's headless assert.
-    bgfx.reset(current_reset, null);
+    resetBackbuffer(current_reset, null);
 }
 
 // ── Window icon (labelle-cli#359) ────────────────────────────────────────
@@ -1527,7 +1536,7 @@ pub fn surfaceRestored() void {
         // `nwh`/`ndt` are ignored for the main window (bgfx owns them), so the
         // restored ANativeWindow still arrives via `setAndroidNativeWindow`
         // before this runs — the swap chain carries geometry only.
-        bgfx.reset(current_reset, &mainSwapChain(screen_w, screen_h));
+        resetBackbuffer(current_reset, &mainSwapChain(screen_w, screen_h));
     }
 }
 
@@ -1695,6 +1704,16 @@ test "window advertises the surface-loss capability via the paired contract hook
     // backend decls directly here so the test is independent of the core pin.
     try testing.expect(supportsSurfaceLoss());
     try testing.expect(@hasDecl(@This(), "surfaceLost") and @hasDecl(@This(), "surfaceRestored"));
+}
+
+test "bgfx.reset is only ever called through resetBackbuffer (labelle-bgfx#125)" {
+    // bgfx's reset unbinds every view's framebuffer; `resetBackbuffer` re-binds
+    // them. A direct call anywhere else would silently break live render
+    // targets (post-fx, mirrors) again. Needle built from two pieces so this
+    // test does not count itself.
+    const src = @embedFile("window.zig");
+    const needle = "bgfx." ++ "reset(";
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, needle));
 }
 
 test "setVsync under a surfaceless run records the flag but never resets bgfx (#54)" {

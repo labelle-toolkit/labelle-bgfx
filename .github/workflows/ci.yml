@@ -114,6 +114,10 @@ jobs:
         run: zig build post-fx-integration-golden-single
       - name: Post-fx integration golden (real gfx driver, 3-pass, no-regression)
         run: zig build post-fx-integration-golden-triple
+      # #125: a bgfx.reset (resize / vsync toggle) unbinds every view's
+      # framebuffer; this renders across one and must still match bloom→crt.
+      - name: Post-fx integration golden (bloom→crt across a bgfx.reset, #125)
+        run: zig build post-fx-integration-golden-reset
 
   # Integration: generate + cross-build the bgfx-android example (which now lives
   # here, not in labelle-assembler). Verifies the backend works end-to-end through
