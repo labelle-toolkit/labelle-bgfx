@@ -1567,6 +1567,9 @@ pub fn beginFrame() void {
     // return draws to the primary view, so each frame's split-screen passes reuse
     // the same band.
     gfx.resetCameraFrame();
+    // Re-arm submission-order views for this frame (programs.zig: a shader
+    // material's own program must not be sorted under plain sprites).
+    gfx.resetViewModes();
     bgfx.setViewRect(0, 0, 0, @intCast(screen_w), @intCast(screen_h), 0.0, 1.0);
     // Touch view 0 so bgfx ALWAYS clears + presents it, even on a frame
     // with zero draw calls. `setViewRect` alone does NOT do this — bgfx
