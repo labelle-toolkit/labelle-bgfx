@@ -522,7 +522,33 @@ extern fn bgfx_submit(_id: bgfx.ViewId, _program: u16, _depth: u32, _flags: u8) 
 /// Submit the current draw state to `view` with `program`, discarding all
 /// state afterwards. See the note above for why this exists.
 fn submitProgram(view: bgfx.ViewId, program: bgfx.ProgramHandle) void {
+    ensureSequential(view);
     bgfx_submit(view, program.idx, 0, @intCast(bgfx.DiscardFlags_All));
+}
+
+// Views in submission order. bgfx's `.Default` view mode SORTS a view's draws
+// by program/state, so a 2D scene drawn back to front with more than one
+// program comes out in the wrong order: a shader-material sprite (its own
+// program) landed UNDER plain sprites (the shared sprite program) that were
+// submitted before it, whatever their z. Painter's order is the contract for
+// every draw here, so every view that receives a submit is `.Sequential`.
+//
+// The mode is set on a view's first submit of each frame (the set is cleared
+// by `resetViewModes` from `window.beginFrame`) rather than once per process:
+// that stays correct across `bgfx.reset` and a recreated context (Android
+// surface loss, `shutdownPrograms`), and costs one call per view per frame.
+var sequential_views = std.StaticBitSet(256).initEmpty();
+
+fn ensureSequential(view: bgfx.ViewId) void {
+    if (sequential_views.isSet(view)) return;
+    bgfx.setViewMode(view, .Sequential);
+    sequential_views.set(view);
+}
+
+/// Forget which views were put in `.Sequential` mode, so the next submit to
+/// each sets it again. Called at every frame start by `window.beginFrame`.
+pub fn resetViewModes() void {
+    sequential_views = std.StaticBitSet(256).initEmpty();
 }
 
 // The guard for the above that cannot pass by luck. The defect was an
@@ -907,6 +933,7 @@ pub fn shutdownPrograms() void {
         white_texture = .{ .idx = std.math.maxInt(u16) };
     }
     shaders_initialized = false;
+    resetViewModes();
 
     // YUV video program + its plane samplers participate in the same teardown,
     // so an Android surface cycle re-creates them lazily on the next video draw.

@@ -266,6 +266,8 @@ pub const postPassSupported = render_target.postPassSupported;
 // passes submit into is reused each frame and never exhausts. Zero-cost (a single
 // store) and a no-op semantically on frames with no post-fx.
 pub const resetPostFxFrame = render_target.resetPostFxFrame;
+/// Draws render in submission (painter's) order; see `programs.resetViewModes`.
+pub const resetViewModes = programs.resetViewModes;
 
 // ── Per-camera viewport views (N-camera split-screen, labelle-bgfx#51) ──
 // The window contract's `setViewport`/`clearViewport` route here: each

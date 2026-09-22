@@ -63,6 +63,13 @@ pub fn main() !void {
         draw(texture, 96, 0, .none);
         draw(texture, 0, 32, palette); // invalidated LUT must fallback white, not blue
         draw(texture, 32, 32, b); // unrelated material survives texture unload
+        // Painter's order across programs: a material draw lands on top of
+        // the plain sprite submitted before it, and under the one after it
+        // (bgfx's default view mode sorted by program, burying materials).
+        draw(texture, 64, 32, .none);
+        draw(texture, 64, 32, a);
+        draw(texture, 96, 32, a);
+        draw(texture, 96, 32, .none);
         window.endFrame();
     }
     if (!window.captureHeadless("shader_material_probe")) return error.CaptureFailed;
@@ -78,6 +85,8 @@ pub fn main() !void {
     try pixel(image, 112, 16, .{ 255, 255, 255 });
     try pixel(image, 16, 48, .{ 255, 255, 255 });
     try pixel(image, 48, 48, .{ 0, 255, 0 });
+    try pixel(image, 80, 48, .{ 255, 0, 0 }); // material over the earlier plain sprite
+    try pixel(image, 112, 48, .{ 255, 255, 255 }); // later plain sprite over the material
     window.closeWindow();
     active = false;
     try std.testing.expect(!gfx.shaderMaterialSupported());
