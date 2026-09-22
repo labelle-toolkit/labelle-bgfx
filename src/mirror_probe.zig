@@ -45,9 +45,16 @@ fn readPixel(src: bgfx.TextureHandle) ?[4]u8 {
     );
     defer bgfx.destroyTexture(rb); // readPixel returns normally, so this runs
 
-    bgfx.blit(0, rb, 0, 0, 0, 0, src, 0, 0, 0, 0, W, H, 1);
+    // bgfx API 161 reworked blit + readTexture to take regions.
+    // `TextureRegion.init` is the 2D helper: mip/z/depth stay zero,
+    // addressing mip 0 of the only slice a 2D texture has.
+    var dst_region: bgfx.TextureRegion = undefined;
+    dst_region.init(rb, 0, 0, W, H);
+    var src_region: bgfx.TextureRegion = undefined;
+    src_region.init(src, 0, 0, W, H);
+    bgfx.blit(0, &dst_region, &src_region);
     var pixels: [@as(usize, W) * @as(usize, H) * 4]u8 = undefined;
-    const ready = bgfx.readTexture(rb, &pixels, 0);
+    const ready = bgfx.readTexture(&dst_region, &pixels);
     var f = bgfx.frame(0);
     var guard: u32 = 0;
     while (f < ready and guard < 64) : (guard += 1) f = bgfx.frame(0);
