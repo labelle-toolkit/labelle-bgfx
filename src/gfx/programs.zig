@@ -158,8 +158,16 @@ fn initShaders() void {
 
     // Select shader variant based on active renderer
     // `.OpenGLES` = WebGL2 (emscripten) / GLES; it needs the essl `#version
-    // 300 es` variants — the desktop GLSL arrays are `-p 120` and render blank
-    // on WebGL2. Desktop `.OpenGL` (2.1) stays on the `-p 120` glsl `else` arm.
+    // 300 es` variants — the desktop GLSL arrays are a different profile and
+    // render blank on WebGL2. Desktop `.OpenGL` takes the glsl `else` arm.
+    //
+    // That arm is `-p 330` (OpenGL 3.3), NOT the `-p 120` (OpenGL 2.1) it was
+    // through bgfx API 142. Upstream raised the minimum OpenGL version at API
+    // 155 and the shader compiler no longer offers a 120 profile at all — its
+    // GLSL profiles start at 330 — so the desktop-GL floor moved 2.1 -> 3.3
+    // with the API 161 vendor bump (labelle-bgfx#119). Only this arm is
+    // affected: Metal, Vulkan and GLES are unchanged, and essl was already at
+    // its own floor of `300_es`.
     const vs_data: []const u8 = switch (bgfx.getRendererType()) {
         .Metal => &shaders_data.vs_sprite_mtl,
         .Vulkan => &shaders_data.vs_sprite_spv,

@@ -28,8 +28,7 @@
         // sits with the rest of the toolkit and so upstreaming is a normal PR;
         // the Codeberg copy is stale and should not be repinned.
         .zbgfx = .{
-            .url = "https://github.com/labelle-toolkit/zbgfx/archive/934372f13b92e651c9e43613af6dff96d231e782.tar.gz",
-            .hash = "zbgfx-0.12.0-Sm4IxBGjywYbjOha8_dczGXQq53qynqGka3vWDhKI3pD",
+            .path = "../../../../../../private/tmp/claude-501/-Users-alexandrecalvao-prj-labelle-toolkit/799e7af1-d7bb-420b-af07-ea73401a028d/scratchpad/zbgfx-baseline",
         },
         .zglfw = .{
             .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",
