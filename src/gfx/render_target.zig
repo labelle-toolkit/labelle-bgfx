@@ -84,6 +84,13 @@ const CAMERA_VIEW_MAX: u16 = POSTFX_VIEW_BASE - 1; // 32 segment views per frame
 /// Persistent render-target views live BELOW the camera band.
 const RT_VIEW_MAX: u16 = CAMERA_VIEW_BASE - 1; // 191 concurrent RTs — ample
 var view_in_use = [_]bool{false} ** (MAX_VIEW + 1);
+/// The framebuffer each live render-target view is bound to, so the binding can
+/// be RE-APPLIED after a `bgfx.reset` (labelle-bgfx#125). bgfx's `reset` sets
+/// EVERY view's framebuffer back to the backbuffer, and a target's view is bound
+/// only once, in `create`. Without re-binding, a resize or vsync toggle sends
+/// the post-fx scene pass to the backbuffer while the chain samples a target
+/// that was only cleared.
+var view_fb = [_]bgfx.FrameBufferHandle{.{ .idx = INVALID }} ** (MAX_VIEW + 1);
 
 /// First free render-target view id (1..RT_VIEW_MAX), or null when all are taken.
 /// Never returns `PRIMARY_VIEW` (0) or a post-fx-band id. Split out so the
@@ -212,6 +219,28 @@ pub fn setBackbufferSubstitute(fb: bgfx.FrameBufferHandle) void {
     var view: u16 = 0;
     while (view <= MAX_VIEW) : (view += 1) {
         bgfx.setViewFrameBuffer(view, fb);
+    }
+}
+
+/// Re-apply every view's framebuffer binding after a `bgfx.reset`
+/// (labelle-bgfx#125). bgfx's `Context::reset` resets EVERY view's framebuffer
+/// to the backbuffer (`m_view[ii].setFrameBuffer(BGFX_INVALID_HANDLE)`), but
+/// this backend binds views once: a render target's view in `create`, and on a
+/// surfaceless run every view to the capture framebuffer in
+/// `setBackbufferSubstitute`. So after a resize, rotation or vsync toggle the
+/// post-fx scene pass drew to the backbuffer while the chain sampled a target
+/// that was only cleared: a dark frame with a smeared blob. Must run after
+/// EVERY `bgfx.reset`; `window.resetBackbuffer` is the only caller of
+/// `bgfx.reset` and does this. View rects and clears survive a reset, so only
+/// the framebuffer is re-applied.
+pub fn rebindViewsAfterReset() void {
+    if (backbuffer_fb.idx != INVALID) {
+        var view: u16 = 0;
+        while (view <= MAX_VIEW) : (view += 1) bgfx.setViewFrameBuffer(view, backbuffer_fb);
+    }
+    var id: u16 = 1;
+    while (id <= RT_VIEW_MAX) : (id += 1) {
+        if (view_in_use[id] and view_fb[id].idx != INVALID) bgfx.setViewFrameBuffer(id, view_fb[id]);
     }
 }
 
@@ -369,6 +398,7 @@ pub fn create(w: u16, h: u16) RenderTarget {
     }
 
     view_in_use[view] = true;
+    view_fb[view] = fb;
 
     bgfx.setViewFrameBuffer(view, fb);
     bgfx.setViewRect(view, 0, 0, w, h, 0.0, 1.0);
@@ -399,7 +429,10 @@ pub fn destroy(rt: *RenderTarget) void {
     // run `backbuffer_fb` IS invalid, so this is byte-identical to the old line.
     bgfx.setViewFrameBuffer(rt.view, backbuffer_fb);
     bgfx.destroyFrameBuffer(rt.fb);
-    if (rt.view <= MAX_VIEW) view_in_use[rt.view] = false; // recycle the id
+    if (rt.view <= MAX_VIEW) {
+        view_in_use[rt.view] = false; // recycle the id
+        view_fb[rt.view] = .{ .idx = INVALID };
+    }
     // Re-sequence so the freed view drops out of the "render targets before
     // primary" order (harmless if it was the last one — becomes the default).
     sequenceViews();
@@ -536,6 +569,7 @@ pub fn reset() void {
             bgfx.destroyFrameBuffer(targets[id].fb);
         }
         view_in_use[id] = false;
+        view_fb[id] = .{ .idx = INVALID };
         targets[id] = invalid_rt;
     }
     // Unbind the transient post-fx band too: `applyPostPass` binds a destroyed

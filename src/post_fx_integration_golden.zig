@@ -20,6 +20,12 @@
 //!       driver reproduces that reference exactly; the buggy driver does not.
 //!   1 (single)  — ODD length-1 stack (bloom only); no-regression.
 //!   3 (triple)  — ODD length-3 stack (bloom→vignette→crt); no-regression.
+//!   4 (reset)   — bloom→crt with a `bgfx.reset` (a vsync toggle, via
+//!       `window.resetBackbuffer`) BETWEEN frames, after the ping-pong targets
+//!       exist. bgfx's reset unbinds every view's framebuffer; without
+//!       re-binding (labelle-bgfx#125) frame 2's scene misses target_a and the
+//!       result is not the reference. Diffed against the SAME
+//!       `post_fx_bloom_crt.tga` as variant 2: a reset must not change output.
 //!
 //! Modes (build option `bless`): --bless writes the committed golden; check
 //! renders a candidate and diffs it with a per-channel tolerance (the CI gate).
@@ -75,6 +81,7 @@ fn candidateBase() [:0]const u8 {
     return switch (options.variant) {
         1 => "zig-out/post_fx_driver_single_candidate",
         3 => "zig-out/post_fx_driver_triple_candidate",
+        4 => "zig-out/post_fx_driver_reset_candidate",
         else => "zig-out/post_fx_driver_bloom_crt_candidate",
     };
 }
@@ -83,6 +90,7 @@ fn candidatePath() [:0]const u8 {
     return switch (options.variant) {
         1 => "zig-out/post_fx_driver_single_candidate.tga",
         3 => "zig-out/post_fx_driver_triple_candidate.tga",
+        4 => "zig-out/post_fx_driver_reset_candidate.tga",
         else => "zig-out/post_fx_driver_bloom_crt_candidate.tga",
     };
 }
@@ -160,6 +168,14 @@ fn drawScene() void {
     gfx.drawRectangleRec(rect(70, 96, 52, 12), gfx.Color{ .r = 40, .g = 210, .b = 90, .a = 255 });
 }
 
+/// Variant 4's frame-0 scene: deliberately NOT the reference. If the frame
+/// after the reset fails to reach the capture (views left unbound), the capture
+/// still holds this and the diff fails — without a decoy the stale frame 0 would
+/// already match the reference and the variant could not tell (#125).
+fn drawDecoy() void {
+    gfx.drawRectangleRec(rect(0, 0, @floatFromInt(W), @floatFromInt(H)), gfx.Color{ .r = 200, .g = 30, .b = 160, .a = 255 });
+}
+
 fn withinTolerance(golden: []const u8, candidate: []const u8) bool {
     if (golden.len != candidate.len or golden.len <= 18) return false;
     const body_len = golden.len - 18;
@@ -207,11 +223,18 @@ pub fn main() !void {
             window.closeWindow();
             std.process.exit(3);
         }
-        drawScene();
+        if (options.variant == 4 and frame == 0) drawDecoy() else drawScene();
         // …then runs the ping-pong pass chain and composites to the backbuffer.
         driver.resolve(W, H);
 
         window.endFrame();
+
+        // Variant 4 (#125): reset between frames, once the targets exist. The
+        // flags must differ from the current ones, or bgfx treats the reset
+        // as a no-op and never unbinds anything.
+        if (options.variant == 4 and frame == 0) {
+            window.resetBackbuffer(bgfx.ResetFlags_Vsync, null);
+        }
     }
 
     const out_base = if (bless) goldenBase() else candidateBase();
