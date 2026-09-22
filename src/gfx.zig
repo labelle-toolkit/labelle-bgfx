@@ -521,7 +521,28 @@ test "drawMesh satisfies the optional textured-mesh capability" {
     }
 }
 
-// Compile probe for the texture surface (labelle-gfx#328 P3).
+/// Reference every public function of `Mod` from a runtime-false branch so
+/// Zig analyses their bodies. Fails to compile on a generic function: those
+/// need an explicit call, because an argument tuple cannot be conjured for
+/// `anytype`/comptime parameters.
+fn probeAll(comptime Mod: type) void {
+    inline for (@typeInfo(Mod).@"struct".decls) |d| {
+        const f = @field(Mod, d.name);
+        const F = @TypeOf(f);
+        if (@typeInfo(F) != .@"fn") continue;
+        if (@typeInfo(F).@"fn".is_generic) {
+            @compileError("compile probe: `" ++ @typeName(Mod) ++ "." ++ d.name ++ "` is generic — call it explicitly beside `probeAll` so its body is analysed");
+        }
+        const args: std.meta.ArgsTuple(F) = undefined;
+        if (@typeInfo(@typeInfo(F).@"fn".return_type.?) == .error_union) {
+            _ = @call(.auto, f, args) catch {};
+        } else {
+            _ = @call(.auto, f, args);
+        }
+    }
+}
+
+// Compile probe for the texture surface (labelle-gfx#328 P3, labelle-bgfx#73).
 //
 // `gfx_tests` roots at THIS file, and Zig only analyses what is reachable —
 // so `gfx/texture.zig`'s function BODIES were never compiled by `zig build
@@ -531,37 +552,26 @@ test "drawMesh satisfies the optional textured-mesh capability" {
 //
 // The runtime-false guard forces analysis without executing anything: these
 // need a live bgfx context, which unit tests do not have.
-test "compile probe: the texture surface is analysed" {
+//
+// The calls are GENERATED, not listed. #75 showed that a second test root
+// adds no coverage over this probe (Zig analyses bodies lazily under any
+// root), and that a hand-written list is the probe's one weakness: it must
+// be maintained. It had already drifted — four of the file's 24 `pub fn`s
+// were missing. So the probe enumerates `texture`'s public function decls
+// by reflection and calls each with an `undefined` argument tuple: a new
+// `pub fn` is covered the moment it exists, and there is no list to fall
+// behind. A generic `pub fn` (anytype / comptime parameter) cannot be
+// called this way; if one is ever added, `probeAll` fails to COMPILE naming
+// it, so it gets an explicit call beside the loop instead of silently going
+// dark.
+test "compile probe: every pub fn of gfx/texture.zig is analysed" {
     var never = false;
     _ = &never;
     if (never) {
-        const t = try texture.uploadTexture(undefined);
-        texture.unloadTexture(t);
-        _ = nativeTextureHandle(t.id);
-        _ = texture.handleForId(t.id);
-
-        // Every remaining public path that touches a texture id. Listing them
-        // is not belt-and-braces: CI caught typed-id errors in
-        // `material_golden.zig` and `render_target.zig` that this suite passed
-        // over, because Zig never analysed those bodies (CodeRabbit on #72).
-        _ = try texture.loadTexture(undefined);
-        _ = try texture.uploadTextureFiltered(undefined, .point);
-        _ = try texture.createDynamicTexture(undefined, undefined);
-        texture.updateTexture(t, undefined);
-        _ = texture.isCompressed(undefined);
-        _ = texture.compressedDims(undefined);
-        _ = try texture.uploadCompressed(undefined);
-        texture.drawTexturePro(t, undefined, undefined, undefined, 0, undefined);
-        _ = texture.materialSupported(undefined);
-        texture.drawTextureProMaterial(t, undefined, undefined, undefined, 0, undefined, undefined);
-        texture.drawExternalTexture(undefined, 0, 0, undefined, undefined, undefined, 0, undefined);
-        _ = texture.yuvProgramReady();
-        _ = try texture.createPlaneTextures(undefined, undefined);
-        texture.updatePlaneTextures(undefined, undefined, undefined, undefined);
-        texture.unloadPlaneTextures(undefined);
-        texture.drawPlanesPro(undefined, undefined, undefined, undefined, 0, undefined);
-        texture.destroyAllTextures();
-
+        probeAll(texture);
+        // Not a `texture` decl, but the one consumer of `Texture.id` in this
+        // file's own surface.
+        _ = nativeTextureHandle(@as(Texture, undefined).id);
         // The video path constructs a `types.Texture` directly with a
         // sentinel id — a site no texture-surface probe reaches, and the one
         // codex caught on #72. Reference it so a future field change breaks
