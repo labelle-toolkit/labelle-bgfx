@@ -52,7 +52,7 @@ non-`none` shader takes precedence over the curated effect field.
 The renderer selects `glsl`, `essl`, `spv`, or `mtl`. Empty selected variants return
 `error.Unsupported`; no other renderer's binary is substituted. Direct3D is not
 advertised: this backend has no matching sprite vertex binary for it yet. The
-binaries must come from the pinned bgfx shaderc (v11 container). Metal uses its
+binaries must come from the pinned bgfx shaderc (v12 container, bgfx API 161). Metal uses its
 normal source-containing output, not an opaque precompiled metallib.
 
 ```zig
@@ -162,7 +162,7 @@ affected effect. See `RFC-MATERIAL-POSTFX.md` (labelle-gfx).
 The embedded bytecode in `src/shaders.zig` is produced offline (there is no
 in-tree shader-compile build step; the sprite/YUV arrays are hand-committed the
 same way). Build `shaderc` from the pinned zbgfx, then compile each shader for
-`{linux/120, android/300_es, osx/metal, linux/spirv}`:
+`{linux/330, android/300_es, osx/metal, linux/spirv}` (API 161 shaderc rejects GLSL profiles below 330):
 
 ```shell
 # in the resolved zbgfx package dir:

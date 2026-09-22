@@ -47,7 +47,7 @@ branch (only the `setViewRect` depth args and i16 casts differ), so API 142
 has the same bug by construction. This was established by reading the code; the
 API-142 build was NOT re-run through a surface cycle on the device.
 
-## Fix direction (separate ticket, gfx + engine)
+## Fix direction (separate ticket, gfx + engine; tracked by labelle-gfx#364)
 
 The driver must forget its targets on surface loss without destroying them
 (the handles are already dead). For example, add a `PostFxDriver.surfaceLost()`

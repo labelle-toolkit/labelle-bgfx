@@ -741,7 +741,7 @@ pub const fs_yuv_essl = [_]u8{
 // Regenerate with: build zbgfx `shaderc` (-Dwith_shaderc=true) then, per shader,
 //   shaderc -f fs_flash.sc --type fragment --platform <p> -p <profile> \
 //           --varyingdef varying.def.sc -i <zbgfx/shaders> -O 3
-// for {linux/120, android/300_es, osx/metal, linux/spirv}; bin → [_]u8 arrays.
+// for {linux/330, android/300_es, osx/metal, linux/spirv}; bin → [_]u8 arrays.
 
 pub const fs_flash_glsl = [_]u8{
     0x46, 0x53, 0x48, 0x0c, 0x01, 0x83, 0xf2, 0xe1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1284,7 +1284,7 @@ pub const fs_palette_essl = [_]u8{
 // Regenerate exactly like fs_flash (build zbgfx `shaderc` -Dwith_shaderc=true):
 //   shaderc -f fs_<name>.sc --type fragment --platform <p> -p <profile> \
 //           --varyingdef varying.def.sc -i <zbgfx/shaders> -O 3
-// for {linux/120, android/300_es, osx/metal, linux/spirv}; bin → [_]u8 arrays.
+// for {linux/330, android/300_es, osx/metal, linux/spirv}; bin → [_]u8 arrays.
 
 pub const fs_dissolve_glsl = [_]u8{
     0x46, 0x53, 0x48, 0x0c, 0x01, 0x83, 0xf2, 0xe1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
