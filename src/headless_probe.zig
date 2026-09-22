@@ -21,15 +21,13 @@ pub fn main() !void {
     // Headless has NO backbuffer/swapchain — bgfx REQUIRES resolution 0x0 here
     // (bgfx.cpp: "resolution of non-existing backbuffer can't be larger than
     // 0x0!"). The render size lives on the offscreen framebuffer below, not here.
-    init.resolution.width = 0;
-    init.resolution.height = 0;
-    init.resolution.reset = bgfx.ResetFlags_None;
+    init.swapChain.width = 0;
+    init.swapChain.height = 0;
+    init.reset = bgfx.ResetFlags_None;
     // Headless: NO native window handle / display.
-    init.platformData.ndt = null;
-    init.platformData.nwh = null;
+    init.swapChain.ndt = null;
+    init.swapChain.nwh = null;
     init.platformData.context = null;
-    init.platformData.backBuffer = null;
-    init.platformData.backBufferDS = null;
 
     if (!bgfx.init(&init)) {
         std.debug.print("PROBE_RESULT: HEADLESS_INIT_FAILED (bgfx.init returned false with nwh=null, Vulkan)\n", .{});
@@ -43,7 +41,7 @@ pub fn main() !void {
     const fb = bgfx.createFrameBufferFromHandles(1, &handles, false);
 
     bgfx.setViewFrameBuffer(0, fb);
-    bgfx.setViewRect(0, 0, 0, W, H);
+    bgfx.setViewRect(0, 0, 0, W, H, 0.0, 1.0);
     // Clear to opaque red (0xRRGGBBAA) — a known, non-zero color.
     bgfx.setViewClear(0, bgfx.ClearFlags_Color | bgfx.ClearFlags_Depth, 0xff0000ff, 1.0, 0);
     bgfx.touch(0);
@@ -62,10 +60,17 @@ pub fn main() !void {
         null,
         0,
     );
-    bgfx.blit(0, readback, 0, 0, 0, 0, rt, 0, 0, 0, 0, W, H, 1);
+    // bgfx API 161 reworked blit + readTexture to take regions.
+    // `TextureRegion.init` is the 2D helper: mip/z/depth stay zero,
+    // addressing mip 0 of the only slice a 2D texture has.
+    var dst_region: bgfx.TextureRegion = undefined;
+    dst_region.init(readback, 0, 0, W, H);
+    var src_region: bgfx.TextureRegion = undefined;
+    src_region.init(rt, 0, 0, W, H);
+    bgfx.blit(0, &dst_region, &src_region);
 
     var pixels: [@as(usize, W) * @as(usize, H) * 4]u8 = undefined;
-    const ready_frame = bgfx.readTexture(readback, &pixels, 0);
+    const ready_frame = bgfx.readTexture(&dst_region, &pixels);
     var f = bgfx.frame(0);
     var guard: u32 = 0;
     while (f < ready_frame and guard < 64) : (guard += 1) f = bgfx.frame(0);

@@ -29,6 +29,20 @@ Opt in explicitly via `backend_package`:
 will resolve here transparently — that flip is deferred until this package is
 validated against real games.)
 
+### Platform requirements
+
+Since the bgfx API 161 vendor (#119):
+
+- **x86 / x86_64 CPUs need SSE4.2.** The vendored bx/bimg/bgfx C libraries are
+  compiled with SSE4.2 enabled (bx's SIMD code requires it), whatever `-Dcpu`
+  the game uses. A build for a generic x86 target still succeeds, but the
+  binary dies with an illegal-instruction fault on a CPU without SSE4.2
+  (pre-2008 Intel, pre-2011 AMD). ARM (Android, Apple Silicon) and wasm are
+  unaffected.
+- **Desktop OpenGL needs 4.3.** This matters only where bgfx picks the GL
+  renderer: Linux without Vulkan, or the Windows GL fallback. macOS uses Metal;
+  Android and WebGL2 use GLES 3.0 and are unaffected.
+
 ## Shared gamepad packages
 
 The desktop/Android gamepad sources are versioned packages this backend depends
@@ -52,7 +66,7 @@ non-`none` shader takes precedence over the curated effect field.
 The renderer selects `glsl`, `essl`, `spv`, or `mtl`. Empty selected variants return
 `error.Unsupported`; no other renderer's binary is substituted. Direct3D is not
 advertised: this backend has no matching sprite vertex binary for it yet. The
-binaries must come from the pinned bgfx shaderc (v11 container). Metal uses its
+binaries must come from the pinned bgfx shaderc (v12 container, bgfx API 161). Metal uses its
 normal source-containing output, not an opaque precompiled metallib.
 
 ```zig
@@ -162,7 +176,7 @@ affected effect. See `RFC-MATERIAL-POSTFX.md` (labelle-gfx).
 The embedded bytecode in `src/shaders.zig` is produced offline (there is no
 in-tree shader-compile build step; the sprite/YUV arrays are hand-committed the
 same way). Build `shaderc` from the pinned zbgfx, then compile each shader for
-`{linux/120, android/300_es, osx/metal, linux/spirv}`:
+`{linux/330, android/300_es, osx/metal, linux/spirv}` (API 161 shaderc rejects GLSL profiles below 330):
 
 ```shell
 # in the resolved zbgfx package dir:

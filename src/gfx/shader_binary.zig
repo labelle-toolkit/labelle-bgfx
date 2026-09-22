@@ -1,4 +1,4 @@
-//! Checked reader for the shaderc v11 container used by the pinned bgfx.
+//! Checked reader for the shaderc v12 container used by the pinned bgfx.
 //! Validate metadata before createShader: bgfx creates global uniforms while
 //! reading the container, so checking only after creation is too late.
 const std = @import("std");
@@ -21,8 +21,16 @@ pub fn read(bytes: []const u8) sm.Error!Reflection {
     if (bytes.len > 16 * 1024 * 1024) return error.InvalidShader;
     var r = Reader{ .bytes = bytes };
     const magic = try r.take(4);
-    if (!std.mem.eql(u8, magic, "FSH\x0b")) return error.InvalidShader;
+    if (!std.mem.eql(u8, magic, "FSH\x0c")) return error.InvalidShader;
     _ = try r.take(8); // input/output varying hashes
+    // v12 inserted two u32 raw-binding masks (srv, uav) between the varying
+    // hashes and the uniform count — bgfx_p.h `readRawBindings`, called from
+    // `createShader` for every container at version >= 12. Reading v12 with
+    // the v11 layout does not fail loudly; it silently reads the srv mask as
+    // the uniform count, which for these shaders is 0, yielding an empty
+    // reflection and a zero code size. Skipped rather than surfaced because
+    // nothing in this backend consumes the masks (they are D3D11-only).
+    _ = try r.take(8); // rawSrvMask, rawUavMask
     const count = try r.int(u16);
     var result = Reflection{};
     if (count > result.bindings.len) return error.InvalidShader;

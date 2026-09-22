@@ -33,6 +33,24 @@
         .repo = "local:../..",
         .version = "0.22.1",
     },
+    // Post-fx on the ANDROID example specifically (labelle-bgfx#122).
+    //
+    // bloom -> crt matches `examples/bgfx` exactly, so the two examples render
+    // the same stack and a device capture is comparable to the desktop one.
+    //
+    // This exists because #65 — the white-screen ANR on Adreno 610 — was an
+    // Android/GLES POST-FX bug, and until now no example ran post-fx on a
+    // physical device: `examples/bgfx` has the stack but no `.android` block,
+    // and this one had the block but no stack. CI's ReleaseFast post-fx smoke
+    // runs the desktop example HEADLESS ON THE HOST, so the exact configuration
+    // that produced #65 had no device coverage at all.
+    //
+    // It also makes CI's existing Android `libgame.so` cross-build cover
+    // post-fx codegen for free.
+    .post_fx = .{
+        .{ .bloom = .{ .threshold = 0.75, .intensity = 1.4, .radius = 1.5 } },
+        .{ .crt = .{ .curvature = 0.12, .scanline = 0.5, .mask = 0.3, .aberration = 0.004 } },
+    },
     .y_axis = .up,
     .ecs = .mock,
     .initial_prefab = "main",
