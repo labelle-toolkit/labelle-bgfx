@@ -23,12 +23,21 @@
         // directly, so that fix has to be IN the pinned commit — do not repin
         // back to a revision predating 934372f.
         //
+        // API 161 bump (labelle-bgfx#119): this revision re-vendors bgfx from
+        // API 142 to 81d81fba (2026-09-19), with bx at 663631eb and bimg at
+        // 87aaad3a. It also drops `3rdparty/fcpp` and `3rdparty/glsl-optimizer`
+        // (both removed upstream), gates the new native video decoder behind
+        // `-Dvideo` (default off, so no VideoToolbox/CoreMedia dependency), and
+        // raises the x86 CPU baseline to SSE4.2 because bx's simd_t.h now
+        // requires it. The screen_shot vtable fix below is still IN this commit.
+        //
         // Host note: the fork previously lived at `codeberg.org/apotema/zbgfx`
         // (commit 0b229b7). It moved to the labelle-toolkit org on GitHub so it
         // sits with the rest of the toolkit and so upstreaming is a normal PR;
         // the Codeberg copy is stale and should not be repinned.
         .zbgfx = .{
-            .path = "../../../../../../private/tmp/claude-501/-Users-alexandrecalvao-prj-labelle-toolkit/799e7af1-d7bb-420b-af07-ea73401a028d/scratchpad/zbgfx-baseline",
+            .url = "https://github.com/labelle-toolkit/zbgfx/archive/8662614f4459f34974a9b963e22fc2c02f1d6e70.tar.gz",
+            .hash = "zbgfx-0.12.0-Sm4IxLfGDAfEU4ObI1ADCQ2v3Nu2zt6uubcIkZVumifh",
         },
         .zglfw = .{
             .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",

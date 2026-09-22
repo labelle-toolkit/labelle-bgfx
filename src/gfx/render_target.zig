@@ -272,7 +272,10 @@ fn openCameraSegment(x: u16, y: u16, w: u16, h: u16, scissored: bool) void {
     // Segments composite over the primary's frame clear — never clear here.
     bgfx.setViewFrameBuffer(v, backbuffer_fb);
     bgfx.setViewClear(v, bgfx.ClearFlags_None, 0, 1.0, 0);
-    bgfx.setViewRect(v, x, y, w, h, 0.0, 1.0);
+    // `setViewRect` takes x/y as i16 since bgfx API 161 (upstream "Allow
+    // negative x/y in bgfx::setViewRect"); this segment's are u16. Note
+    // `setViewScissor` below still takes u16 — only the rect moved.
+    bgfx.setViewRect(v, @intCast(x), @intCast(y), w, h, 0.0, 1.0);
     if (scissored) {
         bgfx.setViewScissor(v, x, y, w, h);
     } else {
