@@ -1278,6 +1278,9 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // Browser video (`video/web_backend.zig`): the EM_JS half that drives a
     // muted `<video>` element. wasm-only; emcc links the JS bodies at the end.
     gfx_mod.addCSourceFile(.{ .file = b.path("src/video/web_video.c"), .flags = &.{} });
+    // Browser fullscreen (`window.zig` wasm `setFullscreen`/`isFullscreen`,
+    // labelle-bgfx#99): the EM_JS half driving the DOM Fullscreen API.
+    gfx_mod.addCSourceFile(.{ .file = b.path("src/web_fullscreen.c"), .flags = &.{} });
 
     // ── Input backend module ────────────────────────────────────────
     // No zglfw / no sdl_gamepad (both desktop-only) — src/input.zig comptime-gates

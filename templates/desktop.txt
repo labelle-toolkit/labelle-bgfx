@@ -192,6 +192,18 @@ const BackendGfxType = @import("backend_gfx");
         // that predate the API (older example projects still build).
         if (comptime @hasDecl(window, "setFullscreen") and @hasDecl(@TypeOf(g), "takeFullscreenRequest")) {
             if (g.takeFullscreenRequest()) |on| window.setFullscreen(on);
+            // Read the window's real state back, so a switch the platform made
+            // on its own is reflected in `g.isFullscreen()` — what a settings
+            // checkbox binds to (labelle-bgfx#99). Folds away on engines
+            // predating `syncFullscreen`.
+            if (comptime @hasDecl(window, "isFullscreen") and @hasDecl(@TypeOf(g), "syncFullscreen")) {
+                g.syncFullscreen(window.isFullscreen());
+            }
+            // Whether the switch can do anything here, for a settings UI to
+            // grey its option out where it can't.
+            if (comptime @hasDecl(window, "fullscreenAvailable") and @hasDecl(@TypeOf(g), "setFullscreenAvailable")) {
+                g.setFullscreenAvailable(window.fullscreenAvailable());
+            }
         }
         // Vsync: same engine-owned-flag / backend-applies split as fullscreen.
         // Folds away on backends without `setVsync` or engines predating the API.
