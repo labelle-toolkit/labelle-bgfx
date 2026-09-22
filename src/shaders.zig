@@ -21,8 +21,9 @@
 //!
 //! glsl is `-p 330`, not the `-p 120` used through bgfx API 142: upstream
 //! raised the minimum OpenGL version at API 155 and its shader compiler no
-//! longer offers a 120 profile. The desktop-GL floor is therefore OpenGL 3.3
-//! (labelle-bgfx#119). These blobs are bgfx binary version 12 (`\x0c`); a
+//! longer offers a 120 profile. 330 is only the COMPILE profile: at load the
+//! GL renderer replaces `#version` with 430 (bgfx clamps its GL renderer to
+//! >= 4.3), so the desktop-GL RUNTIME floor is OpenGL 4.3 (labelle-bgfx#119). These blobs are bgfx binary version 12 (`\x0c`); a
 //! runtime expecting version 11 will reject them, so the vendor pin and this
 //! file must move together.
 //! These shaders are used for 2D sprite rendering with texture and vertex color support.

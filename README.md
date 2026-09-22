@@ -29,6 +29,20 @@ Opt in explicitly via `backend_package`:
 will resolve here transparently — that flip is deferred until this package is
 validated against real games.)
 
+### Platform requirements
+
+Since the bgfx API 161 vendor (#119):
+
+- **x86 / x86_64 CPUs need SSE4.2.** The vendored bx/bimg/bgfx C libraries are
+  compiled with SSE4.2 enabled (bx's SIMD code requires it), whatever `-Dcpu`
+  the game uses. A build for a generic x86 target still succeeds, but the
+  binary dies with an illegal-instruction fault on a CPU without SSE4.2
+  (pre-2008 Intel, pre-2011 AMD). ARM (Android, Apple Silicon) and wasm are
+  unaffected.
+- **Desktop OpenGL needs 4.3.** This matters only where bgfx picks the GL
+  renderer: Linux without Vulkan, or the Windows GL fallback. macOS uses Metal;
+  Android and WebGL2 use GLES 3.0 and are unaffected.
+
 ## Shared gamepad packages
 
 The desktop/Android gamepad sources are versioned packages this backend depends
