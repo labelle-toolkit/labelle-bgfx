@@ -1,97 +1,69 @@
-# BLOCKER: the API 161 upgrade silently disables post-fx on GLES (#119)
+# RESOLVED: "GLES post-fx regression" was a surface-cycle bug, not the API 161 upgrade (#119)
 
-Found 2026-09-22 on an SM-T505 (Adreno 610, OpenGL ES 3.2), ReleaseFast.
-**#119 must not merge until this is resolved.**
+Found and root-caused 2026-09-22 on an SM-T505 (Adreno 610, OpenGL ES 3.2).
+**Not a #119 blocker.** An earlier revision of this note blamed the SPIRV-Cross
+GLSL output and then a #118-style ReleaseFast miscompile; both were wrong.
 
-## Evidence
+## What actually differed between the captures
 
-Same example, same `bloom -> crt` stack, same device, same optimize mode.
-Only the backend differs.
+The "flat" capture (`evidence-119/device_postfx.png`) was taken after the
+device had dozed and been woken, so the app had gone through an Android
+surface cycle (`APP_CMD_TERM_WINDOW` → `APP_CMD_INIT_WINDOW`). The
+"pre-upgrade works" and "Debug works" captures were both **cold launches**.
+Optimize mode and bgfx API version were red herrings.
 
-| Build | Distinct colours | Post-fx visible |
-| --- | --- | --- |
-| **pre-upgrade** (released bgfx 0.22.1) | **18,187** | **YES** — CRT barrel distortion, scanlines, chromatic aberration, bloom |
-| **upgraded** (API 161) | **243** | **NO** — flat shapes, square corners, no scanlines |
+Proof, on the upgraded ReleaseFast build:
 
-Captures: `evidence-119/device_preupgrade.png`, `evidence-119/device_postfx.png`.
+- The binary that rendered flat at 14:15 is byte-identical (`shasum`) to the
+  one that renders bloom + CRT correctly on **8/8 cold launches**.
+- The same binary, same process: cold launch shows post-fx; HOME → resume
+  drops it; it stays dropped through power cycle and rotations.
+- After the restore, logcat shows `sprite shaders initialized` again but never
+  `post-fx programs initialized`: no post-fx pass is attempted at all.
+- Disassembly of `submitPostPass` and its two call sites in `main.gameFrame`
+  shows every handle argument (`set_texture`, `set_view_frame_buffer`, `submit`)
+  stored or loaded from a real slot. The #118 pattern is absent.
 
-Both builds log the SAME success line:
+Metal ReleaseFast on the upgrade is byte-identical to the Phase-1 Metal
+ReleaseFast capture.
 
-```
-bgfx: post-fx programs initialized (renderer: .OpenGLES)
-```
+## Root cause (pre-existing; untouched by #119)
 
-The renderer is otherwise healthy on the upgraded build: geometry, colour and
-the whole surface lifecycle are correct. Post-fx is simply not applied.
+1. On surface loss, `window.teardownSurface` calls `gfx.resetRenderTargets()`
+   (= `render_target.reset()`, also present on `origin/main`),
+   which invalidates the whole render-target pool before `bgfx.shutdown`.
+   That's correct, because the handles belong to the dead context.
+2. labelle-gfx's `PostFxDriver` (`src/post_fx.zig`) caches `target_a` /
+   `target_b` ids and only recreates them in `ensureTargets` when the ids are
+   `0` or the canvas size changed. The canvas is the DESIGN size, so it never
+   changes across a surface cycle or rotation.
+3. After restore the driver keeps using the stale ids. `beginRenderTarget`,
+   `applyPostPass` and `drawRenderTarget` all no-op on an unknown id
+   (`validId`), so the scene falls through to the backbuffer un-processed.
+   Nothing is logged.
 
-## Why no host gate caught it
+`src/gfx/render_target.zig` and gfx `post_fx.zig` are unchanged by this
+branch (only the `setViewRect` depth args and i16 casts differ), so API 142
+has the same bug by construction. This was established by reading the code; the
+API-142 build was NOT re-run through a surface cycle on the device. It just had never been exercised with a post-fx stack on a
+surface cycle before.
 
-All four post-fx goldens PASS after the upgrade — `material-golden`,
-`post-fx-golden`, and all three `post-fx-integration-golden` variants — along
-with 14/14 entry points and 247/247 tests.
+## Fix direction (separate ticket, gfx + engine)
 
-**The goldens run on Metal.** Metal post-fx is genuinely fine. GLES is the
-only affected renderer, and nothing on the host exercises GLES rendering:
-`test-shader-material-wasm32` is a compile check, not a render.
+The driver must forget its targets on surface loss without destroying them
+(the handles are already dead). For example, add a `PostFxDriver.surfaceLost()`
+that zeroes `target_a/b` + `targets_w/h`, called from the engine's
+`Game.surfaceLost()` path through the retained engine. A backend-side
+`renderTargetValid(id)` check in `ensureTargets` would also work, but it puts
+the burden on every backend.
 
-## Where the fault is
+Test: a unit test in gfx with a mock backend whose `reset` invalidates ids,
+which asserts that `ensureTargets` **re-creates** (asserting the mechanism,
+not just that a frame renders).
 
-Upstream deleted `3rdparty/glsl-optimizer` (see the Phase 2 notes), so the new
-shaderc emits GLSL through **SPIRV-Cross** instead. The emitted source changed
-dialect completely:
+## Lessons
 
-```glsl
-/* OLD (glsl-optimizer) */            /* NEW (SPIRV-Cross) */
-varying vec2 v_texcoord0;             in vec2 v_texcoord0;
-                                      layout(location = 0) out vec4 bgfx_FragColor;
-texture2D(s_tex, v_texcoord0)         texture(s_tex, v_texcoord0)
-tmpvar_7                              _22
-```
-
-That is why only the TEXT-emitting variants moved, while the binary ones grew
-normally with the v12 container:
-
-| shader | glsl | essl | mtl | spv |
-| --- | --- | --- | --- | --- |
-| fs_bloom | **42%** | **45%** | 118% | 100% |
-| fs_crt | **74%** | **78%** | 120% | 100% |
-| fs_vignette | **76%** | **79%** | 130% | 100% |
-
-The shaders themselves look valid — and a broken shader would render garbage
-or black, not a clean un-processed frame. A frame that renders correctly
-WITHOUT the effect is the signature of the post-fx draw being dropped, which
-on GLES most plausibly means a **program link failure**: `submitPostPass`
-binds a fragment shader whose varying/binding declarations must match the
-vertex shader it is linked against, and both sides were regenerated by a
-different code generator.
-
-This repo has hit that exact class before — see the `fs_yuv` / `vs_sprite`
-varying-match requirement, where a mismatch fails the link rather than
-misrendering.
-
-## Not yet established
-
-- The precise failing link or binding. That needs on-device shader debugging
-  (bgfx debug text / `BGFX_DEBUG_TEXT`, or an Adreno capture), not more
-  reading.
-- Whether **desktop OpenGL** is affected too. It almost certainly is — it uses
-  the same SPIRV-Cross `glsl` variants — but macOS is Metal-only, so it could
-  not be checked here. A Linux GL run would settle it, and Linux GL is a CI
-  gate this repo does not currently have.
-
-## What this does NOT change
-
-Everything else in the upgrade stands on its own evidence: the vendor bump,
-the v12 shader regeneration, the swap-chain port, the ten binding changes, the
-device lifecycle pass (cold launch / resume / both rotations, no crashes) and
-the SSE4.2 and GL-330 floor decisions.
-
-## Process note worth keeping
-
-This was only visible through a chain: add post-fx to the Android example
-(#122's vehicle) -> deploy to device -> capture the screen -> rebuild against
-the PRE-upgrade backend -> compare. Remove any single link and the upgrade
-ships with GLES post-fx silently dead.
-
-Stopping at "post-fx programs initialized" in the device log would have read
-as success.
+- Compare like with like across **lifecycle state**, not only optimize mode
+  and version: a cold launch is not the same as a resumed launch.
+- The "same binary" check (`shasum`) should come first. It would have killed
+  both wrong hypotheses immediately.
