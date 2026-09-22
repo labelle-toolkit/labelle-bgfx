@@ -45,8 +45,7 @@ ReleaseFast capture.
 `src/gfx/render_target.zig` and gfx `post_fx.zig` are unchanged by this
 branch (only the `setViewRect` depth args and i16 casts differ), so API 142
 has the same bug by construction. This was established by reading the code; the
-API-142 build was NOT re-run through a surface cycle on the device. It just had never been exercised with a post-fx stack on a
-surface cycle before.
+API-142 build was NOT re-run through a surface cycle on the device.
 
 ## Fix direction (separate ticket, gfx + engine)
 
