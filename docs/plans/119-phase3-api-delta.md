@@ -9,11 +9,17 @@ Phases 1, 2 and the Phase 4 shader probe are recorded in their own documents.
 | --- | --- |
 | shaderc builds on the new set | yes — `1.19.161` |
 | all 44 shader blobs regenerated | yes — reproducible, uniformly bgfx binary v12 |
+| native video decoder | compiled OUT — no new framework dependency (§1) |
 | backend test suite | **203/207 tests, 3 steps failing** (baseline: 247/247, 46/46) |
 
-Two integration requirements and one structural API change account for the gap.
+The remaining gap is TWO things, both understood:
 
-## 1. New link requirement: VideoToolbox + CoreMedia (fixed)
+* `window.zig:1365` and `:1496` — the `bgfx_reset` swap-chain port (§2).
+* 4 × `shader_material_tests` — shader reflection reading the regenerated
+  v12 blobs. Expected given the format bump; needs its own look, and is not
+  video- or swap-chain-related.
+
+## 1. RESOLVED: bgfx's native video decoder is compiled OUT
 
 bgfx gained a native video decoder (API 146, "Added video decoder support"),
 and `3rdparty/h264` is now included unconditionally by `src/video.h`. On Apple
@@ -25,13 +31,43 @@ Without those frameworks the link fails on 13 symbols —
 `CMVideoFormatDescriptionCreateFrom{H264,HEVC}ParameterSets`, `kCMTimeInvalid`,
 `kVTDecompressionPropertyKey_RealTime`.
 
-Fixed in zbgfx's `build.zig` next to the existing Metal/MetalKit links.
+### Decision: do not adopt it, compile it out
 
-**Open question for this backend, not a build problem.** labelle-bgfx already
-has its own video path in `src/video/` (worker-thread decode, the Android
-ImageReader route, the GPU-YUV shader). Upstream now ships a native decoder
-covering some of the same ground. Whether these coexist, or one replaces the
-other, is a design decision this upgrade should NOT quietly make.
+Adopting upstream's decoder was considered and rejected on evidence. It has
+backends for exactly four renderers:
+
+```
+video_d3d11.cpp   video_d3d12.cpp   video_mtl.cpp   video_vk.cpp
+```
+
+**No OpenGL/GLES backend, and none for wasm.** This backend's renderer
+mapping puts the two platforms where our video work actually lives on GLES:
+
+| Platform | Renderer | Upstream decoder |
+| --- | --- | --- |
+| macOS | Metal | yes |
+| Windows | D3D11/12 | yes |
+| Linux | Vulkan (OpenGL fallback) | yes / no |
+| **Android** | **OpenGLES** | **none** |
+| **wasm / WebGL2** | **OpenGLES** | **none** |
+
+Our `src/video/` is overwhelmingly Android and web — `android.zig`,
+`android_audio.zig`, the ImageReader route, `web.zig`, `web_backend.zig`,
+`web_video.c`, plus the shared `yuv.zig` GPU path. `desktop.zig` is one file
+of thirteen. Adopting upstream would replace the one platform group already
+working, leave Android and web on our code regardless, and leave us
+maintaining both stacks.
+
+So: `BGFX_CONFIG_VIDEO=0` via a new `-Dvideo` option in zbgfx (default off),
+with VideoToolbox/CoreMedia linked only when it is on. `src/config.h` gates
+all four backends on that one define, so it compiles out cleanly — verified,
+zero `VT*`/`CM*` symbols remain.
+
+Net effect: the API 161 bump adds **no** new framework dependency. The option
+exists for a project targeting only Vulkan/D3D/Metal that does want it.
+
+Revisit if upstream ever ships a GLES backend; that is an upstream request,
+not work on our side.
 
 ## 2. STRUCTURAL: `bgfx_reset` lost width and height
 
