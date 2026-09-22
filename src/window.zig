@@ -1333,17 +1333,37 @@ pub fn frameDuration() f64 {
     return @as(f64, @floatFromInt(now - last_frame_ns)) / @as(f64, std.time.ns_per_s);
 }
 
+// Browser Fullscreen API shim (`src/web_fullscreen.c`, wasm graph only). Only
+// referenced from `is_wasm` branches, so the other targets never analyze them.
+extern "c" fn labelle_web_fullscreen_set(on: c_int) void;
+extern "c" fn labelle_web_fullscreen_is() c_int;
+extern "c" fn labelle_web_fullscreen_available() c_int;
+
+/// Can the fullscreen switch do anything here? Desktop always can. Android is
+/// permanently fullscreen, so there is nothing to switch. The web asks the
+/// browser (`document.fullscreenEnabled`), which says no on iPhone Safari and
+/// in an iframe without `allowfullscreen` (labelle-bgfx#99). The frame loop
+/// reports this to the engine so a settings UI can grey its option out.
+pub fn fullscreenAvailable() bool {
+    if (is_android) return false;
+    if (is_wasm) return labelle_web_fullscreen_available() != 0;
+    return true;
+}
+
 /// Query whether the window is currently fullscreen. Android is always
-/// fullscreen; desktop asks GLFW whether the window is bound to a monitor.
+/// fullscreen; desktop asks GLFW whether the window is bound to a monitor; the
+/// web asks the DOM, reporting an in-flight request as its target
+/// (`web_fullscreen.c`).
 pub fn isFullscreen() bool {
     if (is_android) return true;
-    if (is_wasm) return false; // fullscreen is a browser/DOM concern, not bgfx's
+    if (is_wasm) return labelle_web_fullscreen_is() != 0;
     const win = glfw_window orelse return false;
     return win.getMonitor() != null;
 }
 
-/// Switch to fullscreen (`on=true`) or windowed (`on=false`). Desktop
-/// only — Android is permanently fullscreen, so this is a no-op there.
+/// Switch to fullscreen (`on=true`) or windowed (`on=false`). Android is
+/// permanently fullscreen, so this is a no-op there; the web asks the browser
+/// (`web_fullscreen.c` — asynchronous, and it needs recent user activation).
 /// GLFW has no toggle primitive: going fullscreen binds the window to the
 /// primary monitor at its current video mode (saving the windowed
 /// geometry first); going windowed restores the saved geometry.
@@ -1356,7 +1376,10 @@ pub fn isFullscreen() bool {
 /// `beginFrame` in the same frame), which resets the bgfx swapchain to the
 /// new framebuffer size — so no resize is done here.
 pub fn setFullscreen(on: bool) void {
-    if (no_glfw) return; // Android is permanently fullscreen; wasm defers to the DOM
+    // The web goes through the browser's Fullscreen API on the whole page
+    // (labelle-bgfx#99); the page's sizing script refits the canvas.
+    if (is_wasm) return labelle_web_fullscreen_set(@intFromBool(on));
+    if (no_glfw) return; // Android is permanently fullscreen
     const win = glfw_window orelse return;
     const already = win.getMonitor() != null;
     if (already == on) return;

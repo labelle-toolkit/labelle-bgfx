@@ -26,8 +26,9 @@ const BackendGfxType = @import("backend_gfx");
 // browser owns the event loop, so a blocking while-loop would freeze the page.
 // The callback body mirrors the bgfx DESKTOP template's loop body
 // (tick -> beginFrame -> render -> endFrame), minus the desktop-only
-// headless / screenshot / fullscreen / vsync plumbing (none of which applies in
-// the browser).
+// headless / screenshot / vsync plumbing (none of which applies in the
+// browser). Fullscreen IS drained here: the backend maps it onto the browser's
+// Fullscreen API (labelle-bgfx#99).
 //
 // The bgfx WebGL context is created against the emscripten `#canvas` element:
 // `window.initWindow(w, h, title)` comptime-selects `initWindowWasm`, which hands
@@ -110,6 +111,22 @@ fn gameFrame() callconv(.c) void {
     // content renders correctly regardless of the browser canvas dimensions.
     BackendGfxType.setScreenSize(window.width(), window.height());
     BackendGfxType.setDesignSize(@intCast(screen_w), @intCast(screen_h));
+    // Fullscreen: the engine owns the desired flag, the backend asks the
+    // browser (labelle-bgfx#99). Then read the real state back — Esc or the
+    // browser's own UI leaves fullscreen without the game asking, and the
+    // settings checkbox must follow. Same double gate as the desktop
+    // template, so older backends and engines still build.
+    if (comptime @hasDecl(window, "setFullscreen") and @hasDecl(@TypeOf(g), "takeFullscreenRequest")) {
+        if (g.takeFullscreenRequest()) |on| window.setFullscreen(on);
+        if (comptime @hasDecl(window, "isFullscreen") and @hasDecl(@TypeOf(g), "syncFullscreen")) {
+            g.syncFullscreen(window.isFullscreen());
+        }
+        // iPhone Safari (and an iframe without `allowfullscreen`) can't go
+        // fullscreen at all: report it so the settings UI greys the option out.
+        if (comptime @hasDecl(window, "fullscreenAvailable") and @hasDecl(@TypeOf(g), "setFullscreenAvailable")) {
+            g.setFullscreenAvailable(window.fullscreenAvailable());
+        }
+    }
 {{preview_heartbeat}}{{editor_sim_open}}{{tick_code}}    g.tick(dt);
 {{editor_sim_close}}
     window.beginFrame();
