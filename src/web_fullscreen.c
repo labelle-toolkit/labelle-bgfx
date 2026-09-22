@@ -69,6 +69,22 @@ EM_JS(void, labelle_web_fullscreen_set_js, (int on), {
             if (!ok) { st.desired = null; warn(what, err); return; }
             drive();
         };
+        // Older Safari: the prefixed API is promise-less but just as
+        // asynchronous, so its one-shot change / error events settle the
+        // flight — for the exit as much as the request, or a toggle made
+        // before the exit lands would read the stale element and be dropped.
+        const viaWebkitEvents = (target, start) => {
+            st.pending = target;
+            const done = (ok) => () => {
+                d.removeEventListener('webkitfullscreenchange', onChange);
+                d.removeEventListener('webkitfullscreenerror', onError);
+                settle(ok, 'webkitfullscreenerror');
+            };
+            const onChange = done(true), onError = done(false);
+            d.addEventListener('webkitfullscreenchange', onChange);
+            d.addEventListener('webkitfullscreenerror', onError);
+            start();
+        };
         try {
             const el = d.documentElement;
             if (want && el.requestFullscreen) {
@@ -78,21 +94,9 @@ EM_JS(void, labelle_web_fullscreen_set_js, (int on), {
                 st.pending = false;
                 d.exitFullscreen().then(() => settle(true), (err) => settle(false, err));
             } else if (want && el.webkitRequestFullscreen) {
-                // Older Safari: prefixed and promise-less, so the one-shot
-                // change / error events settle the flight instead.
-                st.pending = true;
-                const done = (ok) => () => {
-                    d.removeEventListener('webkitfullscreenchange', onChange);
-                    d.removeEventListener('webkitfullscreenerror', onError);
-                    settle(ok, 'webkitfullscreenerror');
-                };
-                const onChange = done(true), onError = done(false);
-                d.addEventListener('webkitfullscreenchange', onChange);
-                d.addEventListener('webkitfullscreenerror', onError);
-                el.webkitRequestFullscreen();
+                viaWebkitEvents(true, () => el.webkitRequestFullscreen());
             } else if (!want && d.webkitExitFullscreen && d.webkitFullscreenElement) {
-                d.webkitExitFullscreen();
-                st.desired = null;
+                viaWebkitEvents(false, () => d.webkitExitFullscreen());
             } else {
                 st.desired = null;
                 if (want) warn(what, 'the Fullscreen API is not available');

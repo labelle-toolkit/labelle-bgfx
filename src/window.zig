@@ -1339,15 +1339,16 @@ extern "c" fn labelle_web_fullscreen_set(on: c_int) void;
 extern "c" fn labelle_web_fullscreen_is() c_int;
 extern "c" fn labelle_web_fullscreen_available() c_int;
 
-/// Can the fullscreen switch do anything here? Desktop always can. Android is
-/// permanently fullscreen, so there is nothing to switch. The web asks the
+/// Can the fullscreen switch do anything here? Desktop can when there is a
+/// window: a surfaceless/headless run has none, so `setFullscreen` would be
+/// ignored. Android is permanently fullscreen, so there is nothing to switch. The web asks the
 /// browser (`document.fullscreenEnabled`), which says no on iPhone Safari and
 /// in an iframe without `allowfullscreen` (labelle-bgfx#99). The frame loop
 /// reports this to the engine so a settings UI can grey its option out.
 pub fn fullscreenAvailable() bool {
     if (is_android) return false;
     if (is_wasm) return labelle_web_fullscreen_available() != 0;
-    return true;
+    return glfw_window != null;
 }
 
 /// Query whether the window is currently fullscreen. Android is always
