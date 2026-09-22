@@ -53,14 +53,12 @@ pub fn main() !void {
     var init: bgfx.Init = undefined;
     bgfx.initCtor(&init);
     init.type = if (@import("builtin").os.tag == .macos) .Metal else .Vulkan; // Vulkan/Metal support headless; OpenGL does not
-    init.resolution.width = 0;
-    init.resolution.height = 0;
-    init.resolution.reset = bgfx.ResetFlags_None;
-    init.platformData.ndt = null;
-    init.platformData.nwh = null;
+    init.swapChain.width = 0;
+    init.swapChain.height = 0;
+    init.reset = bgfx.ResetFlags_None;
+    init.swapChain.ndt = null;
+    init.swapChain.nwh = null;
     init.platformData.context = null;
-    init.platformData.backBuffer = null;
-    init.platformData.backBufferDS = null;
 
     if (!bgfx.init(&init)) {
         std.debug.print("PROBE_RESULT: HEADLESS_INIT_FAILED\n", .{});
@@ -72,7 +70,7 @@ pub fn main() !void {
     var handles = [_]bgfx.TextureHandle{rt};
     const fb = bgfx.createFrameBufferFromHandles(1, &handles, false);
     bgfx.setViewFrameBuffer(0, fb);
-    bgfx.setViewRect(0, 0, 0, W, H);
+    bgfx.setViewRect(0, 0, 0, W, H, 0.0, 1.0);
     bgfx.setViewClear(0, bgfx.ClearFlags_Color | bgfx.ClearFlags_Depth, 0x000000ff, 1.0, 0);
     bgfx.touch(0);
     _ = bgfx.frame(0);

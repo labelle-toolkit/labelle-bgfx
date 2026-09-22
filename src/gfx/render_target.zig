@@ -272,7 +272,7 @@ fn openCameraSegment(x: u16, y: u16, w: u16, h: u16, scissored: bool) void {
     // Segments composite over the primary's frame clear — never clear here.
     bgfx.setViewFrameBuffer(v, backbuffer_fb);
     bgfx.setViewClear(v, bgfx.ClearFlags_None, 0, 1.0, 0);
-    bgfx.setViewRect(v, x, y, w, h);
+    bgfx.setViewRect(v, x, y, w, h, 0.0, 1.0);
     if (scissored) {
         bgfx.setViewScissor(v, x, y, w, h);
     } else {
@@ -300,7 +300,7 @@ pub fn applyCameraViewportEmpty(full_w: u16, full_h: u16) void {
     const v = nextCameraView();
     bgfx.setViewFrameBuffer(v, backbuffer_fb);
     bgfx.setViewClear(v, bgfx.ClearFlags_None, 0, 1.0, 0);
-    bgfx.setViewRect(v, 0, 0, full_w, full_h);
+    bgfx.setViewRect(v, 0, 0, full_w, full_h, 0.0, 1.0);
     bgfx.setViewScissor(v, 1, 1, 0, 0); // empty, non-sentinel → clips all
     programs.setActiveView(v);
     camera_band_engaged = true;
@@ -329,7 +329,7 @@ pub fn applyCameraViewport(x: u16, y: u16, w: u16, h: u16) void {
 /// Backbuffer-only (see `applyCameraViewport`).
 pub fn clearCameraViewport(full_w: u16, full_h: u16) void {
     if (!camera_band_engaged) {
-        bgfx.setViewRect(programs.PRIMARY_VIEW, 0, 0, full_w, full_h);
+        bgfx.setViewRect(programs.PRIMARY_VIEW, 0, 0, full_w, full_h, 0.0, 1.0);
         bgfx.setViewScissor(programs.PRIMARY_VIEW, 0, 0, 0, 0);
         return;
     }
@@ -365,7 +365,7 @@ pub fn create(w: u16, h: u16) RenderTarget {
     view_in_use[view] = true;
 
     bgfx.setViewFrameBuffer(view, fb);
-    bgfx.setViewRect(view, 0, 0, w, h);
+    bgfx.setViewRect(view, 0, 0, w, h, 0.0, 1.0);
     bgfx.setViewClear(view, bgfx.ClearFlags_Color | bgfx.ClearFlags_Depth, DEFAULT_CLEAR, 1.0, 0);
     // A new target extends the view range, so re-assert "primary composites
     // last". No-op-cheap and keeps mirror ordering correct as targets appear.
@@ -596,7 +596,7 @@ pub fn applyPostPass(pass: PostPass, src: RenderTargetId, dst: RenderTargetId) v
     // replace owns every dst texel, so no clear is needed (ClearFlags_None).
     const view = allocPostFxView();
     bgfx.setViewFrameBuffer(view, d.fb);
-    bgfx.setViewRect(view, 0, 0, d.width, d.height);
+    bgfx.setViewRect(view, 0, 0, d.width, d.height, 0.0, 1.0);
     bgfx.setViewClear(view, bgfx.ClearFlags_None, 0, 1.0, 0);
 
     const saved = programs.activeView();

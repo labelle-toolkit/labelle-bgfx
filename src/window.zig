@@ -106,7 +106,7 @@ var windowed_h: i32 = 600;
 /// vsync is enabled. `setVsync` toggles it in/out of `current_reset`.
 const RESET_VSYNC: u32 = 0x00000080;
 /// The reset flags currently in effect, reused by `ensureSurface` and
-/// seeded into `init.resolution.reset` at window creation. Starts with
+/// seeded into `init.reset` at window creation. Starts with
 /// vsync ON to match every backend's prior hardcoded behaviour; flipped
 /// live by `setVsync`. (Toggling vsync is just adding/removing
 /// `RESET_VSYNC` and re-issuing `bgfx.reset` — the standard bgfx
@@ -307,8 +307,38 @@ fn ensureSurface() void {
     }
     screen_w = target[0];
     screen_h = target[1];
-    // `.Count` = keep the current backbuffer format (no change).
-    bgfx.reset(@intCast(screen_w), @intCast(screen_h), current_reset, .Count);
+    // bgfx API 161 moved size onto an explicit swap chain (#119): `reset`
+    // takes the device/frame-global flags plus a main-window description.
+    // Width and height are NOT inherited when left zero — they are clamped to
+    // `[1, maxTextureSize]` — so a resize must always supply real dimensions.
+    // Everything else stays neutral and keeps its current value: `.Count`
+    // formats inherit (the old `.Count` "no format change" argument), and
+    // `nwh`/`ndt` are ignored for the main window because bgfx owns them.
+    bgfx.reset(current_reset, &mainSwapChain(screen_w, screen_h));
+}
+
+/// A main-window swap-chain description carrying ONLY a new size.
+///
+/// Every other field is deliberately neutral so bgfx inherits it from the one
+/// `init` established: `.Count` formats inherit, a zero `depth` handle leaves
+/// bgfx owning its depth surface, and zero `numBackBuffers`/`maxFrameLatency`
+/// inherit too. `flags` carries `BGFX_SWAP_CHAIN_*` (MSAA and friends), which
+/// this backend never sets at init, so zero is correct rather than merely
+/// convenient — if init ever sets them, it must set them here too, because
+/// swap-chain flags are NOT inherited on reset.
+fn mainSwapChain(w: i32, h: i32) bgfx.SwapChain {
+    return .{
+        .nwh = null,
+        .ndt = null,
+        .width = @intCast(w),
+        .height = @intCast(h),
+        .flags = 0,
+        .formatColor = .Count,
+        .formatDepthStencil = .Count,
+        .depth = .{ .idx = std.math.maxInt(u16) },
+        .numBackBuffers = 0,
+        .maxFrameLatency = 0,
+    };
 }
 
 /// Pure decision half of `ensureSurface`: the size the backbuffer must be
@@ -390,18 +420,16 @@ fn initWindowWasm(w: i32, h: i32) void {
     bgfx.initCtor(&init);
 
     init.type = .Count; // auto-select renderer (OpenGLES/WebGL on emscripten)
-    init.resolution.width = @intCast(w);
-    init.resolution.height = @intCast(h);
-    init.resolution.reset = current_reset;
+    init.swapChain.width = @intCast(w);
+    init.swapChain.height = @intCast(h);
+    init.reset = current_reset;
 
     // On emscripten `nwh` is a CSS selector C-string for the target canvas; bgfx
     // creates the WebGL context against it. `ndt`/`context`/`queue` are unused.
-    init.platformData.ndt = null;
-    init.platformData.nwh = @ptrCast(@constCast(wasm_canvas_selector.ptr));
+    init.swapChain.ndt = null;
+    init.swapChain.nwh = @ptrCast(@constCast(wasm_canvas_selector.ptr));
     init.platformData.context = null;
     init.platformData.queue = null;
-    init.platformData.backBuffer = null;
-    init.platformData.backBufferDS = null;
     init.platformData.type = .Default;
     bgfx_callback.install(&init);
 
@@ -409,7 +437,7 @@ fn initWindowWasm(w: i32, h: i32) void {
     gfx.shaderMaterialContextStarted();
 
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
-    bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));
+    bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h), 0.0, 1.0);
 
     // Register the HTML5 canvas mouse callbacks so Dear ImGui (and the engine)
     // receive pointer input on the web (#24). No GLFW window on wasm, so this
@@ -428,19 +456,17 @@ fn initWindowAndroid(w: i32, h: i32) void {
     bgfx.initCtor(&init);
 
     init.type = .Count; // auto-select renderer (GLES/Vulkan on Android)
-    init.resolution.width = @intCast(w);
-    init.resolution.height = @intCast(h);
-    init.resolution.reset = current_reset;
+    init.swapChain.width = @intCast(w);
+    init.swapChain.height = @intCast(h);
+    init.reset = current_reset;
 
     // On Android the native window handle is the `ANativeWindow*` handed
     // over by the NativeActivity glue. `ndt` is unused (no display
     // connection like X11), and the handle type is the platform default.
-    init.platformData.ndt = null;
-    init.platformData.nwh = android_native_window;
+    init.swapChain.ndt = null;
+    init.swapChain.nwh = android_native_window;
     init.platformData.context = null;
     init.platformData.queue = null;
-    init.platformData.backBuffer = null;
-    init.platformData.backBufferDS = null;
     init.platformData.type = .Default;
     bgfx_callback.install(&init);
 
@@ -448,7 +474,7 @@ fn initWindowAndroid(w: i32, h: i32) void {
     gfx.shaderMaterialContextStarted();
 
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
-    bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));
+    bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h), 0.0, 1.0);
 }
 
 /// Choose the bgfx renderer type for the desktop init (labelle-bgfx#30).
@@ -524,40 +550,38 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     // Renderer: `.Count` (auto) on macOS/Linux; a variant-backed renderer on
     // Windows, since auto → D3D11 there has no shaders (labelle-bgfx#30).
     init.type = desktopRendererType();
-    init.resolution.width = @intCast(screen_w);
-    init.resolution.height = @intCast(screen_h);
-    init.resolution.reset = current_reset;
+    init.swapChain.width = @intCast(screen_w);
+    init.swapChain.height = @intCast(screen_h);
+    init.reset = current_reset;
 
     // Fill in bgfx's native display type (ndt) and native window handle
     // (nwh) for the build target. See src/platform.zig for the source
     // mapping and its unit tests.
     switch (comptime platform.windowHandleSourceFor(builtin.target.os.tag)) {
         .cocoa => {
-            init.platformData.ndt = null;
-            init.platformData.nwh = glfw.getCocoaWindow(win);
+            init.swapChain.ndt = null;
+            init.swapChain.nwh = glfw.getCocoaWindow(win);
         },
         .win32 => {
-            init.platformData.ndt = null;
-            init.platformData.nwh = glfw.getWin32Window(win);
+            init.swapChain.ndt = null;
+            init.swapChain.nwh = glfw.getWin32Window(win);
         },
         .x11 => {
-            init.platformData.ndt = glfw.getX11Display();
+            init.swapChain.ndt = glfw.getX11Display();
             const xid: u32 = glfw.getX11Window(win);
-            init.platformData.nwh = @ptrFromInt(@as(usize, xid));
+            init.swapChain.nwh = @ptrFromInt(@as(usize, xid));
         },
         .wayland => {
             // Not currently selected — Linux/BSD map to .x11 in
             // platform.zig. Kept here so adding Wayland support in a
             // follow-up is a platform.zig change, not a window.zig one.
-            init.platformData.ndt = glfw.getWaylandDisplay();
-            init.platformData.nwh = glfw.getWaylandWindow(win);
+            init.swapChain.ndt = glfw.getWaylandDisplay();
+            init.swapChain.nwh = glfw.getWaylandWindow(win);
         },
         .unsupported => @compileError("bgfx backend: unsupported OS for window handle"),
     }
     init.platformData.context = null;
     init.platformData.queue = null;
-    init.platformData.backBuffer = null;
-    init.platformData.backBufferDS = null;
     init.platformData.type = .Default;
     bgfx_callback.install(&init);
 
@@ -592,7 +616,7 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
 
     gfx.shaderMaterialContextStarted();
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
-    bgfx.setViewRect(0, 0, 0, @intCast(screen_w), @intCast(screen_h));
+    bgfx.setViewRect(0, 0, 0, @intCast(screen_w), @intCast(screen_h), 0.0, 1.0);
 
     const input = @import("input");
     input.setWindow(win);
@@ -664,15 +688,13 @@ pub fn initHeadless(w: i32, h: i32) bool {
     // No backbuffer/swapchain exists, so the resolution MUST be 0×0 (bgfx:
     // "resolution of non-existing backbuffer can't be larger than 0x0!"). The
     // real render size lives on the offscreen framebuffer created below.
-    init.resolution.width = 0;
-    init.resolution.height = 0;
-    init.resolution.reset = bgfx.ResetFlags_None;
-    init.platformData.ndt = null;
-    init.platformData.nwh = null; // ← surfaceless
+    init.swapChain.width = 0;
+    init.swapChain.height = 0;
+    init.reset = bgfx.ResetFlags_None;
+    init.swapChain.ndt = null;
+    init.swapChain.nwh = null; // ← surfaceless
     init.platformData.context = null;
     init.platformData.queue = null;
-    init.platformData.backBuffer = null;
-    init.platformData.backBufferDS = null;
     init.platformData.type = .Default;
     bgfx_callback.install(&init);
 
@@ -739,7 +761,7 @@ pub fn initHeadless(w: i32, h: i32) bool {
     // records the handle for the camera band AND sweeps the range.
     gfx.setBackbufferSubstitute(headless_fb);
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
-    bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h));
+    bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h), 0.0, 1.0);
     return true;
 }
 
@@ -835,8 +857,16 @@ pub fn captureHeadless(path: [:0]const u8) bool {
         bgfx.destroyTexture(rb);
     };
 
-    bgfx.blit(0, rb, 0, 0, 0, 0, src, 0, 0, 0, 0, w, h, 1);
-    const ready = bgfx.readTexture(rb, px.ptr, 0);
+    // bgfx API 161 reworked blit to take regions instead of 14 positional
+    // args. `TextureRegion.init` is the 2D helper: it leaves `mip`, `z` and
+    // `depth` zero, which addresses mip 0 of the only slice a 2D texture has —
+    // the same thing the old call spelled out as `0, 0, 0, ... , 1`.
+    var dst_region: bgfx.TextureRegion = undefined;
+    dst_region.init(rb, 0, 0, @intCast(w), @intCast(h));
+    var src_region: bgfx.TextureRegion = undefined;
+    src_region.init(src, 0, 0, @intCast(w), @intCast(h));
+    bgfx.blit(0, &dst_region, &src_region);
+    const ready = bgfx.readTexture(&dst_region, px.ptr);
     var f = bgfx.frame(0);
     var guard: u32 = 0;
     while (f < ready and guard < 64) : (guard += 1) f = bgfx.frame(0);
@@ -1361,9 +1391,11 @@ pub fn setVsync(on: bool) void {
         std.log.debug("bgfx: setVsync({}) ignored — surfaceless headless run has no swapchain", .{on});
         return;
     }
-    if (screen_w > 0 and screen_h > 0) {
-        bgfx.reset(@intCast(screen_w), @intCast(screen_h), current_reset, .Count);
-    }
+    // A null swap chain means "leave the main window alone, apply only the
+    // device/frame globals" — which is exactly what a vsync toggle wants. The
+    // old signature forced us to re-pass `screen_w/h` here even though neither
+    // changed, and that redundancy is what tripped #54's headless assert.
+    bgfx.reset(current_reset, null);
 }
 
 // ── Window icon (labelle-cli#359) ────────────────────────────────────────
@@ -1492,8 +1524,10 @@ pub fn surfaceRestored() void {
     if (fb[0] > 0 and fb[1] > 0) {
         screen_w = fb[0];
         screen_h = fb[1];
-        // `.Count` = keep the current backbuffer format (no change).
-        bgfx.reset(@intCast(screen_w), @intCast(screen_h), current_reset, .Count);
+        // `nwh`/`ndt` are ignored for the main window (bgfx owns them), so the
+        // restored ANativeWindow still arrives via `setAndroidNativeWindow`
+        // before this runs — the swap chain carries geometry only.
+        bgfx.reset(current_reset, &mainSwapChain(screen_w, screen_h));
     }
 }
 
@@ -1524,7 +1558,7 @@ pub fn beginFrame() void {
     // return draws to the primary view, so each frame's split-screen passes reuse
     // the same band.
     gfx.resetCameraFrame();
-    bgfx.setViewRect(0, 0, 0, @intCast(screen_w), @intCast(screen_h));
+    bgfx.setViewRect(0, 0, 0, @intCast(screen_w), @intCast(screen_h), 0.0, 1.0);
     // Touch view 0 so bgfx ALWAYS clears + presents it, even on a frame
     // with zero draw calls. `setViewRect` alone does NOT do this — bgfx
     // only processes a view that has submitted draws or an explicit

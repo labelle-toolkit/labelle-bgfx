@@ -82,10 +82,17 @@ fn readPixel(src: bgfx.TextureHandle, x: u16, y: u16) ?[4]u8 {
     var readback_done = false;
     defer if (readback_done) bgfx.destroyTexture(rb);
 
-    bgfx.blit(0, rb, 0, 0, 0, 0, src, 0, 0, 0, 0, W, H, 1);
+    // bgfx API 161 reworked blit + readTexture to take regions.
+    // `TextureRegion.init` is the 2D helper: mip/z/depth stay zero,
+    // addressing mip 0 of the only slice a 2D texture has.
+    var dst_region: bgfx.TextureRegion = undefined;
+    dst_region.init(rb, 0, 0, W, H);
+    var src_region: bgfx.TextureRegion = undefined;
+    src_region.init(src, 0, 0, W, H);
+    bgfx.blit(0, &dst_region, &src_region);
     // File-scope, not a stack array, for the same reason: a late GPU write into
     // a returned-from stack frame would corrupt whatever reused it.
-    const ready = bgfx.readTexture(rb, &pixels, 0);
+    const ready = bgfx.readTexture(&dst_region, &pixels);
     var f = bgfx.frame(0);
     var guard: u32 = 0;
     while (f < ready and guard < 64) : (guard += 1) f = bgfx.frame(0);
@@ -166,7 +173,7 @@ pub fn main() !void {
     // view range, so the GREEN clear must land in the captured image — over the
     // red from phase 1, since bgfx executes views in ascending id order and
     // nothing has re-sequenced them (no render targets exist in this probe).
-    bgfx.setViewRect(UNBOUND_VIEW, 0, 0, W, H);
+    bgfx.setViewRect(UNBOUND_VIEW, 0, 0, W, H, 0.0, 1.0);
     bgfx.setViewClear(UNBOUND_VIEW, bgfx.ClearFlags_Color | bgfx.ClearFlags_Depth, 0x00ff00ff, 1.0, 0);
     bgfx.touch(UNBOUND_VIEW);
     _ = bgfx.frame(0);
