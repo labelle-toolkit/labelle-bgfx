@@ -10,12 +10,20 @@
 // The API is asynchronous. `requestFullscreen()` returns a promise and the
 // document only reports `fullscreenElement` once it settles, while the frame
 // loop reads `isFullscreen()` straight after issuing the request and hands it
-// to the engine's `syncFullscreen`. So an in-flight request is reported as its
-// TARGET until it settles; otherwise a settings checkbox would flicker back for
-// the frames in between. A rejected request (no user activation, an iframe
-// without `allowfullscreen`, a browser without the API) clears the pending
-// state, so the real state wins again, and it is logged ONCE rather than
-// thrown: failing to go fullscreen must never take the game down.
+// to the engine's `syncFullscreen`. So while a transition is in flight,
+// `isFullscreen()` reports the LATEST request; otherwise a settings checkbox
+// would flicker back for the frames in between. A request made during a
+// flight (on, then off before the browser finished) is kept and reconciled
+// when the flight settles, so the last choice always wins. A rejected request
+// (no user activation, an iframe without `allowfullscreen`, a browser without
+// the API) is dropped, so the real state wins again, and it is logged ONCE
+// rather than thrown: failing to go fullscreen must never take the game down.
+//
+// The PAGE must size the canvas to the viewport. Going fullscreen enlarges the
+// document, not the canvas; a page that fits the canvas and its drawing buffer
+// to the viewport (as Flying Platform's does) then fills the screen. The default
+// emcc shell does not, so a game on it gets a fullscreen page around an
+// unchanged canvas (labelle-bgfx#130).
 //
 // Older Safari only has the prefixed, promise-less `webkitRequestFullscreen`;
 // there the pending state is settled by the one-shot `webkitfullscreenchange` /
@@ -32,11 +40,13 @@
 EM_JS(void, labelle_web_fullscreen_set_js, (int on), {
     if (typeof document === 'undefined') return;
     const d = document;
+    // `desired` is the LATEST request, `pending` the transition in flight.
+    // They are separate so a request made while another is in flight (a quick
+    // on-then-off) is not lost: it is reconciled when the flight settles.
     const st = globalThis.__labelleFullscreen ||
-        (globalThis.__labelleFullscreen = { pending: null, warned: false });
-    const want = !!on;
-    const current = !!(d.fullscreenElement || d.webkitFullscreenElement);
-    if (st.pending === null && current === want) return;
+        (globalThis.__labelleFullscreen = { pending: null, desired: null, warned: false });
+    st.desired = !!on;
+    if (st.pending !== null) return; // reconciled by `settle` below
 
     const warn = (what, err) => {
         if (st.warned) return;
@@ -44,44 +54,65 @@ EM_JS(void, labelle_web_fullscreen_set_js, (int on), {
         const msg = err && err.message ? err.message : String(err);
         console.warn('[labelle] fullscreen ' + what + ' failed: ' + msg);
     };
-    const what = want ? 'request' : 'exit';
-    const settle = () => { st.pending = null; };
+    const isOn = () => !!(d.fullscreenElement || d.webkitFullscreenElement);
 
-    try {
-        const el = d.documentElement;
-        if (want && el.requestFullscreen) {
-            st.pending = true;
-            el.requestFullscreen().then(settle, (err) => { settle(); warn(what, err); });
-        } else if (!want && d.exitFullscreen && d.fullscreenElement) {
-            st.pending = false;
-            d.exitFullscreen().then(settle, (err) => { settle(); warn(what, err); });
-        } else if (want && el.webkitRequestFullscreen) {
-            st.pending = true;
-            const done = (ok) => () => {
-                d.removeEventListener('webkitfullscreenchange', onChange);
-                d.removeEventListener('webkitfullscreenerror', onError);
-                settle();
-                if (!ok) warn(what, 'webkitfullscreenerror');
-            };
-            const onChange = done(true), onError = done(false);
-            d.addEventListener('webkitfullscreenchange', onChange);
-            d.addEventListener('webkitfullscreenerror', onError);
-            el.webkitRequestFullscreen();
-        } else if (!want && d.webkitExitFullscreen && d.webkitFullscreenElement) {
-            d.webkitExitFullscreen();
-        } else if (want) {
-            warn(what, 'the Fullscreen API is not available');
+    // Start whatever transition moves the page toward `st.desired`. Called
+    // again after each flight settles, so the last request always wins.
+    const drive = () => {
+        const want = st.desired;
+        if (want === null || isOn() === want) { st.desired = null; return; }
+        const what = want ? 'request' : 'exit';
+        // A rejection drops the request instead of retrying: the reason (no
+        // user activation, no `allowfullscreen`) would only fail again.
+        const settle = (ok, err) => {
+            st.pending = null;
+            if (!ok) { st.desired = null; warn(what, err); return; }
+            drive();
+        };
+        try {
+            const el = d.documentElement;
+            if (want && el.requestFullscreen) {
+                st.pending = true;
+                el.requestFullscreen().then(() => settle(true), (err) => settle(false, err));
+            } else if (!want && d.exitFullscreen && d.fullscreenElement) {
+                st.pending = false;
+                d.exitFullscreen().then(() => settle(true), (err) => settle(false, err));
+            } else if (want && el.webkitRequestFullscreen) {
+                // Older Safari: prefixed and promise-less, so the one-shot
+                // change / error events settle the flight instead.
+                st.pending = true;
+                const done = (ok) => () => {
+                    d.removeEventListener('webkitfullscreenchange', onChange);
+                    d.removeEventListener('webkitfullscreenerror', onError);
+                    settle(ok, 'webkitfullscreenerror');
+                };
+                const onChange = done(true), onError = done(false);
+                d.addEventListener('webkitfullscreenchange', onChange);
+                d.addEventListener('webkitfullscreenerror', onError);
+                el.webkitRequestFullscreen();
+            } else if (!want && d.webkitExitFullscreen && d.webkitFullscreenElement) {
+                d.webkitExitFullscreen();
+                st.desired = null;
+            } else {
+                st.desired = null;
+                if (want) warn(what, 'the Fullscreen API is not available');
+            }
+        } catch (err) {
+            st.pending = null;
+            st.desired = null;
+            warn(what, err);
         }
-    } catch (err) {
-        settle();
-        warn(what, err);
-    }
+    };
+    drive();
 });
 
 EM_JS(int, labelle_web_fullscreen_is_js, (), {
     if (typeof document === 'undefined') return 0;
+    // While a transition is in flight, report the latest request (it wins
+    // once the flight settles), so the frame loop's read-back doesn't flicker
+    // the settings checkbox back for the frames in between.
     const st = globalThis.__labelleFullscreen;
-    if (st && st.pending !== null) return st.pending ? 1 : 0;
+    if (st && st.pending !== null) return (st.desired !== null ? st.desired : st.pending) ? 1 : 0;
     return (document.fullscreenElement || document.webkitFullscreenElement) ? 1 : 0;
 });
 
