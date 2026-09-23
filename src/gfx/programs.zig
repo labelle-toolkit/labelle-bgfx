@@ -22,10 +22,32 @@ fn stateBlendFuncSeparate(src_rgb: u64, dst_rgb: u64, src_a: u64, dst_a: u64) u6
     return (src_rgb | (dst_rgb << 4)) | ((src_a | (dst_a << 4)) << 8);
 }
 
+/// Straight-alpha "over": colour blends by the source's alpha, and the ALPHA
+/// channel composites as coverage (`One, InvSrcAlpha`), so drawing anything
+/// over an opaque pixel leaves it opaque.
+///
+/// It used to blend alpha like colour (`SrcAlpha, InvSrcAlpha`), which gives
+/// srcA² + dstA·(1−srcA): a 50% glow over the opaque sky left alpha at 0.75.
+/// Invisible on desktop and Android, where the window ignores alpha, but the
+/// web canvas is created with an alpha channel (bgfx: `alpha = backbuffer has
+/// alpha bits`, `premultipliedAlpha = false`), so the browser blended the
+/// page behind the canvas through every translucent sprite (Flying Platform:
+/// the sun's glare halo, HUD panels, the build ghost looked different on the
+/// web). Colour factors are unchanged, so every opaque render is identical.
 pub const STATE_BLEND_ALPHA: u64 = stateBlendFuncSeparate(
     bgfx.StateFlags_BlendSrcAlpha,
     bgfx.StateFlags_BlendInvSrcAlpha,
+    bgfx.StateFlags_BlendOne,
+    bgfx.StateFlags_BlendInvSrcAlpha,
+);
+
+/// Additive light (colour `SrcAlpha, One`) with the same alpha coverage rule as
+/// `STATE_BLEND_ALPHA`. Its alpha used to be `SrcAlpha, One`: saturates over an
+/// opaque target, but under-reported coverage (srcA²) into a transparent one.
+pub const STATE_BLEND_ADD: u64 = stateBlendFuncSeparate(
     bgfx.StateFlags_BlendSrcAlpha,
+    bgfx.StateFlags_BlendOne,
+    bgfx.StateFlags_BlendOne,
     bgfx.StateFlags_BlendInvSrcAlpha,
 );
 
@@ -791,6 +813,23 @@ fn fullscreenQuad(flip_v: bool) [6]PosTexColorVertex {
 // negative-height flip. Compile-checked in the `gfx_mod` test graph. (Only the
 // Metal, top-left, `flip_v == false` path is golden-covered on CI — there is no
 // display-GL runner — so this pins the flip's INTENT alongside the code comment.)
+test "straight-alpha states composite alpha as coverage, not srcA² (web canvas stays opaque)" {
+    // Alpha factors live in bits 8..15 of the blend-func field: src | dst << 4.
+    const alpha_bits = struct {
+        fn of(state: u64) u64 {
+            return (state >> (bgfx.StateFlags_BlendShift + 8)) & 0xff;
+        }
+    }.of;
+    const coverage = bgfx.StateFlags_BlendOne | (bgfx.StateFlags_BlendInvSrcAlpha << 4);
+    const want = coverage >> bgfx.StateFlags_BlendShift;
+    try std.testing.expectEqual(want, alpha_bits(STATE_BLEND_ALPHA));
+    try std.testing.expectEqual(want, alpha_bits(STATE_BLEND_ADD));
+    // Colour factors are untouched (opaque renders stay pixel-identical).
+    const rgb = (STATE_BLEND_ALPHA >> bgfx.StateFlags_BlendShift) & 0xff;
+    const want_rgb = (bgfx.StateFlags_BlendSrcAlpha | (bgfx.StateFlags_BlendInvSrcAlpha << 4)) >> bgfx.StateFlags_BlendShift;
+    try std.testing.expectEqual(want_rgb, rgb);
+}
+
 test "fullscreenQuad flip inverts V, preserving position and U" {
     const straight = fullscreenQuad(false);
     const flipped = fullscreenQuad(true);
@@ -1273,7 +1312,7 @@ pub fn submitShaderMaterialTriangles(vertices: []const PosTexColorVertex, textur
     bgfx.setViewTransform(active_view, &identity, &identity);
     bgfx.setTransientVertexBuffer(0, &tvb, 0, num);
     materials.bind(instance, texture_handle, rect);
-    const blend = if (instance.blend == .alpha) STATE_BLEND_ALPHA else stateBlendFuncSeparate(bgfx.StateFlags_BlendSrcAlpha, bgfx.StateFlags_BlendOne, bgfx.StateFlags_BlendSrcAlpha, bgfx.StateFlags_BlendOne);
+    const blend = if (instance.blend == .alpha) STATE_BLEND_ALPHA else STATE_BLEND_ADD;
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | blend, 0);
     submitProgram(active_view, .{ .idx = instance.program.handle });
     return true;
