@@ -828,6 +828,9 @@ test "straight-alpha states composite alpha as coverage, not srcA² (web canvas 
     const rgb = (STATE_BLEND_ALPHA >> bgfx.StateFlags_BlendShift) & 0xff;
     const want_rgb = (bgfx.StateFlags_BlendSrcAlpha | (bgfx.StateFlags_BlendInvSrcAlpha << 4)) >> bgfx.StateFlags_BlendShift;
     try std.testing.expectEqual(want_rgb, rgb);
+    const add_rgb = (STATE_BLEND_ADD >> bgfx.StateFlags_BlendShift) & 0xff;
+    const want_add_rgb = (bgfx.StateFlags_BlendSrcAlpha | (bgfx.StateFlags_BlendOne << 4)) >> bgfx.StateFlags_BlendShift;
+    try std.testing.expectEqual(want_add_rgb, add_rgb);
 }
 
 test "fullscreenQuad flip inverts V, preserving position and U" {
