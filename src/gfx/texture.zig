@@ -399,6 +399,19 @@ fn validateAstc(data: []const u8) ?AstcUpload {
     return .{ .fmt = fmt, .block_x = hdr.block_x, .block_y = hdr.block_y, .width = w, .height = h, .blocks = hdr.blocks };
 }
 
+/// True if `data` is an ASTC blob the RUNNING renderer samples natively, so
+/// `uploadCompressed` will accept it (labelle-bgfx#134). Generated code uses
+/// this to choose between an atlas's `.astc` and its `.png` fallback on web,
+/// where ASTC support depends on the browser and GPU.
+///
+/// Reads bgfx's caps, so it is only meaningful after `bgfx.init` (it returns
+/// false before, which picks the safe PNG). `isCompressed` is the other
+/// question: "is this ASTC at all", which is answerable on any thread.
+pub fn compressedSupported(data: []const u8) bool {
+    const info = validateAstc(data) orelse return false;
+    return runtimeSupport(info.fmt) == .native;
+}
+
 /// True if `data` is a GPU-compressed blob this backend can upload as-is.
 pub fn isCompressed(data: []const u8) bool {
     return validateAstc(data) != null;

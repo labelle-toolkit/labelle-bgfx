@@ -84,6 +84,8 @@ jobs:
         run: zig build rotated-rect-probe
       - name: Post-fx keeps the scene's shape off the design size (#120)
         run: zig build postfx-fit-probe
+      - name: compressedSupported agrees with uploadCompressed (#134)
+        run: zig build compressed-support-probe
       # This renderer probe does not exercise gamepads. Use the supported
       # GLFW fallback so cross-linking does not require a Windows SDL2 SDK;
       # the native build above retains the default SDL gamepad integration.
@@ -564,7 +566,7 @@ jobs:
           set +e
           set -uo pipefail
           fail=0
-          for step in headless-probe mirror-probe screenshot-probe surfaceless-scale-probe rotated-rect-probe postfx-fit-probe; do
+          for step in headless-probe mirror-probe screenshot-probe surfaceless-scale-probe rotated-rect-probe postfx-fit-probe compressed-support-probe; do
             echo "::group::$step"
             # `set +e` above, so a non-zero build/run doesn't abort the loop — but
             # capture the exit code and FOLD it into `fail` (a probe that printed
@@ -573,7 +575,7 @@ jobs:
             out=$(zig build "$step" 2>&1); rc=$?
             echo "$out"
             if [ "$rc" -ne 0 ]; then echo "FAIL: $step exited non-zero ($rc)"; fail=1; fi
-            echo "$out" | grep -qE 'HEADLESS_OFFSCREEN_READBACK_OK|HEADLESS_MIRROR_OK|SCREENSHOT_TGA_OK|SURFACELESS_SCALE_OK|ROTATED_RECT_FILLED|POSTFX_FIT_OK' \
+            echo "$out" | grep -qE 'HEADLESS_OFFSCREEN_READBACK_OK|HEADLESS_MIRROR_OK|SCREENSHOT_TGA_OK|SURFACELESS_SCALE_OK|ROTATED_RECT_FILLED|POSTFX_FIT_OK|COMPRESSED_SUPPORT_AGREES' \
               || { echo "FAIL: $step did not report OK"; fail=1; }
             echo "::endgroup::"
           done
