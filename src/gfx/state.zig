@@ -26,6 +26,12 @@ var design_h: i32 = 600;
 // Aspect-preserving design→physical fit, recomputed on any size change.
 var fit_scale_x: f32 = 1.0;
 var fit_scale_y: f32 = 1.0;
+// The FRAMEBUFFER's fit, even while a render-target pass is open (#120 review).
+// `fit_scale_*` is the fit of whatever surface draws land on; the pointer and
+// camera conversions (`screenToDesign`/`designToPhysical`) always describe the
+// real framebuffer, so they use this one.
+var fb_fit_x: f32 = 1.0;
+var fb_fit_y: f32 = 1.0;
 // When false, `toNdcX/toNdcY` skip the fit so the design canvas stretches
 // to fill the whole framebuffer. The renderer toggles this off around
 // `screen_fill` layers (backdrops) so they cover the pillarbox bars instead
@@ -116,20 +122,24 @@ pub fn targetSize() ?[2]i32 {
     return target_size;
 }
 
-fn recomputeFitScale() void {
-    const surface: [2]i32 = target_size orelse .{ screen_w, screen_h };
-    const sw: f32 = @floatFromInt(surface[0]);
-    const sh: f32 = @floatFromInt(surface[1]);
+/// Aspect-preserving fit of the design canvas into a `w`x`h` surface.
+fn fitInto(w: i32, h: i32) [2]f32 {
+    const sw: f32 = @floatFromInt(w);
+    const sh: f32 = @floatFromInt(h);
     const dw: f32 = @floatFromInt(design_w);
     const dh: f32 = @floatFromInt(design_h);
-    if (sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0) {
-        fit_scale_x = 1.0;
-        fit_scale_y = 1.0;
-        return;
-    }
+    if (sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0) return .{ 1.0, 1.0 };
     const s = @min(sw / dw, sh / dh);
-    fit_scale_x = s * dw / sw;
-    fit_scale_y = s * dh / sh;
+    return .{ s * dw / sw, s * dh / sh };
+}
+
+fn recomputeFitScale() void {
+    const fb = fitInto(screen_w, screen_h);
+    fb_fit_x = fb[0];
+    fb_fit_y = fb[1];
+    const draw = if (target_size) |t| fitInto(t[0], t[1]) else fb;
+    fit_scale_x = draw[0];
+    fit_scale_y = draw[1];
 }
 
 /// Physical framebuffer size (real surface). Recomputes the fit scale.
@@ -167,8 +177,8 @@ pub fn screenToDesign(px: f32, py: f32) Vector2 {
     const ndc_x = (px / sw) * 2.0 - 1.0;
     const ndc_y = 1.0 - (py / sh) * 2.0;
     return .{
-        .x = ((ndc_x / fit_scale_x) + 1.0) * 0.5 * dw,
-        .y = (1.0 - ndc_y / fit_scale_y) * 0.5 * dh,
+        .x = ((ndc_x / fb_fit_x) + 1.0) * 0.5 * dw,
+        .y = (1.0 - ndc_y / fb_fit_y) * 0.5 * dh,
     };
 }
 
@@ -185,8 +195,8 @@ pub fn designToPhysical(pos: Vector2) Vector2 {
     }
     // Forward of toNdc: design → NDC → physical framebuffer px. Exact
     // inverse of screenToDesign (#331).
-    const ndc_x = ((pos.x / dw) * 2.0 - 1.0) * fit_scale_x;
-    const ndc_y = (1.0 - (pos.y / dh) * 2.0) * fit_scale_y;
+    const ndc_x = ((pos.x / dw) * 2.0 - 1.0) * fb_fit_x;
+    const ndc_y = (1.0 - (pos.y / dh) * 2.0) * fb_fit_y;
     return .{
         .x = (ndc_x + 1.0) * 0.5 * sw,
         .y = (1.0 - ndc_y) * 0.5 * sh,
@@ -541,6 +551,13 @@ test "a render-target pass letterboxes into the TARGET, not the framebuffer (#12
     try t.expectApproxEqAbs(@as(f32, -1.0), toNdcX(0), 1e-5);
     // The physical framebuffer is still the physical framebuffer.
     try t.expectEqual(@as(i32, 2000), physicalWidth());
+
+    // Pointer/camera conversions still describe the FRAMEBUFFER mid-pass
+    // (review): its left pillarbox bar is 200 px, so physical x=200 is
+    // design x=0, and design (800, 600) is physical (1800, 1200).
+    try t.expectApproxEqAbs(@as(f32, 0), screenToDesign(200, 0).x, 1e-3);
+    try t.expectApproxEqAbs(@as(f32, 1800), designToPhysical(.{ .x = 800, .y = 600 }).x, 1e-3);
+    try t.expectApproxEqAbs(@as(f32, 1200), designToPhysical(.{ .x = 800, .y = 600 }).y, 1e-3);
 
     // A per-frame setScreenSize during the pass must not undo the target fit.
     setScreenSize(2000, 1200);
