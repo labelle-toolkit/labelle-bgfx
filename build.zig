@@ -568,6 +568,30 @@ pub fn build(b: *std.Build) void {
     const sfprobe_step = b.step("screen-fill-cover-probe", "Run the screen_fill coverage probe (#42)");
     sfprobe_step.dependOn(&b.addRunArtifact(sfprobe).step);
 
+    // `zig build rotated-rect-probe` — rotated filled rectangles really fill
+    // (#98): readback proves fill vs outline, rotation direction vs
+    // labelle-core's shim, and rotation 0 == drawRectangleRec. Surfaceless.
+    const rrprobe = b.addExecutable(.{
+        .name = "rotated_rect_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/rotated_rect_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    rrprobe.root_module.addImport("zbgfx", zbgfx_mod);
+    rrprobe.root_module.addImport("gfx", gfx_mod);
+    rrprobe.root_module.addImport("window", window_mod);
+    rrprobe.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| rrprobe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        rrprobe.root_module.linkSystemLibrary("gdi32", .{});
+        rrprobe.root_module.linkSystemLibrary("user32", .{});
+    }
+    const rrprobe_step = b.step("rotated-rect-probe", "Run the rotated filled-rectangle probe (#98)");
+    rrprobe_step.dependOn(&b.addRunArtifact(rrprobe).step);
+
     // ── Material golden harness (labelle-gfx#305 Slice B, RFC §6) ────────────
     // `zig build material-golden`       — render the fixed flash + palette_swap
     //     scene headless and DIFF it against the committed golden TGA (CI gate).
@@ -802,6 +826,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(state_run).step);
+
+    // Rotated-rectangle corner math (#98): pure, so it EXECUTES on the host
+    // and pins the convention shared with labelle-core's outline fallback.
+    const rotated_rect_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gfx/rotated_rect.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(rotated_rect_run).step);
 
     // Run the transient-buffer budgeting tests (labelle-assembler#648).
     // `gfx/transient_budget.zig` is std-only arithmetic (no zbgfx), so the
