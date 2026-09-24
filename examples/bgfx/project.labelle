@@ -31,7 +31,7 @@
     // example sat on engine 2.11.0 / gfx 1.30.0 under core 2.0.0 and the current
     // CLI could not build it (labelle-bgfx#114). Nothing in CI builds this
     // example through the CLI, which is how that went unnoticed.
-    .core_version = "2.0.0",
+    .core_version = "2.1.0",
     .engine_version = "3.1.0",
     .gfx_version = "2.2.0",
     // Local dev checkouts, resolved as siblings of the main labelle-bgfx
