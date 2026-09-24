@@ -772,6 +772,20 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(screenshot_path_tests).step);
 
+    // ── Guard: no direct page_allocator in production code ──────────
+    // On wasm page_allocator corrupts emscripten's malloc heap (see
+    // src/heap.zig). The test walks src/, so it runs from the repo root.
+    const heap_guard_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/heap_guard_test.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const heap_guard_run = b.addRunArtifact(heap_guard_tests);
+    heap_guard_run.setCwd(b.path("."));
+    test_step.dependOn(&heap_guard_run.step);
+
     // ── Unit tests for the shipped build hook ───────────────────────
     // `backend.hook.zig` is std-only (it's the file the assembler stages
     // and `@import`s into a generated build.zig — see build.zig.zon's

@@ -1,5 +1,6 @@
 //! Generic game-owned fragment shaders. All calls run on the render thread.
 const std = @import("std");
+const heap = @import("heap.zig");
 const core = @import("labelle-core");
 const sm = core.shader_material;
 const bgfx = @import("zbgfx").bgfx;
@@ -7,7 +8,7 @@ const embedded = @import("../shaders.zig");
 const texture = @import("texture.zig");
 const binary = @import("shader_binary.zig");
 const Registry = @import("material_store.zig").Store(Driver);
-var registry = Registry{ .allocator = std.heap.page_allocator, .driver = .{} };
+var registry = Registry{ .allocator = heap.allocator, .driver = .{} };
 var context_active = false;
 
 pub fn contextStarted() void {

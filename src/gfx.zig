@@ -230,6 +230,10 @@ pub const uploadCompressed = texture.uploadCompressed;
 // synchronous seam — it reads dims here to set DecodedImage before upload.
 pub const compressedDims = texture.compressedDims;
 
+// The backend's own allocator: libc malloc on wasm, page_allocator elsewhere.
+// Other backend modules that depend on gfx (window) allocate through this.
+pub const heap = @import("gfx/heap.zig");
+
 // ── Offscreen render targets (labelle-bgfx#36 + transport mirror) ──────
 // Render the scene into a texture instead of the screen. Two features build on
 // this: the headless offscreen capture (#36, via `window.initHeadless`) and the

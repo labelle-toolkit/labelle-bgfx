@@ -18,6 +18,7 @@
 //! AAudio path is already proven in the example + bgfx-Android app.
 
 const std = @import("std");
+const heap = @import("../gfx/heap.zig");
 const builtin = @import("builtin");
 const types = @import("../gfx/types.zig");
 const state = @import("../gfx/state.zig");
@@ -56,7 +57,7 @@ pub const VideoBackend = struct {
     };
 
     var slots: [MAX]Slot = [_]Slot{.{}} ** MAX;
-    const alloc = std.heap.page_allocator;
+    const alloc = heap.allocator;
 
     fn freeSlot() ?usize {
         for (&slots, 0..) |*s, i| if (!s.used) return i;
