@@ -842,6 +842,18 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(screenshot_path_tests).step);
 
+    // Android activity-instance bgfx ownership (labelle-bgfx#143). Pure
+    // bookkeeping the NativeActivity shell drives, so it EXECUTES on the host;
+    // the shell itself only gets the Android compile-check below.
+    const android_owner_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/android_bgfx_owner.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(android_owner_tests).step);
+
     addHeapGuard(b, test_step, optimize);
 
     // ── Unit tests for the shipped build hook ───────────────────────
