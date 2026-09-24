@@ -759,6 +759,13 @@ pub fn run(app: *android_app) void {
     if (app_ptr == null) adoptAccessorsLocked(app);
     unlockOwner();
 
+    // Launch-intent extras → env vars (labelle-bgfx#139), BEFORE the loop: the
+    // game's first `getenv` of a run option is in `init_fn` (engine + scene
+    // init, fired on the first INIT_WINDOW, which only this loop can deliver),
+    // so everything read from there on sees the copied values. Needs
+    // `native_activity`, stashed just above, for the debuggable gate.
+    if (app.activity) |activity| applyLaunchIntentEnv(activity);
+
     // Chain `onWindowFocusChanged` so the engine's immersive re-hide runs
     // on the UI thread (the only thread `WindowInsetsController.hide()` is
     // legal on). The NDK glue installed its own handler in
@@ -932,6 +939,68 @@ pub fn isDebuggable() bool {
     return result;
 }
 
+// ── Launch-intent extras → env vars (labelle-bgfx#139) ──────────────
+// `labelle run --platform=android --scene=X` launches with `am start ...
+// --es LABELLE_SCENE X` (labelle-cli#397); the allow-list and the per-key
+// decision live in `android_intent_env.zig` (host-tested), the JNI read in
+// `src/android_intent_extras.c`.
+const intent_env = @import("android_intent_env.zig");
+
+extern "c" fn labelle_bgfx_read_intent_extras(
+    vm: ?*anyopaque,
+    clazz: ?*anyopaque,
+    keys: [*]const [*:0]const u8,
+    count: c_int,
+    buf: [*]u8,
+    buf_cap: usize,
+    lens: [*]c_int,
+) c_int;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+/// Survives activity relaunches in a cached process, so a plain launch can
+/// clear what a previous `--scene` launch set (see `intent_env.action`).
+var intent_env_state: intent_env.State = .{};
+/// Backing store for the extras' values. setenv copies them, so it is only
+/// needed for the duration of `applyLaunchIntentEnv`.
+var intent_buf: [4096]u8 = undefined;
+
+const LibcEnv = struct {
+    pub fn set(_: LibcEnv, name: [:0]const u8, value: [:0]const u8) bool {
+        return setenv(name.ptr, value.ptr, 1) == 0;
+    }
+    pub fn unset(_: LibcEnv, name: [:0]const u8) void {
+        _ = unsetenv(name.ptr);
+    }
+    pub fn debuggable(_: LibcEnv) bool {
+        return isDebuggable();
+    }
+};
+
+/// Copy the launch intent's allow-listed `LABELLE_*` string extras into the
+/// process environment. A launch with no extras (the launcher icon) or any
+/// JNI failure changes nothing, except clearing values a previous intent set.
+fn applyLaunchIntentEnv(activity: *ANativeActivity) void {
+    if (comptime !is_android) return;
+    var names: [intent_env.keys.len][*:0]const u8 = undefined;
+    for (intent_env.keys, 0..) |k, i| names[i] = k.name.ptr;
+    var lens: [intent_env.keys.len]c_int = undefined;
+    if (labelle_bgfx_read_intent_extras(activity.vm, activity.clazz, &names, names.len, &intent_buf, intent_buf.len, &lens) == 0) {
+        std.log.warn("bgfx: could not read the launch intent; LABELLE_* extras ignored", .{});
+        return;
+    }
+    var extras: [intent_env.keys.len]?[:0]const u8 = @splat(null);
+    var off: usize = 0;
+    for (lens, 0..) |len, i| {
+        if (len == -2) std.log.warn("bgfx: intent extra {s} too long; ignored", .{intent_env.keys[i].name});
+        if (len < 0) continue;
+        const n: usize = @intCast(len);
+        extras[i] = intent_buf[off .. off + n :0];
+        off += n + 1;
+    }
+    intent_env.apply(&intent_env_state, extras, LibcEnv{});
+}
+
 /// C-ABI accessor the bgfx Android backend adapter binds `extern "c"` (see
 /// the `native_activity` block above for why this is a C symbol and not a Zig
 /// import). Strong export so it survives dead-stripping and resolves the
@@ -968,6 +1037,7 @@ comptime {
     _ = getNativeActivity;
     _ = setImmersiveCallback;
     _ = &focusHook;
+    _ = applyLaunchIntentEnv;
 }
 
 test "android_app module compiles for the host as a no-op namespace" {
