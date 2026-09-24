@@ -615,6 +615,29 @@ pub fn build(b: *std.Build) void {
     const pfprobe_step = b.step("postfx-fit-probe", "Run the post-fx letterbox probe (#120)");
     pfprobe_step.dependOn(&b.addRunArtifact(pfprobe).step);
 
+    // `zig build compressed-support-probe` — compressedSupported agrees with
+    // uploadCompressed on the running GPU (#134: the web ASTC/PNG pick).
+    const csprobe = b.addExecutable(.{
+        .name = "compressed_support_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/compressed_support_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    csprobe.root_module.addImport("zbgfx", zbgfx_mod);
+    csprobe.root_module.addImport("gfx", gfx_mod);
+    csprobe.root_module.addImport("window", window_mod);
+    csprobe.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| csprobe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        csprobe.root_module.linkSystemLibrary("gdi32", .{});
+        csprobe.root_module.linkSystemLibrary("user32", .{});
+    }
+    const csprobe_step = b.step("compressed-support-probe", "Run the compressedSupported/uploadCompressed agreement probe (#134)");
+    csprobe_step.dependOn(&b.addRunArtifact(csprobe).step);
+
     // ── Material golden harness (labelle-gfx#305 Slice B, RFC §6) ────────────
     // `zig build material-golden`       — render the fixed flash + palette_swap
     //     scene headless and DIFF it against the committed golden TGA (CI gate).

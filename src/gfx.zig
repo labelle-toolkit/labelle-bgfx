@@ -230,6 +230,9 @@ pub const uploadCompressed = texture.uploadCompressed;
 // splits worker-thread decode from main-thread upload and so can't use the
 // synchronous seam — it reads dims here to set DecodedImage before upload.
 pub const compressedDims = texture.compressedDims;
+// Runtime-support query for the web ASTC/PNG choice (#134): true only for
+// an ASTC blob this renderer samples natively. Needs bgfx initialised.
+pub const compressedSupported = texture.compressedSupported;
 
 // The backend's own allocator: libc malloc on wasm, page_allocator elsewhere.
 // Other backend modules that depend on gfx (window) allocate through this.
