@@ -70,6 +70,33 @@ pub fn parse(data: []const u8) ?Header {
     };
 }
 
+// ── Runtime support (labelle-bgfx#76) ─────────────────────────────────────
+// Parsing says what a blob IS; this says whether the running GPU can SAMPLE
+// it. The flags are bgfx's `caps.formats[fmt]` bits, passed in so the
+// decision stays host-testable (texture.zig asserts they match bgfx's).
+
+/// `BGFX_CAPS_FORMAT_TEXTURE_2D`: the GPU samples the format natively.
+pub const caps_texture_2d: u32 = 0x1;
+/// `BGFX_CAPS_FORMAT_TEXTURE_2D_EMULATED`: bgfx would convert it to RGBA8 on
+/// the CPU at upload.
+pub const caps_texture_2d_emulated: u32 = 0x4;
+
+pub const Support = enum {
+    /// Upload the blocks as-is.
+    native,
+    /// Only bgfx's CPU conversion could take it. That path is broken in our
+    /// builds: bimg's astcenc fails to initialise, so it draws a checkerboard
+    /// on native GPUs and writes out of bounds on wasm. Treat as unsupported.
+    emulated_only,
+    none,
+};
+
+pub fn support(format_caps: u32) Support {
+    if (format_caps & caps_texture_2d != 0) return .native;
+    if (format_caps & caps_texture_2d_emulated != 0) return .emulated_only;
+    return .none;
+}
+
 // ── Tests (pure; no bgfx) ───────────────────────────────────────────────────
 
 fn makeHeader(buf: *[16]u8, bx: u8, by: u8, w: u24, h: u24) void {
@@ -124,4 +151,15 @@ test "parse rejects non-astc / degenerate dims" {
     try std.testing.expect(parse(&buf) == null);
     makeHeader(buf[0..16], 0, 8, 64, 64); // zero block dim
     try std.testing.expect(parse(&buf) == null);
+}
+
+test "support: only a natively sampled format uploads" {
+    try std.testing.expectEqual(Support.native, support(caps_texture_2d));
+    // Native wins even when bgfx also reports the emulated bit.
+    try std.testing.expectEqual(Support.native, support(caps_texture_2d | caps_texture_2d_emulated));
+    // The #76 case: bgfx would only convert on the CPU, which draws garbage.
+    try std.testing.expectEqual(Support.emulated_only, support(caps_texture_2d_emulated));
+    try std.testing.expectEqual(Support.none, support(0));
+    // Other bits (sRGB, 3D, cube...) don't make a 2D texture sampleable.
+    try std.testing.expectEqual(Support.none, support(0x2 | 0x8 | 0x40));
 }
