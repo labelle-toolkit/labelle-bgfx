@@ -11,9 +11,10 @@
 ///     the in-place geometry commands (`WINDOW_RESIZED`/`CONFIG_CHANGED`/
 ///     `CONTENT_RECT_CHANGED`, labelle-bgfx#66), honor resume/pause, and
 ///     translate `app.destroyRequested` into `window.shouldQuit`.
-///   * touch input (`AInputEvent`/`AMotionEvent_*`): fed into `input.zig`
-///     as pointer-down + x/y so the engine sees touch as mouse-like
-///     pointer input (mirrors the desktop mouse path).
+///   * touch input (`AInputEvent`/`AMotionEvent_*`, handled in
+///     `android_input_event.zig`): fed into `input.zig` as pointer-down +
+///     x/y so the engine sees touch as mouse-like pointer input (mirrors
+///     the desktop mouse path).
 ///
 /// Compile target: `aarch64-linux-android`. This module is Android-only —
 /// on every other target it is a no-op namespace (see the `is_android`
@@ -26,6 +27,8 @@ const builtin = @import("builtin");
 // which Zig 0.16 rejects ("file exists in modules ...").
 const window = @import("window");
 const input = @import("input");
+// The `AInputEvent` handler (touch + gamepad) lives in its own file.
+const onInputEvent = @import("android_input_event.zig").onInputEvent;
 // `root` is the compilation's root module — the generated game's
 // `main.zig` when this backend is consumed by an assembled project. We
 // read an optional `labelle_provides_android_main` declaration from it so
@@ -211,84 +214,16 @@ const ALOOPER_POLL_CALLBACK: c_int = -2;
 const ALOOPER_POLL_TIMEOUT: c_int = -3;
 const ALOOPER_POLL_ERROR: c_int = -4;
 
-// ── AInputEvent types (android/input.h) ─────────────────────────────
-const AINPUT_EVENT_TYPE_KEY: i32 = 1;
-const AINPUT_EVENT_TYPE_MOTION: i32 = 2;
-
-// ── AKeyEvent actions (android/input.h) ─────────────────────────────
-const AKEY_EVENT_ACTION_DOWN: i32 = 0;
-const AKEY_EVENT_ACTION_UP: i32 = 1;
-
-// `AKEYCODE_BACK` — many controllers map the B / "circle" / select button to
-// the system BACK key. If we leave that unconsumed, Android performs back
-// navigation (the activity finishes — the game quits) the moment the player
-// presses B. We consume BACK only when it originates from a gamepad source
-// (so the real system BACK gesture/button is untouched). Mirrors sokol's
-// B->BACK guard (assembler#248).
-const AKEYCODE_BACK: i32 = 4;
-
-// ── AInputEvent source classes/sources (android/input.h) ────────────
-// A device's source is a bitmask; controllers expose GAMEPAD and/or
-// JOYSTICK. We treat a motion event as a gamepad axis report only when its
-// source carries JOYSTICK (analog sticks/triggers/hat live there); key
-// events from GAMEPAD/JOYSTICK/KEYBOARD-with-buttons carry the BUTTON_*/
-// DPAD_* keycodes the shared state module maps. Mirrors the source masks in
-// the JNI glue (`is_gamepad_sources`).
-const AINPUT_SOURCE_GAMEPAD: i32 = 0x00000401;
-const AINPUT_SOURCE_JOYSTICK: i32 = 0x01000010;
-
-// ── AMOTION_EVENT_AXIS_* (android/input.h) ──────────────────────────
-// The raw MotionEvent axis ids we sample into the shared state module's
-// forwarded-axis buffer (indexed by `input.GAMEPAD_AXIS_COUNT` / `agp.FA_*`).
-// Order here mirrors that buffer's FA_* layout.
-const AMOTION_EVENT_AXIS_X: i32 = 0;
-const AMOTION_EVENT_AXIS_Y: i32 = 1;
-const AMOTION_EVENT_AXIS_Z: i32 = 11;
-const AMOTION_EVENT_AXIS_RZ: i32 = 14;
-const AMOTION_EVENT_AXIS_RX: i32 = 12;
-const AMOTION_EVENT_AXIS_RY: i32 = 13;
-const AMOTION_EVENT_AXIS_LTRIGGER: i32 = 17;
-const AMOTION_EVENT_AXIS_RTRIGGER: i32 = 18;
-const AMOTION_EVENT_AXIS_GAS: i32 = 22;
-const AMOTION_EVENT_AXIS_BRAKE: i32 = 23;
-const AMOTION_EVENT_AXIS_HAT_X: i32 = 15;
-const AMOTION_EVENT_AXIS_HAT_Y: i32 = 16;
-
-// ── AMotionEvent actions (android/input.h), masked ──────────────────
-const AMOTION_EVENT_ACTION_MASK: i32 = 0xff;
-const AMOTION_EVENT_ACTION_DOWN: i32 = 0;
-const AMOTION_EVENT_ACTION_UP: i32 = 1;
-const AMOTION_EVENT_ACTION_MOVE: i32 = 2;
-const AMOTION_EVENT_ACTION_CANCEL: i32 = 3;
-const AMOTION_EVENT_ACTION_POINTER_DOWN: i32 = 5;
-const AMOTION_EVENT_ACTION_POINTER_UP: i32 = 6;
-// The lifting pointer's index for a POINTER_UP is packed into the high byte of
-// the raw (unmasked) action.
-const AMOTION_EVENT_ACTION_POINTER_INDEX_MASK: i32 = 0xff00;
-const AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT: u5 = 8;
-
 // ── NDK / glue functions we call ────────────────────────────────────
 // Declared `extern` so the linker resolves them from the glue
-// (`android_app_*`), libandroid (`ANativeWindow_*`, `AMotionEvent_*`,
-// `AInputEvent_*`), and the C runtime (`ALooper_pollOnce`). The link of
-// these libs is phase 4 — here we only need them declared so the module
-// compiles; the object is produced without a final link.
+// (`android_app_*`) and libandroid (`ANativeWindow_*`, `ALooper_*`; the
+// `AInputEvent_*` ones sit with the handler in `android_input_event.zig`).
+// The link of these libs is phase 4 — here we only need them declared so
+// the module compiles; the object is produced without a final link.
 extern fn ALooper_pollOnce(timeoutMillis: c_int, outFd: ?*c_int, outEvents: ?*c_int, outData: ?*?*anyopaque) c_int;
 
 extern fn ANativeWindow_getWidth(window: *ANativeWindow) i32;
 extern fn ANativeWindow_getHeight(window: *ANativeWindow) i32;
-
-extern fn AInputEvent_getType(event: *AInputEvent) i32;
-extern fn AInputEvent_getSource(event: *AInputEvent) i32;
-extern fn AInputEvent_getDeviceId(event: *AInputEvent) i32;
-extern fn AMotionEvent_getAction(event: *AInputEvent) i32;
-extern fn AMotionEvent_getX(event: *AInputEvent, pointer_index: usize) f32;
-extern fn AMotionEvent_getY(event: *AInputEvent, pointer_index: usize) f32;
-extern fn AMotionEvent_getPointerCount(event: *AInputEvent) usize;
-extern fn AMotionEvent_getPointerId(event: *AInputEvent, pointer_index: usize) i32;
-extern fn AMotionEvent_getAxisValue(event: *AInputEvent, axis: i32, pointer_index: usize) f32;
-extern fn AKeyEvent_getAction(event: *AInputEvent) i32;
-extern fn AKeyEvent_getKeyCode(event: *AInputEvent) i32;
 
 // `<android/configuration.h>` — the density bucket in dpi (160, 240, 320,
 // 420, 480, 560, 640…). 160 is Android's `dp` baseline, so `density / 160`
@@ -301,13 +236,53 @@ extern fn AConfiguration_getDensity(config: *AConfiguration) i32;
 const ACONFIGURATION_DENSITY_ANY: i32 = 0xfffe;
 const ACONFIGURATION_DENSITY_NONE: i32 = 0xffff;
 
-// ── Shell state ─────────────────────────────────────────────────────
-// `bgfx_ready` guards the per-frame tick: we only draw once the surface
-// exists and bgfx is initialized (between INIT_WINDOW and TERM_WINDOW).
-// `is_resumed` honors the activity pause/resume lifecycle — when paused
-// we keep pumping events but skip rendering.
-var bgfx_ready: bool = false;
-var is_resumed: bool = false;
+extern fn ALooper_wake(looper: *ALooper) void;
+
+// ── Shell state (per activity instance) ─────────────────────────────
+// One `Shell` per `run()`, i.e. per activity instance, reached from the
+// glue callbacks through `app.userData`. It used to be process globals,
+// which assumed one activity per process: a second instance started in
+// the same process (labelle-bgfx#143) then saw the first one's "bgfx is up"
+// and ticked a frame on its own thread, straight into bgfx's
+// "Must be called from main thread" assert.
+//
+// `bgfx_ready` guards the per-frame tick: this instance owns bgfx and it is
+// initialized against its surface. `is_resumed` honors the activity
+// pause/resume lifecycle — when paused we keep pumping events but skip
+// rendering. `waiting_logged` keeps the "waiting for handoff" line to once
+// per wait.
+const Shell = struct {
+    gen: u64,
+    bgfx_ready: bool = false,
+    is_resumed: bool = false,
+    waiting_logged: bool = false,
+};
+
+fn shellOf(app: *android_app) *Shell {
+    return @ptrCast(@alignCast(app.userData.?));
+}
+
+// ── bgfx ownership across activity instances (labelle-bgfx#143) ─────
+// bgfx is one per process and thread-affine; see `android_bgfx_owner.zig`
+// for the rules. Every arbiter call happens under `owner_mutex`, which is
+// taken from the app threads of every live instance and, via `focusHook`,
+// the UI thread. It is never held across a bgfx init or teardown.
+const Arbiter = @import("android_bgfx_owner.zig").Arbiter(*android_app);
+var owner_mutex: std.c.pthread_mutex_t = .{};
+var arbiter: Arbiter = .{};
+
+fn lockOwner() void {
+    _ = std.c.pthread_mutex_lock(&owner_mutex);
+}
+
+fn unlockOwner() void {
+    _ = std.c.pthread_mutex_unlock(&owner_mutex);
+}
+
+/// While waiting for another instance to hand bgfx over, poll this often (ms)
+/// instead of blocking: the handoff is signalled by the other thread's state,
+/// not by an event on this looper.
+const handoff_poll_ms: c_int = 16;
 
 // ── Immersive-mode UI-thread hook (bgfx-immersive) ──────────────────
 // Hiding the system bars (`WindowInsetsController.hide()`) MUST run on the
@@ -373,6 +348,13 @@ fn focusHook(activity: *ANativeActivity, has_focus: c_int) callconv(.c) void {
 /// window relayout, so it is where a degenerate surface gets fixed. The
 /// resulting APP_CMD_WINDOW_RESIZED is reconciled by the usual path.
 fn recoverDegenerateWindow(activity: *ANativeActivity) void {
+    // `window_for_ui` is the bgfx OWNER's window. With two instances alive
+    // (#143) the focus change can belong to the other one, whose window
+    // this size says nothing about.
+    lockOwner();
+    const is_owner = if (arbiter.owner) |owner| owner.activity == activity else false;
+    unlockOwner();
+    if (!is_owner) return;
     const w = @atomicLoad(?*ANativeWindow, &window_for_ui, .acquire) orelse return;
     const size = [2]i32{ ANativeWindow_getWidth(w), ANativeWindow_getHeight(w) };
     if (!window.isDegenerateSurface(size)) return;
@@ -454,6 +436,16 @@ var init_fn: ?InitFn = null;
 /// (app backgrounded then resumed) re-creates the bgfx surface but must
 /// NOT re-run engine/scene init — the engine state persists across the
 /// surface teardown. Only the very first surface fires the game's init.
+///
+/// Once per PROCESS, not per activity instance (#143). The generated
+/// `main.zig` keeps the game in a process global and never deinits it, so
+/// a later activity in the same process — concurrent with the old one, or
+/// relaunched into a cached process after the old one was destroyed — finds
+/// the engine alive and restores it. This used to be reset on
+/// APP_CMD_DESTROY, which made that later activity run `init_fn` again over
+/// the live game: a second `AssembledGame.init` over the first, whose asset
+/// worker thread was still running, SIGSEGV'd in `SpscRing.tryDequeue` on
+/// the overwritten memory.
 var init_done: bool = false;
 
 /// Register the one-shot surface-ready (engine init) callback. Call from
@@ -494,64 +486,128 @@ pub fn setSurfaceRestoredCallback(cb: SurfaceFn) void {
     surface_restored_fn = cb;
 }
 
+// ── bgfx bring-up / teardown, gated on ownership (#143) ─────────────
+
+/// Bring bgfx up against this instance's window if it may own it. Called on
+/// INIT_WINDOW and, while another instance still holds bgfx, retried every
+/// loop iteration until the handoff lands. Only ever runs on `app`'s own
+/// thread, which becomes bgfx's API thread.
+fn acquireBgfx(app: *android_app, shell: *Shell) void {
+    if (shell.bgfx_ready) return;
+    const w = app.window orelse return;
+
+    lockOwner();
+    const claim = arbiter.claim(app, shell.gen);
+    // Wake the owner so it notices the request even while it is paused and
+    // blocked in `ALooper_pollOnce(-1)`. Under the lock: the owner releases
+    // (under the same lock) before its `run()` returns, so its looper is
+    // still alive here.
+    if (claim == .requested_yield) {
+        if (arbiter.owner.?.looper) |looper| ALooper_wake(looper);
+    }
+    unlockOwner();
+
+    switch (claim) {
+        // `already_owner` without `bgfx_ready` cannot happen (the two change
+        // together); should it ever, bringing bgfx up is still correct.
+        .granted, .already_owner => {},
+        .requested_yield, .wait => {
+            if (!shell.waiting_logged) {
+                shell.waiting_logged = true;
+                if (claim == .requested_yield)
+                    std.log.info("bgfx: an older activity instance still owns bgfx; waiting for it to hand over (#143)", .{})
+                else
+                    std.log.info("bgfx: a newer activity instance owns bgfx; this one stays dark (#143)", .{});
+            }
+            return;
+        },
+    }
+    shell.waiting_logged = false;
+
+    // Hand the window module this instance's ANativeWindow and bring bgfx
+    // up against it.
+    @atomicStore(?*ANativeWindow, &window_for_ui, w, .release);
+    window.setAndroidNativeWindow(@ptrCast(w));
+    const width = ANativeWindow_getWidth(w);
+    const height = ANativeWindow_getHeight(w);
+    const ww: i32 = if (width > 0) width else default_width;
+    const wh: i32 = if (height > 0) height else default_height;
+    // Always the NEW window's size — never the dims cached before a
+    // TERM_WINDOW: a resume can come back in the other orientation,
+    // and the fit/projection are derived from `window.width()/
+    // height()` every frame, so trusting the old geometry here
+    // would stretch the first restored frames (#66).
+    window.initWindow(ww, wh, "labelle");
+    shell.bgfx_ready = true;
+    std.log.info("bgfx: INIT_WINDOW surface {d}x{d}", .{ ww, wh });
+
+    // Cold init vs. surface restore (#386 Phase 4). The very
+    // first INIT_WINDOW runs the game's one-shot engine/scene
+    // init (`init_fn`) — engine state is built once and survives
+    // every later TERM/INIT cycle. A LATER INIT_WINDOW (resume
+    // after backgrounding) re-creates the bgfx surface against a
+    // brand-new context; the engine must rebuild its GPU catalog
+    // (sprites), so we fire `surface_restored_fn` instead.
+    // surfaceRestored therefore fires ONLY in the `else` — never
+    // on the first window. A later activity instance in the same
+    // process (#143) is a restore too: the engine state is
+    // process-wide (see `init_done`) and the previous owner fired
+    // `surface_lost_fn` when it let go of bgfx.
+    if (!init_done) {
+        init_done = true;
+        if (init_fn) |cb| cb();
+        std.log.info("bgfx: first surface (cold init)", .{});
+    } else {
+        if (surface_restored_fn) |cb| cb();
+        std.log.info("bgfx: re-init against new surface (restore)", .{});
+    }
+}
+
+/// Tear bgfx down on this (owning) instance's thread and give up ownership.
+///
+/// Ordering is LOAD-BEARING: notify the engine FIRST (`surface_lost_fn`) so
+/// it forgets its catalog handles while they're still nominally valid, THEN
+/// tear bgfx down (`teardownSurface` = shutdownPrograms-then-shutdown), THEN
+/// drop the native handle so a later INIT_WINDOW re-inits cleanly — in this
+/// instance or the next one. The engine outlives every activity instance
+/// (see `init_done`), so every release is followed by a restore, and the
+/// engine is always told.
+fn releaseBgfx(app: *android_app, shell: *Shell) void {
+    if (!shell.bgfx_ready) return;
+    @atomicStore(?*ANativeWindow, &window_for_ui, null, .release);
+    if (surface_lost_fn) |cb| cb();
+    window.teardownSurface();
+    window.setAndroidNativeWindow(null);
+    shell.bgfx_ready = false;
+    lockOwner();
+    arbiter.release(app);
+    unlockOwner();
+}
+
 // ── Lifecycle: APP_CMD_* handler ────────────────────────────────────
 fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
+    const shell = shellOf(app);
     switch (cmd) {
         APP_CMD_INIT_WINDOW => {
-            // A new ANativeWindow is ready. Hand it to the window module
-            // and bring bgfx up against it.
-            if (app.window) |w| {
-                @atomicStore(?*ANativeWindow, &window_for_ui, w, .release);
-                window.setAndroidNativeWindow(@ptrCast(w));
-                const width = ANativeWindow_getWidth(w);
-                const height = ANativeWindow_getHeight(w);
-                const ww: i32 = if (width > 0) width else default_width;
-                const wh: i32 = if (height > 0) height else default_height;
-                // Always the NEW window's size — never the dims cached before a
-                // TERM_WINDOW: a resume can come back in the other orientation,
-                // and the fit/projection are derived from `window.width()/
-                // height()` every frame, so trusting the old geometry here
-                // would stretch the first restored frames (#66).
-                window.initWindow(ww, wh, "labelle");
-                bgfx_ready = true;
-                std.log.info("bgfx: INIT_WINDOW surface {d}x{d}", .{ ww, wh });
-
-                // Cold init vs. surface restore (#386 Phase 4). The very
-                // first INIT_WINDOW runs the game's one-shot engine/scene
-                // init (`init_fn`) — engine state is built once and survives
-                // every later TERM/INIT cycle. A LATER INIT_WINDOW (resume
-                // after backgrounding) re-creates the bgfx surface against a
-                // brand-new context; the engine must rebuild its GPU catalog
-                // (sprites), so we fire `surface_restored_fn` instead.
-                // surfaceRestored therefore fires ONLY in the `else` — never
-                // on the first window.
-                if (!init_done) {
-                    init_done = true;
-                    if (init_fn) |cb| cb();
-                    std.log.info("bgfx: first surface (cold init)", .{});
-                } else {
-                    if (surface_restored_fn) |cb| cb();
-                    std.log.info("bgfx: re-init against new surface (restore)", .{});
-                }
-            }
+            // A new ANativeWindow is ready. Bring bgfx up against it, or,
+            // if a previous activity instance in this process still holds
+            // bgfx, ask it to hand over; `run` retries until it has (#143).
+            acquireBgfx(app, shell);
         },
         APP_CMD_TERM_WINDOW => {
-            @atomicStore(?*ANativeWindow, &window_for_ui, null, .release);
             // The surface is going away — bgfx destroys the GPU context AND
-            // every texture/shader. Ordering is LOAD-BEARING: notify the
-            // engine FIRST (`surface_lost_fn`) so it forgets its catalog
-            // handles while they're still nominally valid, THEN tear bgfx
-            // down (`teardownSurface` = shutdownPrograms-then-shutdown), THEN
-            // drop the native handle so a later INIT_WINDOW re-inits cleanly.
-            if (bgfx_ready) {
-                if (surface_lost_fn) |cb| cb();
-                window.teardownSurface();
-                bgfx_ready = false;
-                window.setAndroidNativeWindow(null);
+            // every texture/shader (see `releaseBgfx` for the ordering). An
+            // instance that does not own bgfx has nothing to tear down and
+            // must NOT touch the window module: that state is the owner's.
+            if (shell.bgfx_ready) {
+                releaseBgfx(app, shell);
                 std.log.info("bgfx: shutdownPrograms + bgfx.shutdown (surface lost)", .{});
-            } else {
-                window.setAndroidNativeWindow(null);
             }
+            // No window, no claim: drop any reservation made while waiting.
+            lockOwner();
+            arbiter.withdraw(app);
+            unlockOwner();
+            shell.waiting_logged = false;
         },
         // In-place surface geometry changes (labelle-bgfx#66). A rotation under
         // `sensorLandscape`, a resume that lands in the other orientation, or a
@@ -566,168 +622,33 @@ fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
         // makes the outcome independent of which command showed up. Only
         // while bgfx is up — with no surface there is nothing to reconcile.
         APP_CMD_WINDOW_RESIZED, APP_CMD_CONFIG_CHANGED, APP_CMD_CONTENT_RECT_CHANGED => {
-            if (bgfx_ready) window.reconcileSurface(switch (cmd) {
+            if (shell.bgfx_ready) window.reconcileSurface(switch (cmd) {
                 APP_CMD_WINDOW_RESIZED => "APP_CMD_WINDOW_RESIZED",
                 APP_CMD_CONFIG_CHANGED => "APP_CMD_CONFIG_CHANGED",
                 else => "APP_CMD_CONTENT_RECT_CHANGED",
             });
         },
         APP_CMD_GAINED_FOCUS, APP_CMD_RESUME, APP_CMD_START => {
-            is_resumed = true;
+            shell.is_resumed = true;
             // Immersive re-hide is NOT driven from here: it must run on the
             // UI thread, and this handler runs on the glue's app thread. The
             // re-hide is driven by `focusHook` (chained onWindowFocusChanged),
             // which the framework invokes on the UI thread on focus gain.
         },
         APP_CMD_LOST_FOCUS, APP_CMD_PAUSE, APP_CMD_STOP => {
-            is_resumed = false;
+            shell.is_resumed = false;
         },
         APP_CMD_DESTROY => {
             // Surface should already be gone via TERM_WINDOW; be defensive.
-            // Route through the same shutdownPrograms-then-shutdown order as
-            // the surface-lost path (via `closeWindow`, which also drops the
-            // native-window handle), but do NOT fire `surface_lost_fn`: the
-            // engine is about to deinit, so there's no restore to prepare for
-            // and notifying it would race its own teardown.
-            if (bgfx_ready) {
-                window.closeWindow();
-                bgfx_ready = false;
-            }
-            is_resumed = false;
-            // Reset the cold-start guard. `init_done` is module-global, so if
-            // Android keeps the process cached after destroying the Activity, a
-            // later relaunch's first INIT_WINDOW would otherwise take the RESTORE
-            // branch (`surfaceRestored`) against deinitialized/stale engine state
-            // instead of a clean cold init (`init_fn`) → crash. Resetting here
-            // guarantees the next Activity launch cold-inits. (Gemini + CodeRabbit.)
-            init_done = false;
+            // Same order as the surface-lost path, `surface_lost_fn`
+            // included: the engine survives this activity and the next one
+            // restores it. `init_done` is deliberately NOT reset here (#143,
+            // see its declaration).
+            releaseBgfx(app, shell);
+            shell.is_resumed = false;
         },
         else => {},
     }
-}
-
-// ── Input: AInputEvent handler (touch + gamepad) ────────────────────
-// Returns 1 ("handled") for events we consume, 0 otherwise so the glue lets
-// the system process them. Two paths:
-//
-//   * Touch (motion events from a touchscreen / mouse-like source) is mapped
-//     to the backend's pointer model: pointer 0's (x, y) becomes the mouse
-//     position and down/up drives mouse button 0, exactly how `input.zig`
-//     reports the desktop mouse — so the engine's existing mouse-driven
-//     UI/hit-testing sees touch with no engine-side changes.
-//   * Gamepad (#310 Stage 4): KEY events carry BUTTON_*/DPAD_* keycodes;
-//     JOYSTICK-source MOTION events carry analog sticks/triggers/hat. Both
-//     route into the shared `android_gamepad` state (via `input.zig`), keyed
-//     by `AInputEvent_getDeviceId` (the same id the JNI detection registry
-//     emits as its hotplug slot), so the engine's gamepad queries resolve.
-fn onInputEvent(app: *android_app, event: *AInputEvent) callconv(.c) c_int {
-    _ = app;
-    const etype = AInputEvent_getType(event);
-    const source = AInputEvent_getSource(event);
-    const device_id = AInputEvent_getDeviceId(event);
-
-    if (etype == AINPUT_EVENT_TYPE_KEY) {
-        // Controller buttons (BUTTON_A/B/X/Y, L1/R1/L2/R2, thumbs, start/
-        // select/mode) and DPAD_* arrive as key events. Forward the raw
-        // keycode; the shared state module maps it to a canonical button
-        // (and ignores non-gamepad keys).
-        const keycode = AKeyEvent_getKeyCode(event);
-        const action = AKeyEvent_getAction(event);
-        if (action == AKEY_EVENT_ACTION_DOWN) {
-            input.applyGamepadKey(device_id, keycode, true);
-        } else if (action == AKEY_EVENT_ACTION_UP) {
-            input.applyGamepadKey(device_id, keycode, false);
-        }
-        // Consume BACK when it comes from a gamepad/joystick (controllers map
-        // B/select to AKEYCODE_BACK) so it doesn't quit the activity; leave
-        // the genuine system BACK (touchscreen/system source) unhandled so it
-        // still navigates. Other gamepad keys stay unconsumed (return 0) —
-        // the system does nothing useful with BUTTON_*/DPAD_*, and consuming
-        // them all would swallow HOME/volume on odd devices.
-        const from_pad = (source & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD or
-            (source & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK;
-        if (keycode == AKEYCODE_BACK and from_pad) return 1;
-        return 0;
-    }
-
-    if (etype != AINPUT_EVENT_TYPE_MOTION) return 0;
-
-    // Joystick-source motion = gamepad analog axes (sticks, triggers, hat).
-    // Sample the raw MotionEvent axes into the forwarded-axis buffer the
-    // shared state module expects (FA_* order) and forward; the state module
-    // applies the per-device axis-routing quirk on read.
-    if ((source & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK) {
-        var axes = [_]f32{0} ** input.GAMEPAD_AXIS_COUNT;
-        // FA_* layout (android_gamepad_state.zig): X, Y, Z, RZ, RX, RY,
-        // LTRIGGER, RTRIGGER, GAS, BRAKE, HAT_X, HAT_Y.
-        axes[0] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_X, 0);
-        axes[1] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_Y, 0);
-        axes[2] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_Z, 0);
-        axes[3] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_RZ, 0);
-        axes[4] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_RX, 0);
-        axes[5] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_RY, 0);
-        axes[6] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_LTRIGGER, 0);
-        axes[7] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_RTRIGGER, 0);
-        axes[8] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_GAS, 0);
-        axes[9] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_BRAKE, 0);
-        axes[10] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_HAT_X, 0);
-        axes[11] = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_HAT_Y, 0);
-        input.applyGamepadMotion(device_id, axes);
-        return 1;
-    }
-
-    const action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
-
-    // Primary pointer (index 0) position drives the pointer location.
-    const count = AMotionEvent_getPointerCount(event);
-    if (count > 0) {
-        const x = AMotionEvent_getX(event, 0);
-        const y = AMotionEvent_getY(event, 0);
-        input.setTouchPointer(0, x, y, AMotionEvent_getPointerId(event, 0));
-    }
-
-    // Feed the FULL multi-touch set for the camera's pinch-zoom / two-finger /
-    // one-finger-pan gestures (additive to the single-pointer mouse emulation
-    // below). On UP/CANCEL every finger is gone; on POINTER_UP the lifting
-    // pointer is still present in the event, so exclude it.
-    if (action == AMOTION_EVENT_ACTION_UP or action == AMOTION_EVENT_ACTION_CANCEL) {
-        input.setAndroidTouches(&.{}, &.{});
-    } else {
-        const up_index: i32 = if (action == AMOTION_EVENT_ACTION_POINTER_UP)
-            (AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT
-        else
-            -1;
-        var xs: [10]f32 = undefined;
-        var ys: [10]f32 = undefined;
-        var n: usize = 0;
-        var i: usize = 0;
-        while (i < count and n < xs.len) : (i += 1) {
-            if (@as(i32, @intCast(i)) == up_index) continue; // this finger is lifting
-            xs[n] = AMotionEvent_getX(event, i);
-            ys[n] = AMotionEvent_getY(event, i);
-            n += 1;
-        }
-        input.setAndroidTouches(xs[0..n], ys[0..n]);
-    }
-
-    // We model a single pointer (finger 0). Only the FIRST finger going
-    // down (ACTION_DOWN) and the LAST finger coming up (ACTION_UP) change
-    // the down-state. POINTER_DOWN/POINTER_UP are secondary fingers in a
-    // multi-touch gesture — the primary is still down, so they must NOT
-    // release it; they only refresh the primary's position (done above).
-    switch (action) {
-        AMOTION_EVENT_ACTION_DOWN => {
-            input.setPointerDown(true);
-        },
-        AMOTION_EVENT_ACTION_UP, AMOTION_EVENT_ACTION_CANCEL => {
-            input.setPointerDown(false);
-            input.clearTouch();
-        },
-        // MOVE / POINTER_DOWN / POINTER_UP: position already refreshed
-        // above; keep the primary down-state unchanged.
-        else => {},
-    }
-    return 1;
 }
 
 /// The NativeActivity glue's entry point. The glue calls this on the app
@@ -739,6 +660,12 @@ fn onInputEvent(app: *android_app, event: *AInputEvent) callconv(.c) c_int {
 /// `android_native_app_glue.c` (which declares `extern void
 /// android_main(struct android_app*)`) links against it.
 pub fn run(app: *android_app) void {
+    // This instance's shell state lives on this frame for the whole of
+    // `run()`; the glue callbacks reach it through `app.userData`.
+    lockOwner();
+    var shell: Shell = .{ .gen = arbiter.begin() };
+    unlockOwner();
+    app.userData = &shell;
     app.onAppCmd = onAppCmd;
     app.onInputEvent = onInputEvent;
 
@@ -782,10 +709,17 @@ pub fn run(app: *android_app) void {
         //     frame.
         //   - idle → -1: blocks until an event arrives, so we don't spin
         //     while backgrounded / before the surface exists.
+        //   - waiting for another instance to hand bgfx over (#143) →
+        //     `handoff_poll_ms`, so the retry below runs without an event.
         // No early break — processing only one event per frame (the prior
         // bug) caps input throughput and adds latency.
         while (ALooper_pollOnce(
-            if (bgfx_ready and is_resumed) 0 else -1,
+            if (shell.bgfx_ready and shell.is_resumed)
+                0
+            else if (!shell.bgfx_ready and app.window != null)
+                handoff_poll_ms
+            else
+                -1,
             &fd,
             &events,
             &data,
@@ -799,18 +733,41 @@ pub fn run(app: *android_app) void {
 
         if (app.destroyRequested != 0) break;
 
+        // bgfx handoff between activity instances (#143). A newer instance
+        // with a window asked for bgfx: tear it down HERE, on the thread
+        // that is bgfx's API thread, and let the engine drop its GPU
+        // catalog — the new owner restores it.
+        if (shell.bgfx_ready) {
+            lockOwner();
+            const yield = arbiter.shouldYield(app);
+            unlockOwner();
+            if (yield) {
+                releaseBgfx(app, &shell);
+                std.log.info("bgfx: handed bgfx over to a newer activity instance (#143)", .{});
+            }
+        } else if (app.window != null) {
+            // We have a window but no bgfx: an older instance is still
+            // handing it over (or we just yielded to a newer one). Retry.
+            acquireBgfx(app, &shell);
+        }
+
         // Per-frame tick: only when the surface exists, bgfx is up, and
         // the activity is in the foreground.
-        if (bgfx_ready and is_resumed) {
+        if (shell.bgfx_ready and shell.is_resumed) {
             if (tick_fn) |cb| cb();
         }
     }
 
-    // Activity destroyed — make sure bgfx is torn down.
-    if (bgfx_ready) {
-        window.closeWindow();
-        bgfx_ready = false;
-    }
+    // Activity destroyed — make sure bgfx is torn down (on this thread, the
+    // only one allowed to) and forget this instance before its glue state
+    // and looper go away.
+    releaseBgfx(app, &shell);
+    lockOwner();
+    arbiter.end(app);
+    unlockOwner();
+    if (native_activity == app.activity) native_activity = null;
+    if (app_ptr == app) app_ptr = null;
+    app.userData = null;
 }
 
 // On Android, export the glue entry. The glue's C file declares
