@@ -854,6 +854,18 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(android_owner_tests).step);
 
+    // The pure half of the Android launch-intent → env mapping (#139): the
+    // allow-list and per-key set/unset decision. Std-only, so it RUNS on the
+    // host; the JNI read is covered by the Android compile-check below.
+    const android_intent_env_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/android_intent_env.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(android_intent_env_tests).step);
+
     addHeapGuard(b, test_step, optimize);
 
     // ── Unit tests for the shipped build hook ───────────────────────
@@ -1178,6 +1190,13 @@ pub fn build(b: *std.Build) void {
         // rationale and `__ANDROID__` gate as android_debuggable.c.
         android_app_mod.addCSourceFile(.{
             .file = b.path("src/android_window_relayout.c"),
+            .flags = &.{ "-std=c11", "-Wall" },
+        });
+        // Reads the launch intent's LABELLE_* string extras so the shell can
+        // turn them into env vars (labelle-bgfx#139). Same JNI-in-C rationale
+        // and `__ANDROID__` gate as android_debuggable.c.
+        android_app_mod.addCSourceFile(.{
+            .file = b.path("src/android_intent_extras.c"),
             .flags = &.{ "-std=c11", "-Wall" },
         });
 
