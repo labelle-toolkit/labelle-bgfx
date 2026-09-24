@@ -23,6 +23,7 @@ const std = @import("std");
 const bgfx = @import("zbgfx").bgfx;
 const core = @import("labelle-core");
 const programs = @import("programs.zig");
+const state = @import("state.zig");
 const texture = @import("texture.zig");
 const types = @import("types.zig");
 
@@ -449,15 +450,23 @@ var view_stack: [8]u16 = undefined;
 /// the first `view_stack.len` levels; deeper levels restore to the primary
 /// (acceptable degradation for absurd nesting) but never desync the counter.
 var stack_depth: usize = 0;
+/// The letterbox surface each open `begin` replaced, restored by `end`
+/// (#120): null = the framebuffer, else an enclosing target's size.
+var size_stack: [8]?[2]i32 = undefined;
 
 /// Point every subsequent draw at `rt`'s framebuffer. Balance with `end`.
 /// `touch` guarantees bgfx clears/processes the view even if the pass submits no
 /// draws — the same reason `window.beginFrame` touches the primary view.
 pub fn begin(rt: RenderTarget) void {
     if (!rt.isValid()) return;
-    if (stack_depth < view_stack.len) view_stack[stack_depth] = programs.activeView();
+    if (stack_depth < view_stack.len) {
+        view_stack[stack_depth] = programs.activeView();
+        size_stack[stack_depth] = state.targetSize();
+    }
     stack_depth += 1; // always, so `end` stays balanced even past capacity
     programs.setActiveView(rt.view);
+    // Draws now land in `rt`: letterbox into IT, not the framebuffer (#120).
+    state.setTargetSize(.{ rt.width, rt.height });
     bgfx.touch(rt.view);
 }
 
@@ -467,6 +476,7 @@ pub fn begin(rt: RenderTarget) void {
 pub fn end() void {
     if (stack_depth == 0) {
         programs.setActiveView(programs.PRIMARY_VIEW);
+        state.setTargetSize(null);
         return;
     }
     stack_depth -= 1;
@@ -475,6 +485,8 @@ pub fn end() void {
     else
         programs.PRIMARY_VIEW; // beyond the saved depth — best-effort
     programs.setActiveView(restore);
+    // Beyond the saved depth, fall back to the framebuffer, like the view.
+    state.setTargetSize(if (stack_depth < size_stack.len) size_stack[stack_depth] else null);
 }
 
 /// Composite a finished render target into the CURRENT view (call this OUTSIDE
