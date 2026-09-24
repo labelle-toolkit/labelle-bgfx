@@ -6,6 +6,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const state = @import("state.zig");
 const programs = @import("programs.zig");
+const rotated_rect = @import("rotated_rect.zig");
 
 const Color = types.Color;
 const Rectangle = types.Rectangle;
@@ -38,6 +39,33 @@ pub fn drawRectangleRec(rec: Rectangle, tint: Color) void {
         makeVertex(x0, y0, abgr), makeVertex(x1, y0, abgr), makeVertex(x1, y1, abgr),
         makeVertex(x0, y0, abgr), makeVertex(x1, y1, abgr), makeVertex(x0, y1, abgr),
     };
+    programs.submitFlatTriangles(&vertices);
+}
+
+/// Draw a filled rectangle of `width` x `height` centred on
+/// `(center_x, center_y)` and rotated by `rotation` radians about that
+/// centre (labelle-bgfx#98). labelle-core's shim dispatches here when the
+/// backend declares it; without it the shim can only OUTLINE a rotated
+/// rectangle, so a spinning filled square turned into a spinning outline.
+/// The corner math is shared with that shim's convention
+/// (`rotated_rect.zig`), so a fill here and an outline there cover the same
+/// pixels.
+pub fn drawRectanglePro(center_x: f32, center_y: f32, width: f32, height: f32, rotation: f32, tint: Color) void {
+    if (rotation == 0) {
+        // Exactly the axis-aligned path, so rotation 0 stays pixel-identical.
+        drawRectangleRec(.{
+            .x = center_x - width * 0.5,
+            .y = center_y - height * 0.5,
+            .width = width,
+            .height = height,
+        }, tint);
+        return;
+    }
+    const c = rotated_rect.corners(center_x, center_y, width, height, rotation);
+    const abgr = tint.toAbgr();
+    var v: [4]PosTexColorVertex = undefined;
+    for (c, 0..) |p, i| v[i] = makeVertex(state.transformX(p.x), state.transformY(p.y), abgr);
+    const vertices = [6]PosTexColorVertex{ v[0], v[1], v[2], v[0], v[2], v[3] };
     programs.submitFlatTriangles(&vertices);
 }
 

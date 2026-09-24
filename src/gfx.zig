@@ -89,6 +89,7 @@ pub const availTransientVertices = programs.availTransientVertices;
 // ── Draw primitives (Backend contract) ─────────────────────────────────
 
 pub const drawRectangleRec = draw.drawRectangleRec;
+pub const drawRectanglePro = draw.drawRectanglePro;
 pub const drawCircle = draw.drawCircle;
 pub const drawLine = draw.drawLine;
 pub const drawTriangle = draw.drawTriangle;
