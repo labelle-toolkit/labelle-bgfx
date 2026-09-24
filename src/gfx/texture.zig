@@ -5,6 +5,7 @@
 /// `destroyAllTextures` here on teardown so the bgfx handles get released
 /// in the same pass as the shader uniforms.
 const std = @import("std");
+const heap = @import("heap.zig");
 const bgfx = @import("zbgfx").bgfx;
 const core = @import("labelle-core");
 const types = @import("types.zig");
@@ -127,7 +128,7 @@ pub fn destroyAllTextures() void {
             texture_handles[i] = .{ .idx = std.math.maxInt(u16) };
         }
         if (texture_pixel_data[i]) |px| {
-            std.heap.page_allocator.free(px);
+            heap.allocator.free(px);
             texture_pixel_data[i] = null;
         }
     }
@@ -160,7 +161,7 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
     if (fseek(file, 0, SEEK_SET) != 0) return error.LoadFailed;
     const file_size: usize = @intCast(file_size_signed);
 
-    const allocator = std.heap.page_allocator;
+    const allocator = heap.allocator;
     const data = allocator.alloc(u8, file_size) catch return error.LoadFailed;
     defer allocator.free(data);
 
@@ -427,7 +428,7 @@ pub fn unloadTexture(texture: Texture) void {
             texture_handles[texture.id.toInt()] = .{ .idx = std.math.maxInt(u16) };
         }
         if (texture_pixel_data[texture.id.toInt()]) |px| {
-            std.heap.page_allocator.free(px);
+            heap.allocator.free(px);
             texture_pixel_data[texture.id.toInt()] = null;
         }
     }

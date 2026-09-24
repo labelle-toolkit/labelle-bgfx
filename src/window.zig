@@ -1,5 +1,6 @@
 /// bgfx window backend — windowing lifecycle via GLFW + bgfx frame management.
 const std = @import("std");
+const heap = @import("gfx").heap;
 const builtin = @import("builtin");
 const zbgfx = @import("zbgfx");
 const bgfx = zbgfx.bgfx;
@@ -866,7 +867,7 @@ pub fn captureHeadless(path: [:0]const u8) bool {
     const rb = bgfx.createTexture2D(w, h, false, 1, .RGBA8, bgfx.TextureFlags_BlitDst | bgfx.TextureFlags_ReadBack, null, 0);
     if (rb.idx == INVALID_HANDLE) return false;
 
-    const px = std.heap.page_allocator.alloc(u8, @as(usize, w) * @as(usize, h) * 4) catch {
+    const px = heap.allocator.alloc(u8, @as(usize, w) * @as(usize, h) * 4) catch {
         bgfx.destroyTexture(rb);
         return false;
     };
@@ -878,7 +879,7 @@ pub fn captureHeadless(path: [:0]const u8) bool {
     // stall, so leaking these two on that path is the safe trade.
     var readback_done = false;
     defer if (readback_done) {
-        std.heap.page_allocator.free(px);
+        heap.allocator.free(px);
         bgfx.destroyTexture(rb);
     };
 
@@ -1481,10 +1482,10 @@ const window_icon_supported = !no_glfw and builtin.target.os.tag != .macos;
 pub fn setWindowIconRgba(w: u32, h: u32, pixels: []const u8) void {
     if (comptime !window_icon_supported) return;
     const win = glfw_window orelse return;
-    // Short-lived scratch: three small buffers freed on the way out. The page
-    // allocator keeps this independent of the game's allocator, which the
-    // backend never sees.
-    const allocator = std.heap.page_allocator;
+    // Short-lived scratch: three small buffers freed on the way out. The
+    // backend allocator (`heap.zig`) keeps this independent of the game's
+    // allocator, which the backend never sees.
+    const allocator = heap.allocator;
     var set = window_icon.buildFrames(allocator, pixels, w, h) catch |err| {
         std.log.warn("bgfx: window icon ignored — {s} ({d}x{d}, {d} bytes)", .{ @errorName(err), w, h, pixels.len });
         return;
@@ -1505,7 +1506,7 @@ pub fn setWindowIconRgba(w: u32, h: u32, pixels: []const u8) void {
 pub fn setWindowIconPng(png_bytes: []const u8) void {
     if (comptime !window_icon_supported) return;
     if (glfw_window == null) return;
-    const allocator = std.heap.page_allocator;
+    const allocator = heap.allocator;
     const img = gfx.decodeImage("", png_bytes, allocator) catch |err| {
         std.log.warn("bgfx: window icon ignored — could not decode icon bytes ({s}, {d} bytes)", .{ @errorName(err), png_bytes.len });
         return;

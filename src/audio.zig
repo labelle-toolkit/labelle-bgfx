@@ -26,6 +26,7 @@
 /// `is_android` switch as before, so `miniaudio.h` is never seen on Android and
 /// the AAudio externs are never seen on desktop.
 const std = @import("std");
+const heap = @import("audio_heap.zig");
 const builtin = @import("builtin");
 const labelle_audio = @import("labelle-audio");
 
@@ -108,7 +109,7 @@ extern "c" fn ftell(stream: *std.c.FILE) c_long;
 /// null on any IO error or short read (a short `fread` can occur on EOF
 /// mid-read without setting an error flag, so we compare against the full
 /// requested size, see PR #227). Caller owns the returned slice and frees it
-/// via `std.heap.page_allocator`.
+/// via `heap.allocator`.
 fn readFileBytes(path: [:0]const u8) ?[]u8 {
     const file = std.c.fopen(path.ptr, "rb") orelse return null;
     defer _ = std.c.fclose(file);
@@ -119,7 +120,7 @@ fn readFileBytes(path: [:0]const u8) ?[]u8 {
     if (fseek(file, 0, SEEK_SET) != 0) return null;
     const file_size: usize = @intCast(file_size_signed);
 
-    const allocator = std.heap.page_allocator;
+    const allocator = heap.allocator;
     const data = allocator.alloc(u8, file_size) catch return null;
 
     const bytes_read = std.c.fread(data.ptr, 1, file_size, file);
@@ -138,7 +139,7 @@ fn readFileBytes(path: [:0]const u8) ?[]u8 {
 /// decode + the PCM). Returns the sound id, or 0 on failure.
 pub fn loadSound(path: [:0]const u8) u32 {
     const bytes = readFileBytes(path) orelse return 0;
-    defer std.heap.page_allocator.free(bytes);
+    defer heap.allocator.free(bytes);
     return Audio.loadSoundFromMemory(bytes);
 }
 
@@ -168,7 +169,7 @@ pub fn setSoundVolume(id: u32, volume: f32) void {
 /// libc file-read shim as `loadSound`. Returns the music id, or 0 on failure.
 pub fn loadMusic(path: [:0]const u8) u32 {
     const bytes = readFileBytes(path) orelse return 0;
-    defer std.heap.page_allocator.free(bytes);
+    defer heap.allocator.free(bytes);
     return Audio.loadMusicFromMemory(bytes);
 }
 
