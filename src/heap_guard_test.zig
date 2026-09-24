@@ -26,9 +26,24 @@ const allowed = [_][]const u8{
     "video/test_decode.zig",
 };
 
+/// `path` as the walker returns it: native separators, so `\\` on Windows.
 fn isAllowed(path: []const u8) bool {
-    for (allowed) |a| if (std.mem.eql(u8, path, a)) return true;
+    for (allowed) |a| {
+        if (a.len != path.len) continue;
+        const same = for (a, path) |x, y| {
+            const yy: u8 = if (y == '\\') '/' else y;
+            if (x != yy) break false;
+        } else true;
+        if (same) return true;
+    }
     return false;
+}
+
+test "the allowlist matches Windows-style walker paths" {
+    try std.testing.expect(isAllowed("gfx/heap.zig"));
+    try std.testing.expect(isAllowed("gfx\\heap.zig"));
+    try std.testing.expect(isAllowed("video\\apk\\native.zig"));
+    try std.testing.expect(!isAllowed("gfx\\texture.zig"));
 }
 
 test "no production file names std.heap.page_allocator" {

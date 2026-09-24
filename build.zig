@@ -772,19 +772,7 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(screenshot_path_tests).step);
 
-    // ── Guard: no direct page_allocator in production code ──────────
-    // On wasm page_allocator corrupts emscripten's malloc heap (see
-    // src/heap.zig). The test walks src/, so it runs from the repo root.
-    const heap_guard_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/heap_guard_test.zig"),
-            .target = b.graph.host,
-            .optimize = optimize,
-        }),
-    });
-    const heap_guard_run = b.addRunArtifact(heap_guard_tests);
-    heap_guard_run.setCwd(b.path("."));
-    test_step.dependOn(&heap_guard_run.step);
+    addHeapGuard(b, test_step, optimize);
 
     // ── Unit tests for the shipped build hook ───────────────────────
     // `backend.hook.zig` is std-only (it's the file the assembler stages
@@ -1445,7 +1433,26 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // A `test` step is expected by CI even on wasm; wire a no-op so `zig build
     // test -Dtarget=wasm32-emscripten` succeeds (the real unit tests run on the
     // host target in the desktop/android graph).
-    _ = b.step("test", "(wasm target: unit tests run on the host graph)");
+    // The heap guard is the one host test that also runs here: it exists
+    // for the wasm build (page_allocator corrupts emscripten's heap).
+    const test_step = b.step("test", "(wasm target: unit tests run on the host graph; the heap guard runs here too)");
+    addHeapGuard(b, test_step, optimize);
+}
+
+/// Guard: no direct page_allocator in production code. On wasm it corrupts
+/// emscripten's malloc heap (see src/gfx/heap.zig). The test walks src/, so
+/// it always runs on the HOST, from the repo root, in both build graphs.
+fn addHeapGuard(b: *std.Build, test_step: *std.Build.Step, optimize: std.builtin.OptimizeMode) void {
+    const heap_guard_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/heap_guard_test.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const heap_guard_run = b.addRunArtifact(heap_guard_tests);
+    heap_guard_run.setCwd(b.path("."));
+    test_step.dependOn(&heap_guard_run.step);
 }
 
 /// Attach miniaudio's implementation TU + include path, and link the
