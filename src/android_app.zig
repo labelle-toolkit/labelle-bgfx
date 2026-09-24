@@ -762,8 +762,10 @@ pub fn run(app: *android_app) void {
     // Launch-intent extras → env vars (labelle-bgfx#139), BEFORE the loop: the
     // game's first `getenv` of a run option is in `init_fn` (engine + scene
     // init, fired on the first INIT_WINDOW, which only this loop can deliver),
-    // so everything read from there on sees the copied values. Needs
-    // `native_activity`, stashed just above, for the debuggable gate.
+    // so everything read from there on sees the copied values. The extras are
+    // read from THIS activity's intent. The debuggable gate reads
+    // `native_activity`, which can still be a previous instance while it owns
+    // bgfx (#143); it is the same package, so the answer is the same.
     if (app.activity) |activity| applyLaunchIntentEnv(activity);
 
     // Chain `onWindowFocusChanged` so the engine's immersive re-hide runs
