@@ -965,7 +965,12 @@ var intent_env_state: intent_env.State = .{};
 /// needed for the duration of `applyLaunchIntentEnv`.
 var intent_buf: [4096]u8 = undefined;
 
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
 const LibcEnv = struct {
+    pub fn get(_: LibcEnv, name: [:0]const u8) ?[:0]const u8 {
+        return if (getenv(name.ptr)) |v| std.mem.span(v) else null;
+    }
     pub fn set(_: LibcEnv, name: [:0]const u8, value: [:0]const u8) bool {
         return setenv(name.ptr, value.ptr, 1) == 0;
     }
