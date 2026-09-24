@@ -93,8 +93,8 @@
         // For local integration against a working copy of core, prefer
         // `-Dcore-source=/path/to/labelle-core/src/root.zig`.
         .labelle_core = .{
-            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v2.0.0.tar.gz",
-            .hash = "labelle_core-2.0.0-OauRcPGlBwCXfrDJneAcTZoHhXiFnsO3pCCBA3L0_Nup",
+            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v2.1.0.tar.gz",
+            .hash = "labelle_core-2.1.0-OauRcEmpBwB-EUz284qa13cc2A5eu3u1L1avd_FDF0JF",
         },
         // Shared audio engine (pluggable-backends RFC, Phase 2). The bgfx
         // backend's `src/audio.zig` collapses its duplicated WAV decode + PCM
