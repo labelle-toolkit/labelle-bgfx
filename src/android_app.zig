@@ -330,7 +330,10 @@ fn wakeParkedLocked() void {
 }
 
 /// Point the process-wide accessors (`native_activity`, `app_ptr`) at `app`.
-fn adoptAccessors(app: *android_app) void {
+/// Every write to them happens under `owner_mutex` (this and the clear at the
+/// end of `run`), so an exiting instance's "is it still mine? then clear"
+/// cannot interleave with a new owner's adoption and wipe it.
+fn adoptAccessorsLocked(app: *android_app) void {
     @atomicStore(?*ANativeActivity, &native_activity, app.activity, .release);
     @atomicStore(?*android_app, &app_ptr, app, .release);
 }
@@ -366,6 +369,10 @@ pub fn setImmersiveCallback(cb: ImmersiveCb) void {
     immersive_cb = cb;
 }
 
+/// The activity whose focus change `focusHook` is handling, while it runs the
+/// immersive callback. Thread-local: only that UI-thread call sees it.
+threadlocal var focus_activity: ?*ANativeActivity = null;
+
 /// The NDK glue's original `onWindowFocusChanged`, saved so `focusHook`
 /// can forward to it. Set in `run()` before `focusHook` is installed.
 var glue_focus_cb: ?*const fn (*ANativeActivity, c_int) callconv(.c) void = null;
@@ -380,6 +387,13 @@ extern "c" fn labelle_bgfx_force_window_relayout(vm: ?*anyopaque, clazz: ?*anyop
 fn focusHook(activity: *ANativeActivity, has_focus: c_int) callconv(.c) void {
     if (glue_focus_cb) |cb| cb(activity, has_focus);
     if (has_focus != 0) {
+        // The immersive callback finds its activity through
+        // `labelle_bgfx_get_native_activity`, which normally answers the bgfx
+        // owner. A newly focused activity may still be waiting for the
+        // handoff (#143), so answer with THIS activity for the duration of
+        // the callback; it runs synchronously, on this thread.
+        focus_activity = activity;
+        defer focus_activity = null;
         if (immersive_cb) |cb| cb();
         recoverDegenerateWindow(activity);
     }
@@ -567,6 +581,8 @@ fn acquireBgfx(app: *android_app, shell: *Shell) void {
         unparkLocked(app);
         shell.parked = false;
     }
+    // The engine runs on the owner's thread: its JNI / density seams follow.
+    if (claim == .granted or claim == .already_owner) adoptAccessorsLocked(app);
     unlockOwner();
 
     switch (claim) {
@@ -588,7 +604,6 @@ fn acquireBgfx(app: *android_app, shell: *Shell) void {
 
     // Hand the window module this instance's ANativeWindow and bring bgfx
     // up against it.
-    adoptAccessors(app);
     window.setAndroidNativeWindow(@ptrCast(w));
     const width = ANativeWindow_getWidth(w);
     const height = ANativeWindow_getHeight(w);
@@ -740,7 +755,9 @@ pub fn run(app: *android_app) void {
     // `app.config` density. The glue has populated `app.activity` by the
     // time it calls us. Only when unset: an instance that owns bgfx keeps
     // them until it lets go (#143); this one adopts them when it gets bgfx.
-    if (@atomicLoad(?*android_app, &app_ptr, .acquire) == null) adoptAccessors(app);
+    lockOwner();
+    if (app_ptr == null) adoptAccessorsLocked(app);
+    unlockOwner();
 
     // Chain `onWindowFocusChanged` so the engine's immersive re-hide runs
     // on the UI thread (the only thread `WindowInsetsController.hide()` is
@@ -831,12 +848,12 @@ pub fn run(app: *android_app) void {
     lockOwner();
     arbiter.end(app);
     unparkLocked(app);
-    wakeParkedLocked();
-    unlockOwner();
-    if (@atomicLoad(?*android_app, &app_ptr, .acquire) == app) {
+    if (app_ptr == app) {
         @atomicStore(?*ANativeActivity, &native_activity, null, .release);
         @atomicStore(?*android_app, &app_ptr, null, .release);
     }
+    wakeParkedLocked();
+    unlockOwner();
     app.userData = null;
 }
 
@@ -863,7 +880,7 @@ comptime {
 /// below; the bgfx Android backend adapter (`android.zig`) binds the C symbol
 /// to populate core's `AndroidBackendContext.get_native_activity`.
 pub fn getNativeActivity() ?*anyopaque {
-    return @ptrCast(@atomicLoad(?*ANativeActivity, &native_activity, .acquire));
+    return getNativeActivityC();
 }
 
 /// The app's private internal data directory (`/data/data/<package>/files`),
@@ -921,6 +938,7 @@ pub fn isDebuggable() bool {
 /// adapter's undefined ref in the final `.so` link. Android-only — emitted in
 /// the `comptime` block below.
 fn getNativeActivityC() callconv(.c) ?*anyopaque {
+    if (focus_activity) |activity| return @ptrCast(activity); // see `focusHook`
     return @ptrCast(@atomicLoad(?*ANativeActivity, &native_activity, .acquire));
 }
 
