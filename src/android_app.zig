@@ -295,6 +295,10 @@ extern fn AKeyEvent_getKeyCode(event: *AInputEvent) i32;
 // is the normalized UI scale (a 320dpi phone → 2.0, the 213dpi P42 → ~1.33).
 // Linked from libandroid, same as the input/window symbols above.
 extern fn AConfiguration_getDensity(config: *AConfiguration) i32;
+// Two-letter ISO-639 language / ISO-3166 country codes, written into a
+// 2-byte buffer with NO terminator; zeroed when unset.
+extern fn AConfiguration_getLanguage(config: *AConfiguration, out: *[2]u8) void;
+extern fn AConfiguration_getCountry(config: *AConfiguration, out: *[2]u8) void;
 // Two distinct "no usable density" sentinels, and BOTH have to be rejected:
 // they are ordinary positive i32 values, so a `> 0` test lets them through
 // and `density / 160` then yields ~409, not the 1.0 a caller expects.
@@ -419,6 +423,28 @@ export fn labelle_bgfx_display_scale() callconv(.c) f32 {
     const density = AConfiguration_getDensity(config);
     if (density <= 0 or density == ACONFIGURATION_DENSITY_ANY or density == ACONFIGURATION_DENSITY_NONE) return 1.0;
     return @as(f32, @floatFromInt(density)) / 160.0;
+}
+
+/// The device locale on Android as `ll` or `ll-CC` (e.g. `pt-BR`), written
+/// into `buf`; returns the length, 0 before `run` has stashed the app or when
+/// the configuration carries no language. Exported as a C symbol for
+/// `window.systemLocale()`, same bridge as `labelle_bgfx_display_scale`. The
+/// configuration reflects a per-app language chosen in system settings too.
+export fn labelle_bgfx_system_locale(buf: [*]u8, len: usize) callconv(.c) usize {
+    const app = app_ptr orelse return 0;
+    const config = app.config orelse return 0;
+    var lang: [2]u8 = .{ 0, 0 };
+    var country: [2]u8 = .{ 0, 0 };
+    AConfiguration_getLanguage(config, &lang);
+    AConfiguration_getCountry(config, &country);
+    if (lang[0] == 0 or len < 2) return 0;
+    buf[0] = lang[0];
+    buf[1] = lang[1];
+    if (country[0] == 0 or len < 5) return 2;
+    buf[2] = '-';
+    buf[3] = country[0];
+    buf[4] = country[1];
+    return 5;
 }
 
 /// Optional per-frame tick callback, set by the game's entry before it

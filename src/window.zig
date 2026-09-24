@@ -191,6 +191,79 @@ pub fn displayScale() f32 {
     return 1.0;
 }
 
+/// The device's preferred language as a BCP-47-ish tag (`pt-BR`, `en`,
+/// `pt_BR.UTF-8` on Linux), written into `buf` — the input the generated
+/// i18n module's `applySystemLocale` resolves against the shipped locales
+/// (it normalizes separators/suffixes and falls back to the language
+/// subtag). Null when the platform reports nothing usable, which leaves the
+/// project's `.i18n.default` active. Per platform:
+///   * Android — the activity configuration's language + country
+///     (`AConfiguration_getLanguage/getCountry`), which also reflects a
+///     per-app language picked in system settings.
+///   * Wasm    — `navigator.language`.
+///   * macOS   — the first of the user's preferred languages (CoreFoundation),
+///     which is set for Finder-launched apps that have no `LANG`.
+///   * Windows — `GetUserDefaultLocaleName`.
+///   * Linux   — `LC_ALL` → `LC_MESSAGES` → `LANG`, skipping `C`/`POSIX`.
+pub fn systemLocale(buf: []u8) ?[]const u8 {
+    if (comptime is_android) return nonEmpty(buf[0..labelle_bgfx_system_locale(buf.ptr, buf.len)]);
+    if (comptime is_wasm) return copyTag(buf, std.mem.span(em.emscripten_run_script_string("navigator.language||''")));
+    switch (comptime builtin.target.os.tag) {
+        .macos => return macosPreferredLanguage(buf),
+        .windows => {
+            var wide: [85]u16 = undefined; // LOCALE_NAME_MAX_LENGTH
+            const n = GetUserDefaultLocaleName(&wide, wide.len);
+            if (n <= 1) return null; // count includes the terminating NUL
+            const len = @min(@as(usize, @intCast(n - 1)), buf.len);
+            // Locale names are ASCII (`pt-BR`, `zh-Hant-TW`).
+            for (wide[0..len], 0..) |c, i| buf[i] = if (c < 0x80) @intCast(c) else '?';
+            return buf[0..len];
+        },
+        else => {
+            for ([_][*:0]const u8{ "LC_ALL", "LC_MESSAGES", "LANG" }) |name| {
+                const raw = std.mem.span(std.c.getenv(name) orelse continue);
+                if (raw.len == 0) continue;
+                // The first variable that is set decides; `C`/`POSIX` means
+                // "no language", not "try the next one".
+                if (std.mem.eql(u8, raw, "C") or std.mem.eql(u8, raw, "POSIX")) return null;
+                return copyTag(buf, raw);
+            }
+            return null;
+        },
+    }
+}
+
+fn copyTag(buf: []u8, tag: []const u8) ?[]const u8 {
+    const n = @min(tag.len, buf.len);
+    @memcpy(buf[0..n], tag[0..n]);
+    return nonEmpty(buf[0..n]);
+}
+
+fn nonEmpty(s: []const u8) ?[]const u8 {
+    return if (s.len == 0) null else s;
+}
+
+// CoreFoundation, for `systemLocale` on macOS (linked by the window module on
+// macOS targets). Hand-declared like the other platform externs here.
+const CFTypeRef = *const anyopaque;
+extern "c" fn CFLocaleCopyPreferredLanguages() ?CFTypeRef;
+extern "c" fn CFArrayGetCount(array: CFTypeRef) isize;
+extern "c" fn CFArrayGetValueAtIndex(array: CFTypeRef, idx: isize) ?CFTypeRef;
+extern "c" fn CFStringGetCString(str: CFTypeRef, buf: [*]u8, size: isize, encoding: u32) u8;
+extern "c" fn CFRelease(cf: CFTypeRef) void;
+const kCFStringEncodingUTF8: u32 = 0x08000100;
+
+fn macosPreferredLanguage(buf: []u8) ?[]const u8 {
+    const langs = CFLocaleCopyPreferredLanguages() orelse return null;
+    defer CFRelease(langs);
+    if (CFArrayGetCount(langs) < 1) return null;
+    const first = CFArrayGetValueAtIndex(langs, 0) orelse return null;
+    if (CFStringGetCString(first, buf.ptr, @intCast(buf.len), kCFStringEncodingUTF8) == 0) return null;
+    return nonEmpty(std.mem.sliceTo(buf, 0));
+}
+
+extern "kernel32" fn GetUserDefaultLocaleName(name: [*]u16, len: c_int) callconv(.winapi) c_int;
+
 /// The physical framebuffer size of the render surface.
 ///
 /// On Android there's no GLFW; query the live `ANativeWindow` size (physical)
@@ -228,6 +301,9 @@ const em = struct {
     // `window.devicePixelRatio` — the browser's CSS-px-to-physical ratio, which
     // encodes DPI and page zoom (the wasm analogue of the OS UI scale).
     extern "c" fn emscripten_get_device_pixel_ratio() f64;
+    // Evaluates JS and returns the string result (emscripten-owned buffer,
+    // valid until the next call) — `systemLocale` reads `navigator.language`.
+    extern "c" fn emscripten_run_script_string(script: [*:0]const u8) [*:0]const u8;
 };
 
 /// NDK `ANativeWindow` size queries (libandroid, which the Android build links
@@ -298,6 +374,9 @@ fn liveOrCached(live: [2]i32, cached: [2]i32) [2]i32 {
 // Only referenced in the `is_android` branch of `displayScale`, so desktop/wasm
 // never link it.
 extern fn labelle_bgfx_display_scale() f32;
+// The Android device locale, same C-symbol bridge as the density above
+// (`android_app.zig`); only referenced in `systemLocale`'s Android branch.
+extern fn labelle_bgfx_system_locale(buf: [*]u8, len: usize) usize;
 
 /// Reconcile the bgfx backbuffer with the current physical framebuffer size.
 ///
@@ -1735,6 +1814,21 @@ test "displayScale always yields a positive factor, 1.0 with no window (labelle-
     const s = displayScale();
     try testing.expect(s > 0);
     if (!is_android and !is_wasm and glfw_window == null) try testing.expectEqual(@as(f32, 1.0), s);
+}
+
+test "systemLocale yields a non-empty tag within the buffer, or null" {
+    // Referenced from a test for the same reason as displayScale: every
+    // target's compile-check analyzes its platform branch. On a macOS host
+    // this really calls CoreFoundation; the host's language is unknown, so
+    // only the shape is asserted.
+    var buf: [64]u8 = undefined;
+    if (systemLocale(&buf)) |tag| {
+        try testing.expect(tag.len > 0 and tag.len <= buf.len);
+        try testing.expect(std.mem.indexOfScalar(u8, tag, 0) == null);
+    }
+    // A too-small buffer truncates instead of overrunning.
+    var tiny: [2]u8 = undefined;
+    if (systemLocale(&tiny)) |tag| try testing.expect(tag.len <= tiny.len);
 }
 
 test "window advertises the surface-loss capability via the paired contract hooks" {

@@ -381,6 +381,10 @@ pub fn build(b: *std.Build) void {
     // window.zig's `gui_enabled` gate on the imgui bridge's device-loss
     // notification in `teardownSurface`.
     window_mod.addImport("build_options", input_opts_mod);
+    // `systemLocale()` reads the device language: getenv on Linux, and
+    // CoreFoundation's preferred-languages list on macOS.
+    window_mod.link_libc = true;
+    if (target.result.os.tag == .macos) window_mod.linkFramework("CoreFoundation", .{});
 
     // ── Re-export native artifacts so consumers can link them ───────
     // bgfx is always re-exported. glfw is desktop-only (Android has no
