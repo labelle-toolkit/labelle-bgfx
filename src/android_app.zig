@@ -132,16 +132,27 @@ pub const ANativeActivity = extern struct {
     /// NativeActivity can always write to, and the one `run-as <package> cat`
     /// / `adb pull` can read back on a debuggable build.
     internal_data_path: ?[*:0]const u8,
-    /// The remaining tail (`externalDataPath`, `sdkVersion` + its padding,
-    /// `instance`, `assetManager`, `obbPath`) stays opaque. Total size is
-    /// unchanged: 4 pointer slots replaced the first 4 `_tail` entries.
-    _tail: [7]?*anyopaque,
+    /// `const char* externalDataPath` — unused.
+    _external_data_path: ?*anyopaque,
+    /// `int32_t sdkVersion` plus its padding: one pointer slot on both LP64
+    /// and ILP32. Unused.
+    _sdk_version: ?*anyopaque,
+    /// `void* instance` — native_app_glue stores this activity's
+    /// `struct android_app` here. Lets the UI-thread focus hook find its own
+    /// activity's window (#143).
+    instance: ?*anyopaque,
+    /// `assetManager`, `obbPath` — unused.
+    _tail: [2]?*anyopaque,
 };
 
 comptime {
     // The struct is only ever used through a pointer the framework gives us,
-    // so a layout drift would read the wrong field silently. Pin the size.
-    if (@sizeOf(ANativeActivity) != 12 * @sizeOf(?*anyopaque)) {
+    // so a layout drift would read the wrong field silently. Pin the size to
+    // the NDK header's 10 slots, and the one tail field we read. (The size
+    // pinned here used to be 12: two phantom tail slots that nothing read,
+    // so it never mattered until `instance` was needed.)
+    const slot = @sizeOf(?*anyopaque);
+    if (@sizeOf(ANativeActivity) != 10 * slot or @offsetOf(ANativeActivity, "instance") != 7 * slot) {
         @compileError("ANativeActivity layout drifted");
     }
 }
@@ -256,6 +267,8 @@ const Shell = struct {
     bgfx_ready: bool = false,
     is_resumed: bool = false,
     waiting_logged: bool = false,
+    /// Blocked until woken by `wakeParkedLocked` rather than polling.
+    parked: bool = false,
 };
 
 fn shellOf(app: *android_app) *Shell {
@@ -283,6 +296,44 @@ fn unlockOwner() void {
 /// instead of blocking: the handoff is signalled by the other thread's state,
 /// not by an event on this looper.
 const handoff_poll_ms: c_int = 16;
+
+/// Instances that must wait for a NEWER owner (`Claim.wait`). They block in
+/// `ALooper_pollOnce(-1)` instead of polling and are woken when bgfx is
+/// released or a reservation is dropped, so a long-lived older activity
+/// costs nothing while it waits. Guarded by `owner_mutex`; an instance
+/// unparks itself before its `run()` returns, so every looper woken here is
+/// alive. More waiters than slots fall back to polling.
+var parked: [8]?*android_app = @splat(null);
+
+fn parkLocked(app: *android_app) bool {
+    for (&parked) |*slot| if (slot.* == app) return true;
+    for (&parked) |*slot| if (slot.* == null) {
+        slot.* = app;
+        return true;
+    };
+    return false;
+}
+
+fn unparkLocked(app: *android_app) void {
+    for (&parked) |*slot| if (slot.* == app) {
+        slot.* = null;
+    };
+}
+
+/// bgfx (or a reservation on it) became free: let every parked instance
+/// retry its claim. They re-park if they still have to wait.
+fn wakeParkedLocked() void {
+    for (&parked) |*slot| if (slot.*) |app| {
+        if (app.looper) |looper| ALooper_wake(looper);
+        slot.* = null;
+    };
+}
+
+/// Point the process-wide accessors (`native_activity`, `app_ptr`) at `app`.
+fn adoptAccessors(app: *android_app) void {
+    @atomicStore(?*ANativeActivity, &native_activity, app.activity, .release);
+    @atomicStore(?*android_app, &app_ptr, app, .release);
+}
 
 // ── Immersive-mode UI-thread hook (bgfx-immersive) ──────────────────
 // Hiding the system bars (`WindowInsetsController.hide()`) MUST run on the
@@ -318,13 +369,6 @@ pub fn setImmersiveCallback(cb: ImmersiveCb) void {
 /// The NDK glue's original `onWindowFocusChanged`, saved so `focusHook`
 /// can forward to it. Set in `run()` before `focusHook` is installed.
 var glue_focus_cb: ?*const fn (*ANativeActivity, c_int) callconv(.c) void = null;
-/// The live ANativeWindow for the UI-thread degenerate check (`focusHook`).
-/// Written on the app thread at INIT_WINDOW, cleared at TERM_WINDOW, read on
-/// the UI thread, hence atomic. The pointer stays valid for that read: the
-/// window is destroyed from the UI thread itself (onNativeWindowDestroyed),
-/// which waits for the app thread to finish TERM_WINDOW.
-var window_for_ui: ?*ANativeWindow = null;
-
 /// UI-thread half of the stuck-surface recovery (labelle-bgfx#127):
 /// `src/android_window_relayout.c`.
 extern "c" fn labelle_bgfx_force_window_relayout(vm: ?*anyopaque, clazz: ?*anyopaque) c_int;
@@ -347,15 +391,19 @@ fn focusHook(activity: *ANativeActivity, has_focus: c_int) callconv(.c) void {
 /// resume and runs on the UI thread, the only thread allowed to make the
 /// window relayout, so it is where a degenerate surface gets fixed. The
 /// resulting APP_CMD_WINDOW_RESIZED is reconciled by the usual path.
+///
+/// The window checked is THIS activity's own (`activity.instance` is its
+/// glue `android_app`), whether or not it owns bgfx yet: with two instances
+/// alive (#143) the new one gains focus while it is still waiting for the
+/// handoff, and this is its only chance to get the relayout. bgfx is then
+/// brought up against the live size when the handoff lands. The window
+/// pointer stays valid for this read: the glue writes it on the app thread,
+/// but the window is destroyed from the UI thread itself
+/// (onNativeWindowDestroyed), the thread we are on.
 fn recoverDegenerateWindow(activity: *ANativeActivity) void {
-    // `window_for_ui` is the bgfx OWNER's window. With two instances alive
-    // (#143) the focus change can belong to the other one, whose window
-    // this size says nothing about.
-    lockOwner();
-    const is_owner = if (arbiter.owner) |owner| owner.activity == activity else false;
-    unlockOwner();
-    if (!is_owner) return;
-    const w = @atomicLoad(?*ANativeWindow, &window_for_ui, .acquire) orelse return;
+    const instance = activity.instance orelse return;
+    const app: *android_app = @ptrCast(@alignCast(instance));
+    const w = @atomicLoad(?*ANativeWindow, &app.window, .acquire) orelse return;
     const size = [2]i32{ ANativeWindow_getWidth(w), ANativeWindow_getHeight(w) };
     if (!window.isDegenerateSurface(size)) return;
     const ok = labelle_bgfx_force_window_relayout(activity.vm, activity.clazz) != 0;
@@ -376,6 +424,12 @@ fn recoverDegenerateWindow(activity: *ANativeActivity) void {
 //     deliberately breaks the would-be module cycle: the shell imports
 //     `input`, so `input` can't import the shell back — exactly how the sokol
 //     adapter reaches sokol_app's `sapp_android_get_native_activity()`.
+///
+/// With several activity instances alive (#143) these follow the bgfx
+/// OWNER (`adoptAccessors`, on grant), since it is the owner's thread that
+/// runs the engine. Before any instance owns bgfx they point at the first
+/// instance to start, so `isDebuggable`/`internalDataPath` work early.
+/// Accessed atomically: the UI thread and other instances read them.
 var native_activity: ?*ANativeActivity = null;
 
 // Stashed from `run` so `labelle_bgfx_display_scale` can read the live
@@ -396,7 +450,7 @@ var app_ptr: ?*android_app = null;
 /// screen (it takes the min of density and height/reference), but a tall
 /// one would jump straight to the maximum scale.
 export fn labelle_bgfx_display_scale() callconv(.c) f32 {
-    const app = app_ptr orelse return 1.0;
+    const app = @atomicLoad(?*android_app, &app_ptr, .acquire) orelse return 1.0;
     const config = app.config orelse return 1.0;
     const density = AConfiguration_getDensity(config);
     if (density <= 0 or density == ACONFIGURATION_DENSITY_ANY or density == ACONFIGURATION_DENSITY_NONE) return 1.0;
@@ -505,6 +559,14 @@ fn acquireBgfx(app: *android_app, shell: *Shell) void {
     if (claim == .requested_yield) {
         if (arbiter.owner.?.looper) |looper| ALooper_wake(looper);
     }
+    // Waiting on a NEWER owner can take arbitrarily long: park instead of
+    // polling. Waiting on an older owner's handoff polls (it is short).
+    if (claim == .wait) {
+        shell.parked = parkLocked(app);
+    } else {
+        unparkLocked(app);
+        shell.parked = false;
+    }
     unlockOwner();
 
     switch (claim) {
@@ -526,7 +588,7 @@ fn acquireBgfx(app: *android_app, shell: *Shell) void {
 
     // Hand the window module this instance's ANativeWindow and bring bgfx
     // up against it.
-    @atomicStore(?*ANativeWindow, &window_for_ui, w, .release);
+    adoptAccessors(app);
     window.setAndroidNativeWindow(@ptrCast(w));
     const width = ANativeWindow_getWidth(w);
     const height = ANativeWindow_getHeight(w);
@@ -574,13 +636,13 @@ fn acquireBgfx(app: *android_app, shell: *Shell) void {
 /// engine is always told.
 fn releaseBgfx(app: *android_app, shell: *Shell) void {
     if (!shell.bgfx_ready) return;
-    @atomicStore(?*ANativeWindow, &window_for_ui, null, .release);
     if (surface_lost_fn) |cb| cb();
     window.teardownSurface();
     window.setAndroidNativeWindow(null);
     shell.bgfx_ready = false;
     lockOwner();
     arbiter.release(app);
+    wakeParkedLocked();
     unlockOwner();
 }
 
@@ -606,7 +668,10 @@ fn onAppCmd(app: *android_app, cmd: i32) callconv(.c) void {
             // No window, no claim: drop any reservation made while waiting.
             lockOwner();
             arbiter.withdraw(app);
+            unparkLocked(app);
+            wakeParkedLocked();
             unlockOwner();
+            shell.parked = false;
             shell.waiting_logged = false;
         },
         // In-place surface geometry changes (labelle-bgfx#66). A rotation under
@@ -670,12 +735,12 @@ pub fn run(app: *android_app) void {
     app.onInputEvent = onInputEvent;
 
     // Stash the activity for the backend-seam accessor the engine's
-    // immersive-mode helper calls (see `native_activity` above). The glue
-    // has populated `app.activity` by the time it calls us.
-    native_activity = app.activity;
-    // Same for the app itself, so `labelle_bgfx_display_scale` can read the
-    // live `app.config` density.
-    app_ptr = app;
+    // immersive-mode helper calls (see `native_activity` above), and the
+    // app itself so `labelle_bgfx_display_scale` can read the live
+    // `app.config` density. The glue has populated `app.activity` by the
+    // time it calls us. Only when unset: an instance that owns bgfx keeps
+    // them until it lets go (#143); this one adopts them when it gets bgfx.
+    if (@atomicLoad(?*android_app, &app_ptr, .acquire) == null) adoptAccessors(app);
 
     // Chain `onWindowFocusChanged` so the engine's immersive re-hide runs
     // on the UI thread (the only thread `WindowInsetsController.hide()` is
@@ -709,14 +774,15 @@ pub fn run(app: *android_app) void {
         //     frame.
         //   - idle → -1: blocks until an event arrives, so we don't spin
         //     while backgrounded / before the surface exists.
-        //   - waiting for another instance to hand bgfx over (#143) →
+        //   - waiting for an older instance to hand bgfx over (#143) →
         //     `handoff_poll_ms`, so the retry below runs without an event.
+        //     Waiting on a NEWER owner parks instead (-1 until woken).
         // No early break — processing only one event per frame (the prior
         // bug) caps input throughput and adds latency.
         while (ALooper_pollOnce(
             if (shell.bgfx_ready and shell.is_resumed)
                 0
-            else if (!shell.bgfx_ready and app.window != null)
+            else if (!shell.bgfx_ready and app.window != null and !shell.parked)
                 handoff_poll_ms
             else
                 -1,
@@ -764,9 +830,13 @@ pub fn run(app: *android_app) void {
     releaseBgfx(app, &shell);
     lockOwner();
     arbiter.end(app);
+    unparkLocked(app);
+    wakeParkedLocked();
     unlockOwner();
-    if (native_activity == app.activity) native_activity = null;
-    if (app_ptr == app) app_ptr = null;
+    if (@atomicLoad(?*android_app, &app_ptr, .acquire) == app) {
+        @atomicStore(?*ANativeActivity, &native_activity, null, .release);
+        @atomicStore(?*android_app, &app_ptr, null, .release);
+    }
     app.userData = null;
 }
 
@@ -793,7 +863,7 @@ comptime {
 /// below; the bgfx Android backend adapter (`android.zig`) binds the C symbol
 /// to populate core's `AndroidBackendContext.get_native_activity`.
 pub fn getNativeActivity() ?*anyopaque {
-    return @ptrCast(native_activity);
+    return @ptrCast(@atomicLoad(?*ANativeActivity, &native_activity, .acquire));
 }
 
 /// The app's private internal data directory (`/data/data/<package>/files`),
@@ -808,7 +878,7 @@ pub fn getNativeActivity() ?*anyopaque {
 /// that. Relative paths keep the knob short and land the capture exactly where
 /// `run-as <package> cat files/<name>` can fetch it.
 pub fn internalDataPath() ?[*:0]const u8 {
-    const activity = native_activity orelse return null;
+    const activity = @atomicLoad(?*ANativeActivity, &native_activity, .acquire) orelse return null;
     return activity.internal_data_path;
 }
 
@@ -839,7 +909,7 @@ pub fn isDebuggable() bool {
     // TU compiles to an empty object and the symbol does not exist.
     if (comptime !is_android) return false;
     if (is_debuggable_cached) |cached| return cached;
-    const activity = native_activity orelse return false; // not cached: asked too early
+    const activity = @atomicLoad(?*ANativeActivity, &native_activity, .acquire) orelse return false; // not cached: asked too early
     const result = labelle_bgfx_app_is_debuggable(activity.vm, activity.clazz) != 0;
     is_debuggable_cached = result;
     return result;
@@ -851,7 +921,7 @@ pub fn isDebuggable() bool {
 /// adapter's undefined ref in the final `.so` link. Android-only — emitted in
 /// the `comptime` block below.
 fn getNativeActivityC() callconv(.c) ?*anyopaque {
-    return @ptrCast(native_activity);
+    return @ptrCast(@atomicLoad(?*ANativeActivity, &native_activity, .acquire));
 }
 
 comptime {
