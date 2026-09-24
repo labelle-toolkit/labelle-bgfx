@@ -568,6 +568,29 @@ pub fn build(b: *std.Build) void {
     const sfprobe_step = b.step("screen-fill-cover-probe", "Run the screen_fill coverage probe (#42)");
     sfprobe_step.dependOn(&b.addRunArtifact(sfprobe).step);
 
+    // `zig build postfx-fit-probe` — a render-target (post-fx) pass keeps the
+    // scene's shape on a framebuffer that isn't the design size (#120).
+    const pfprobe = b.addExecutable(.{
+        .name = "postfx_fit_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/postfx_fit_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    pfprobe.root_module.addImport("zbgfx", zbgfx_mod);
+    pfprobe.root_module.addImport("gfx", gfx_mod);
+    pfprobe.root_module.addImport("window", window_mod);
+    pfprobe.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| pfprobe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        pfprobe.root_module.linkSystemLibrary("gdi32", .{});
+        pfprobe.root_module.linkSystemLibrary("user32", .{});
+    }
+    const pfprobe_step = b.step("postfx-fit-probe", "Run the post-fx letterbox probe (#120)");
+    pfprobe_step.dependOn(&b.addRunArtifact(pfprobe).step);
+
     // ── Material golden harness (labelle-gfx#305 Slice B, RFC §6) ────────────
     // `zig build material-golden`       — render the fixed flash + palette_swap
     //     scene headless and DIFF it against the committed golden TGA (CI gate).

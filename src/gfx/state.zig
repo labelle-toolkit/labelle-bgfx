@@ -95,9 +95,31 @@ pub fn setApplyFit(active: bool) void {
     fit_active = active;
 }
 
+// Size of the render target a pass is drawing into, or null for the physical
+// framebuffer (labelle-bgfx#120). The letterbox fits the design canvas into
+// whatever surface the draws LAND on. Post-fx renders the scene into a
+// design-sized target and letterboxes only when compositing that target to
+// the framebuffer; fitting the scene pass to the PHYSICAL size too squeezed
+// it (x by 0.8 on a 2000x1200 tablet with an 800x600 design). Only the fit
+// follows the target: `physicalWidth`/`screenToDesign` keep describing the
+// real framebuffer. Set by `render_target.begin`/`end`.
+var target_size: ?[2]i32 = null;
+
+/// Letterbox into a `w`x`h` render target instead of the framebuffer (null
+/// restores the framebuffer). Called by `render_target.begin`/`end`.
+pub fn setTargetSize(size: ?[2]i32) void {
+    target_size = size;
+    recomputeFitScale();
+}
+
+pub fn targetSize() ?[2]i32 {
+    return target_size;
+}
+
 fn recomputeFitScale() void {
-    const sw: f32 = @floatFromInt(screen_w);
-    const sh: f32 = @floatFromInt(screen_h);
+    const surface: [2]i32 = target_size orelse .{ screen_w, screen_h };
+    const sw: f32 = @floatFromInt(surface[0]);
+    const sh: f32 = @floatFromInt(surface[1]);
     const dw: f32 = @floatFromInt(design_w);
     const dh: f32 = @floatFromInt(design_h);
     if (sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0) {
@@ -501,4 +523,37 @@ test "screen_fill maps the design canvas onto the FULL framebuffer (#42)" {
     setApplyFit(true);
     try std.testing.expectApproxEqAbs(@as(f32, -0.75), toNdcX(0), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), toNdcX(1024), 0.0001);
+}
+
+test "a render-target pass letterboxes into the TARGET, not the framebuffer (#120)" {
+    const t = std.testing;
+    defer setTargetSize(null);
+    setDesignSize(800, 600);
+    setScreenSize(2000, 1200); // SM-T505 landscape: framebuffer fit 0.8 x 1.0
+    try t.expectApproxEqAbs(@as(f32, 0.8), fitScaleX(), 1e-5);
+
+    // Post-fx scene pass: a design-sized target is a 1:1 fit, so the design
+    // canvas spans the whole target. Before #120 this stayed 0.8.
+    setTargetSize(.{ 800, 600 });
+    try t.expectApproxEqAbs(@as(f32, 1.0), fitScaleX(), 1e-5);
+    try t.expectApproxEqAbs(@as(f32, 1.0), fitScaleY(), 1e-5);
+    try t.expectApproxEqAbs(@as(f32, 1.0), toNdcX(800), 1e-5);
+    try t.expectApproxEqAbs(@as(f32, -1.0), toNdcX(0), 1e-5);
+    // The physical framebuffer is still the physical framebuffer.
+    try t.expectEqual(@as(i32, 2000), physicalWidth());
+
+    // A per-frame setScreenSize during the pass must not undo the target fit.
+    setScreenSize(2000, 1200);
+    try t.expectApproxEqAbs(@as(f32, 1.0), fitScaleX(), 1e-5);
+
+    // A mirror target of another shape letterboxes into ITSELF: 400x400
+    // holds the 4:3 canvas at 400x300, so y shrinks to 0.75.
+    setTargetSize(.{ 400, 400 });
+    try t.expectApproxEqAbs(@as(f32, 1.0), fitScaleX(), 1e-5);
+    try t.expectApproxEqAbs(@as(f32, 0.75), fitScaleY(), 1e-5);
+
+    // Back to the framebuffer: the composite letterboxes again.
+    setTargetSize(null);
+    try t.expectApproxEqAbs(@as(f32, 0.8), fitScaleX(), 1e-5);
+    try t.expectApproxEqAbs(@as(f32, 1.0), fitScaleY(), 1e-5);
 }
