@@ -997,7 +997,7 @@ fn applyLaunchIntentEnv(activity: *ANativeActivity) void {
     var extras: [intent_env.keys.len]?[:0]const u8 = @splat(null);
     var off: usize = 0;
     for (lens, 0..) |len, i| {
-        if (len == -2) std.log.warn("bgfx: intent extra {s} too long; ignored", .{intent_env.keys[i].name});
+        if (len == -2) std.log.warn("bgfx: intent extra {s} too long or contains a NUL; ignored", .{intent_env.keys[i].name});
         if (len < 0) continue;
         const n: usize = @intCast(len);
         extras[i] = intent_buf[off .. off + n :0];

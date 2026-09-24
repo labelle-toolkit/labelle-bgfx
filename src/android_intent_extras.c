@@ -17,7 +17,8 @@
 
 // For each of the `count` keys, copy its string extra (NUL-terminated) into
 // `buf` back to back and store its length in `lens[i]`; -1 means the extra is
-// absent (or not a string), -2 that it did not fit in what was left of `buf`.
+// absent (or not a string), -2 that it did not fit in what was left of `buf`
+// or holds a NUL (which setenv would silently truncate at).
 // `vm` / `clazz` are `ANativeActivity.vm` / `.clazz`. Returns 1 when the intent
 // was read, 0 on any JNI failure (then `lens` is all -1: nothing to apply).
 int labelle_bgfx_read_intent_extras(void *vm_ptr, void *clazz_ptr, const char *const *keys, int count,
@@ -41,9 +42,9 @@ int labelle_bgfx_read_intent_extras(void *vm_ptr, void *clazz_ptr, const char *c
     }
 
     int ok = 0;
-    // Room for the activity class, intent, its class and, per key, the key and
-    // value strings; the frame hands them all back in one pop.
-    if ((*env)->PushLocalFrame(env, 4 + 2 * count) == JNI_OK) {
+    // Room for the activity class, intent, its class, the charset name and,
+    // per key, the key, the value and its byte[]; one pop hands them all back.
+    if ((*env)->PushLocalFrame(env, 8 + 3 * count) == JNI_OK) {
         jclass activity_cls = (*env)->GetObjectClass(env, activity);
         jmethodID get_intent = activity_cls ? (*env)->GetMethodID(env, activity_cls, "getIntent", "()Landroid/content/Intent;") : NULL;
         // A launcher-icon launch still has an intent, just no extras; null only
@@ -52,7 +53,14 @@ int labelle_bgfx_read_intent_extras(void *vm_ptr, void *clazz_ptr, const char *c
         if (!(*env)->ExceptionCheck(env) && intent != NULL) {
             jclass intent_cls = (*env)->GetObjectClass(env, intent);
             jmethodID get_extra = intent_cls ? (*env)->GetMethodID(env, intent_cls, "getStringExtra", "(Ljava/lang/String;)Ljava/lang/String;") : NULL;
-            if (get_extra != NULL) {
+            // Standard UTF-8 via String.getBytes("UTF-8"), NOT GetStringUTFChars:
+            // that returns JNI's modified UTF-8, which encodes a supplementary
+            // character (an emoji in a scene name) as a surrogate pair, so the
+            // env value would not byte-match the name the CLI was given.
+            jclass string_cls = (*env)->FindClass(env, "java/lang/String");
+            jmethodID get_bytes = string_cls ? (*env)->GetMethodID(env, string_cls, "getBytes", "(Ljava/lang/String;)[B") : NULL;
+            jstring utf8 = get_bytes ? (*env)->NewStringUTF(env, "UTF-8") : NULL;
+            if (get_extra != NULL && utf8 != NULL && !(*env)->ExceptionCheck(env)) {
                 ok = 1;
                 size_t used = 0;
                 for (int i = 0; i < count && ok; i++) {
@@ -69,20 +77,24 @@ int labelle_bgfx_read_intent_extras(void *vm_ptr, void *clazz_ptr, const char *c
                         break;
                     }
                     if (jval != NULL) {
-                        const char *chars = (*env)->GetStringUTFChars(env, jval, NULL);
-                        if (chars == NULL) {
-                            ok = 0; // OOM: an exception is pending
+                        jbyteArray bytes = (jbyteArray)(*env)->CallObjectMethod(env, jval, get_bytes, utf8);
+                        if (bytes == NULL || (*env)->ExceptionCheck(env)) {
+                            ok = 0;
                             break;
                         }
-                        size_t len = strlen(chars);
+                        size_t len = (size_t)(*env)->GetArrayLength(env, bytes);
                         if (len + 1 <= buf_cap - used) {
-                            memcpy(buf + used, chars, len + 1);
-                            lens[i] = (int)len;
-                            used += len + 1;
+                            (*env)->GetByteArrayRegion(env, bytes, 0, (jsize)len, (jbyte *)(buf + used));
+                            buf[used + len] = '\0';
+                            if (memchr(buf + used, '\0', len) != NULL) {
+                                lens[i] = -2;
+                            } else {
+                                lens[i] = (int)len;
+                                used += len + 1;
+                            }
                         } else {
                             lens[i] = -2;
                         }
-                        (*env)->ReleaseStringUTFChars(env, jval, chars);
                     }
                 }
             }
