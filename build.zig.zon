@@ -78,23 +78,17 @@
         // (`window_contract.zig` - width/height/frameDuration/requestQuit), the
         // unification target for the beginDrawing->beginFrame / getScreenWidth->
         // width / windowShouldClose->shouldQuit renames in this backend.
-        // FLOOR IS NOW the game-owned shader-material contract: `shader_material.zig`
-        // (Descriptor/Parameter/TextureBinding/Id + the validation helpers) and
-        // `backend_contract.Material.shader`, which `src/gfx/shader_material.zig`,
+        // FLOOR IS v2.1.0: the game-owned shader-material contract
+        // (`shader_material.zig`: Descriptor/Parameter/TextureBinding/Id and the
+        // validation helpers, `backend_contract.Material.shader`) that
         // `src/gfx/material_store.zig`, `src/gfx/shader_binary.zig` and
-        // `texture.drawTextureProMaterial` all require. v1.32.0 has neither and
-        // will not compile.
-        //
-        // is not released yet. This is a real, hash-verified pin (same shape as
-        // the zbgfx pin above), NOT a path override, so CI resolves it; but it
-        // MUST be replaced with the release tag once core#79 merges and ships:
-        //   .url  = ".../labelle-core/archive/refs/tags/v1.33.0.tar.gz"
-        // Merge order for this stack is core#79 → gfx#361 → engine#882 → this PR.
-        // For local integration against a working copy of core, prefer
+        // `texture.drawTextureProMaterial` require, plus `Blend.modulate2x`,
+        // which `programs.materialBlendState` switches on. Older cores do not
+        // compile. For local integration against a working copy of core, prefer
         // `-Dcore-source=/path/to/labelle-core/src/root.zig`.
         .labelle_core = .{
-            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v2.0.0.tar.gz",
-            .hash = "labelle_core-2.0.0-OauRcPGlBwCXfrDJneAcTZoHhXiFnsO3pCCBA3L0_Nup",
+            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v2.1.0.tar.gz",
+            .hash = "labelle_core-2.1.0-OauRcEmpBwB-EUz284qa13cc2A5eu3u1L1avd_FDF0JF",
         },
         // Shared audio engine (pluggable-backends RFC, Phase 2). The bgfx
         // backend's `src/audio.zig` collapses its duplicated WAV decode + PCM

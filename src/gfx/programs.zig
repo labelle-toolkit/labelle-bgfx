@@ -51,6 +51,26 @@ pub const STATE_BLEND_ADD: u64 = stateBlendFuncSeparate(
     bgfx.StateFlags_BlendInvSrcAlpha,
 );
 
+/// Modulate 2x (colour `DstColor, SrcColor`): dst * 2 * src per channel, for
+/// shader-material overlays that darken AND brighten what is under them (a
+/// src of 0.5 leaves the pixel unchanged). Alpha `Zero, One` keeps the
+/// destination's coverage, so an overlay never changes it.
+pub const STATE_BLEND_MODULATE2X: u64 = stateBlendFuncSeparate(
+    bgfx.StateFlags_BlendDstColor,
+    bgfx.StateFlags_BlendSrcColor,
+    bgfx.StateFlags_BlendZero,
+    bgfx.StateFlags_BlendOne,
+);
+
+/// The blend state a shader material's `blend` asks for.
+pub fn materialBlendState(blend: anytype) u64 {
+    return switch (blend) {
+        .alpha => STATE_BLEND_ALPHA,
+        .additive => STATE_BLEND_ADD,
+        .modulate2x => STATE_BLEND_MODULATE2X,
+    };
+}
+
 // ── Premultiplied-alpha blend states for `drawMesh` (labelle-gfx#290) ──
 // Spine's default export uses a premultiplied-alpha (PMA) atlas, so the four
 // Spine blend modes map to PMA blend funcs (src factor is ONE / DST_COLOR, not
@@ -813,6 +833,18 @@ fn fullscreenQuad(flip_v: bool) [6]PosTexColorVertex {
 // negative-height flip. Compile-checked in the `gfx_mod` test graph. (Only the
 // Metal, top-left, `flip_v == false` path is golden-covered on CI — there is no
 // display-GL runner — so this pins the flip's INTENT alongside the code comment.)
+test "modulate2x multiplies colour by 2*src and keeps destination alpha" {
+    const field = STATE_BLEND_MODULATE2X >> bgfx.StateFlags_BlendShift;
+    const rgb = (bgfx.StateFlags_BlendDstColor | (bgfx.StateFlags_BlendSrcColor << 4)) >> bgfx.StateFlags_BlendShift;
+    const alpha = (bgfx.StateFlags_BlendZero | (bgfx.StateFlags_BlendOne << 4)) >> bgfx.StateFlags_BlendShift;
+    try std.testing.expectEqual(rgb, field & 0xff);
+    try std.testing.expectEqual(alpha, (field >> 8) & 0xff);
+    const Blend = enum { alpha, additive, modulate2x };
+    try std.testing.expectEqual(STATE_BLEND_ALPHA, materialBlendState(Blend.alpha));
+    try std.testing.expectEqual(STATE_BLEND_ADD, materialBlendState(Blend.additive));
+    try std.testing.expectEqual(STATE_BLEND_MODULATE2X, materialBlendState(Blend.modulate2x));
+}
+
 test "straight-alpha states composite alpha as coverage, not srcA² (web canvas stays opaque)" {
     // Alpha factors live in bits 8..15 of the blend-func field: src | dst << 4.
     const alpha_bits = struct {
@@ -1315,8 +1347,7 @@ pub fn submitShaderMaterialTriangles(vertices: []const PosTexColorVertex, textur
     bgfx.setViewTransform(active_view, &identity, &identity);
     bgfx.setTransientVertexBuffer(0, &tvb, 0, num);
     materials.bind(instance, texture_handle, rect);
-    const blend = if (instance.blend == .alpha) STATE_BLEND_ALPHA else STATE_BLEND_ADD;
-    bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | blend, 0);
+    bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | materialBlendState(instance.blend), 0);
     submitProgram(active_view, .{ .idx = instance.program.handle });
     return true;
 }

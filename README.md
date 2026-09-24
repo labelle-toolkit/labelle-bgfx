@@ -98,7 +98,7 @@ registers for bgfx; declare corresponding shader uniforms as `vec4` arrays and
 read the appropriate channels. Mat4 uses 16 column-major floats per element.
 Defaults may be empty (all zeros); updates must have the exact shape and finite
 values. Binding names, duplicate names, counts, capacity and reserved bgfx names
-are checked by the core contract. There are at most 256 live instances, 16 named
+are checked by the core contract. There are at most 4096 live instances, 16 named
 parameters, 4 auxiliary textures, and 64 uniform registers including the automatic
 rect. Exhausted generations retire their slot rather than wrapping.
 
