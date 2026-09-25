@@ -30,15 +30,17 @@
         // `-Dvideo` (default off, so no VideoToolbox/CoreMedia/CoreVideo dependency), and
         // raises the x86 CPU baseline to SSE4.2 because bx's simd_t.h now
         // requires it. The screen_shot vtable fix below is still IN this commit.
-        // Pinned to ba2786f, the merge of labelle-toolkit/zbgfx#1 (reviewed).
+        // Pinned to eb71fd4 (labelle-toolkit/zbgfx#2): the zbgfx#1 API 161 vendor
+        // plus the web ASTC fix: the emscripten format table lists the full
+        // LDR set, so 8x8 samples natively on WebGL (#147).
         //
         // Host note: the fork previously lived at `codeberg.org/apotema/zbgfx`
         // (commit 0b229b7). It moved to the labelle-toolkit org on GitHub so it
         // sits with the rest of the toolkit and so upstreaming is a normal PR;
         // the Codeberg copy is stale and should not be repinned.
         .zbgfx = .{
-            .url = "https://github.com/labelle-toolkit/zbgfx/archive/ba2786f11b8042afc2f90e10b2a6432bd24befae.tar.gz",
-            .hash = "zbgfx-0.12.0-Sm4IxMnIDAdzAesVbziV41cUrt0j8cBIG8xGe7UL1fpY",
+            .url = "https://github.com/labelle-toolkit/zbgfx/archive/eb71fd4b0339cbad09c755eea52091c3105ac719.tar.gz",
+            .hash = "zbgfx-0.12.0-Sm4IxN_KDAf834PtToJwIjR0-zzWnYOjJWZAtPUwhAHZ",
         },
         .zglfw = .{
             .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",
