@@ -46,6 +46,18 @@
 //!     `.pic` — are emitted declaratively by the assembler from the manifest, NOT
 //!     here.
 //!
+//!     NDK DETECTION IS DUPLICATED HERE ON PURPOSE (labelle-bgfx#149 phase 1e).
+//!     bgfx's `build.zig` takes `resolveNdk` / `addAndroidSysroot` from the
+//!     `labelle_android` package; this hook keeps its own
+//!     `getAndroidNdkSysroot` / `selectGreatestValidNdk` / `libcTxt` because it
+//!     is std-only BY CONTRACT (see the first paragraph: the assembler imports
+//!     it into the generated root package, where no `labelle_android` module is
+//!     resolvable). Both copies apply the same selection rule — `ANDROID_NDK_HOME`,
+//!     else the greatest `ANDROID_HOME/ndk/<version>` that HAS a sysroot — so the
+//!     .so link and the C compile agree on the NDK. The copy leaves with
+//!     labelle-cli#406, when APK packaging (and with it this residual) moves into
+//!     labelle-android.
+//!
 //! The generated v2 android build.zig `@import`s this file (as a sibling
 //! `backend_build_hook.zig`) and calls both phases; that import is the design's
 //! "assembler imports the hook into the generated root package" (§3). `generate`

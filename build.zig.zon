@@ -64,7 +64,9 @@
         // decoders with the shared `yuv`/`planes` helpers (FP#549; links
         // `libmediandk`). One named module, `labelle_android`, imported by
         // `gfx`, `audio` and `android_app`. Eager (not lazy): `build.zig`
-        // will `@import` its build helpers in a later phase.
+        // `@import`s its build helpers (`resolveNdk` / `addAndroidSysroot` /
+        // `nativeAppGlueDir`, phase 1e) at the top level, which resolves the
+        // package on every build — desktop and wasm included.
         // Commit pin until labelle-android v0.1.0 is tagged. NEVER a committed
         // `.path`: `.labelle/deps/labelle-bgfx` is a copy, so a relative path
         // would not resolve from an assembled game.
