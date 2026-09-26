@@ -1395,6 +1395,11 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // Browser fullscreen (`window.zig` wasm `setFullscreen`/`isFullscreen`,
     // labelle-bgfx#99): the EM_JS half driving the DOM Fullscreen API.
     gfx_mod.addCSourceFile(.{ .file = b.path("src/web_fullscreen.c"), .flags = &.{} });
+    if (b.lazyDependency("labelle_web", .{ .target = target, .optimize = optimize })) |web_storage| {
+        gfx_mod.addImport("persistent_storage", web_storage.module("storage"));
+        gfx_mod.addCSourceFile(.{ .file = web_storage.path("src/web_storage.c"), .flags = &.{} });
+    }
+
 
     // ── Input backend module ────────────────────────────────────────
     // No zglfw / no sdl_gamepad (both desktop-only) — src/input.zig comptime-gates

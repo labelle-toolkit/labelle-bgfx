@@ -4,6 +4,13 @@
     .version = "0.28.1",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        // Unreleased storage integration: immutable, real revision. Replace
+        // with the first labelle-web release before merging this draft.
+        .labelle_web = .{
+            .url = "https://github.com/labelle-toolkit/labelle-web/archive/003acf235bc49d2e352c6f72c372f61ada32d3e3.tar.gz",
+            .hash = "labelle_web-0.0.0-rzifm_4hAACRU_SLZdnQoG_yFuu2OBMydV4_t7sd0J2e",
+            .lazy = true,
+        },
         // Pinned to specific commits — same class of fix as #146.
         // Bumping either dep requires `zig fetch <new-url>` to get
         // the new hash, then updating the url and hash together.
