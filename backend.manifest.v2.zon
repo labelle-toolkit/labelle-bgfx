@@ -187,7 +187,13 @@
             // (design §3 merge contract) — matching the enum `backend_bgfx_android`,
             // which forwards only `gui_enabled` (no gamepad flags on android).
             .dep_options = .{},
-            .package = .{ .apk = .{ .manifest = "src/video/apk/AndroidManifest.xml" } },
+            // The apk manifest string is parsed by the assembler but never read:
+            // labelle-cli generates the real `AndroidManifest.xml` itself
+            // (`generateAndroidManifest`, cli#737). It used to name the standalone
+            // decode harness's manifest, retired with the decoder's move to
+            // labelle-android (#149 phase 1d, cli#405); the value now matches the
+            // assembler's own fixture.
+            .package = .{ .apk = .{ .manifest = "AndroidManifest.xml.tmpl" } },
         },
         // WASM/Emscripten/WebGL2 (bgfx-wasm epic labelle-bgfx#8, shipped in
         // 0.4.x, browser-verified) — mirrors the proven raylib wasm PlatformEntry
