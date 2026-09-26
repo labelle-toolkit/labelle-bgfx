@@ -7,7 +7,9 @@ pub fn key(code: []const u8) ?u32 {
     return null;
 }
 pub fn capture(code: []const u8, modified: bool) bool {
-    return !modified and key(code) != null;
+    // ImGui edits canvas text fields, not DOM inputs. WebKit otherwise
+    // interprets an ordinary Backspace as history navigation.
+    return !modified and (key(code) != null or std.mem.eql(u8, code, "Backspace"));
 }
 test "save, restart and load map to engine keys without consuming text or modified browser shortcuts" {
     try std.testing.expectEqual(@as(?u32, 294), key("F5"));
@@ -15,6 +17,8 @@ test "save, restart and load map to engine keys without consuming text or modifi
     try std.testing.expectEqual(@as(?u32, 298), key("F9"));
     try std.testing.expect(capture("F5", false));
     try std.testing.expect(capture("F9", false));
+    try std.testing.expect(capture("Backspace", false));
+    try std.testing.expect(!capture("Backspace", true));
     try std.testing.expect(!capture("F5", true));
     try std.testing.expect(!capture("KeyA", false));
     try std.testing.expect(!capture("F12", false));
