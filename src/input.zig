@@ -499,11 +499,12 @@ fn wasmWheel(_: i32, e: *const em.WheelEvent, _: ?*anyopaque) callconv(.c) bool 
 // layout-INDEPENDENT (physical position), matching how desktop GLFW reports
 // keys. TEXT input stays on the keypress/char path (`imgui_bridge_char`), which
 // SHOULD be layout-dependent — only engine key-state uses physical `code`.
-// Unmapped keys (F-keys, punctuation, numpad, …) are ignored for now.
+// F5/F8/F9 are game commands; other F-keys, punctuation and numpad remain unmapped.
 
 /// Physical `KeyboardEvent.code` token → GLFW/engine keycode, or null when
 /// unmapped. GLFW letter/digit codes coincide with ASCII: A=65..Z=90, 0=48..9=57.
 fn codeToGlfwKey(code: []const u8) ?u32 {
+    if (@import("web_command_keys.zig").key(code)) |command| return command;
     // Letter keys "KeyA".."KeyZ" → GLFW 65..90 (== the ASCII uppercase letter).
     if (code.len == 4 and std.mem.eql(u8, code[0..3], "Key")) {
         const c = code[3];
@@ -541,12 +542,13 @@ fn wasmKeyCode(e: *const em.KeyboardEvent) []const u8 {
     return std.mem.sliceTo(&e.code, 0);
 }
 
-// All three key callbacks return FALSE so emscripten does NOT call
-// `preventDefault()`. Returning true would suppress the follow-on `keypress`
-// event (so `wasmKeyPress`/`imgui_bridge_char` never fire → text input broken)
-// and swallow browser shortcuts. The FP web page is a fullscreen canvas, so we
-// don't need to consume keys to stop page-scroll; text-input correctness wins.
+// Text keys return false so keypress still feeds ImGui. Plain F5/F8/F9
+// have no text event; consume them so quicksave cannot reload the page.
+// Modified browser shortcuts remain available and do not trigger a game action.
 fn wasmKeyDown(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) bool {
+    const commands = @import("web_command_keys.zig");
+    const modified = e.ctrlKey or e.shiftKey or e.altKey or e.metaKey;
+    if (modified and commands.key(wasmKeyCode(e)) != null) return false;
     if (codeToGlfwKey(wasmKeyCode(e))) |code| {
         wasm_key_down[code] = true; // held-state for isKeyDown (no poll on wasm)
         // Auto-repeat isn't a fresh press: skip the edge accum + the imgui key
@@ -556,7 +558,7 @@ fn wasmKeyDown(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) 
             if (comptime gui_enabled) imgui.imgui_bridge_key(@intCast(code), true);
         }
     }
-    return false;
+    return @import("web_command_keys.zig").capture(wasmKeyCode(e), e.ctrlKey or e.shiftKey or e.altKey or e.metaKey);
 }
 
 fn wasmKeyUp(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) bool {
@@ -565,7 +567,7 @@ fn wasmKeyUp(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) bo
         wasm_key_released_accum[code] = true; // latched into keys_released in newFrame
         if (comptime gui_enabled) imgui.imgui_bridge_key(@intCast(code), false);
     }
-    return false;
+    return @import("web_command_keys.zig").capture(wasmKeyCode(e), e.ctrlKey or e.shiftKey or e.altKey or e.metaKey);
 }
 
 fn wasmKeyPress(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) bool {
