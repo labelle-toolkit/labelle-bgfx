@@ -259,6 +259,15 @@ pub fn build(b: *std.Build) void {
     const android_gp_dep = b.dependency("labelle_android_gamepad", .{ .target = target, .optimize = optimize });
     input_mod.addImport("android_gamepad", android_gp_dep.module("android_gamepad"));
 
+    // Shared Android platform services (labelle-bgfx#149 phase 1): launch
+    // intent extras → env, the `android:debuggable` query and the #127 window
+    // relayout, as the ONE named module `labelle_android`. The package
+    // compiles its own JNI C against the NDK sysroot it resolves itself, so
+    // nothing here `addCSourceFile`s for it. Eager dependency: fetched on
+    // every target (tiny), referenced only by `android_app` below.
+    const android_dep = b.dependency("labelle_android", .{ .target = target, .optimize = optimize });
+    const labelle_android_mod = android_dep.module("labelle_android");
+
     // labelle-core, imported on EVERY target so `src/input.zig` can prove it
     // satisfies the engine input contract at comptime (`core.assertInput`) and
     // `src/window.zig` the window contract (`core.assertWindow`, #386 Phase 3).
@@ -854,17 +863,8 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(android_owner_tests).step);
 
-    // The pure half of the Android launch-intent → env mapping (#139): the
-    // allow-list and per-key set/unset decision. Std-only, so it RUNS on the
-    // host; the JNI read is covered by the Android compile-check below.
-    const android_intent_env_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/android_intent_env.zig"),
-            .target = host_target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(android_intent_env_tests).step);
+    // The Android launch-intent → env mapping (#139) moved to labelle-android
+    // (#149); its allow-list / decision tests run in THAT package's suite.
 
     addHeapGuard(b, test_step, optimize);
 
@@ -1158,6 +1158,8 @@ pub fn build(b: *std.Build) void {
         android_app_mod.addImport("window", window_mod);
         android_app_mod.addImport("input", input_mod);
         android_app_mod.addImport("zbgfx", zbgfx_mod);
+        // Intent extras → env, `isDebuggable`, window relayout (#149).
+        android_app_mod.addImport("labelle_android", labelle_android_mod);
 
         // Vendor the NDK's native_app_glue: its include dir (for
         // <android_native_app_glue.h>) and its single C TU. The glue needs
@@ -1173,32 +1175,10 @@ pub fn build(b: *std.Build) void {
             .flags = &.{ "-std=c11", "-Wall" },
         });
 
-        // JNI helper for `android_app.isDebuggable()` (labelle-assembler#737):
-        // `activity.getApplicationInfo().flags & FLAG_DEBUGGABLE`, which gates
-        // the device knob-file channel on the RUNNING apk rather than on
-        // whatever `run-as` allowed at the time the file was written. In C
-        // because <jni.h> already declares the JNI vtables; the NDK sysroot is
-        // wired onto this module just above. `#ifdef __ANDROID__`-gated, so it
-        // emits an empty object off Android (same convention as
-        // `android_gamepad_jni.c`).
-        android_app_mod.addCSourceFile(.{
-            .file = b.path("src/android_debuggable.c"),
-            .flags = &.{ "-std=c11", "-Wall" },
-        });
-        // Forces a relayout when a restored window comes back 1x1 and
-        // never receives its resize (labelle-bgfx#127). Same JNI-in-C
-        // rationale and `__ANDROID__` gate as android_debuggable.c.
-        android_app_mod.addCSourceFile(.{
-            .file = b.path("src/android_window_relayout.c"),
-            .flags = &.{ "-std=c11", "-Wall" },
-        });
-        // Reads the launch intent's LABELLE_* string extras so the shell can
-        // turn them into env vars (labelle-bgfx#139). Same JNI-in-C rationale
-        // and `__ANDROID__` gate as android_debuggable.c.
-        android_app_mod.addCSourceFile(.{
-            .file = b.path("src/android_intent_extras.c"),
-            .flags = &.{ "-std=c11", "-Wall" },
-        });
+        // The JNI helpers this shell used to compile here — the debuggable
+        // query (labelle-assembler#737), the #127 window relayout and the
+        // #139 intent-extras read — live in labelle-android now (#149), which
+        // compiles them into `labelle_android_mod` against its own sysroot.
 
         // Declare the android libs the shell references for the eventual
         // (phase-4) link. These are recorded on the module's link inputs;
