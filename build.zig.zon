@@ -4,11 +4,11 @@
     .version = "0.28.1",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // Unreleased storage integration: immutable, real revision. Replace
-        // with the first labelle-web release before merging this draft.
+        // Browser persistent storage (IndexedDB bridge), wasm-only (lazy).
+        // Pinned to the labelle-web v0.1.0 release tag.
         .labelle_web = .{
-            .url = "https://github.com/labelle-toolkit/labelle-web/archive/43e2fc9c848c847f60d9cf698e7c4847e22cfaa6.tar.gz",
-            .hash = "labelle_web-0.0.0-rzifm1EkAABYsoTkV7Jctha59UzzYFTM9uwyzhl1JdOb",
+            .url = "https://github.com/labelle-toolkit/labelle-web/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "labelle_web-0.1.0-rzifm04rAAANjWLNPm7v1g2i2zV8NOs5UJ-CXZIKyR0p",
             .lazy = true,
         },
         // Pinned to specific commits — same class of fix as #146.
