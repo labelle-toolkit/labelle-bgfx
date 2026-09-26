@@ -1,5 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
+// Build-time helpers from the labelle-android package (labelle-bgfx#149
+// phase 1e): NDK sysroot detection (`resolveNdk` / `addAndroidSysroot`) and
+// the native_app_glue locator (`nativeAppGlueDir`). This is the reason the
+// `labelle_android` dependency is EAGER (`b.dependency`, never
+// `lazyDependency`): a `build.zig`-level `@import` of a dependency's build
+// script resolves on every build, desktop and wasm included — the same
+// mechanism `labelle-sokol/build.zig` uses for sokol's `emLinkStep`.
+const labelle_android = @import("labelle_android");
 
 /// True when `t` is a native desktop OS (matches the shared sdl_gamepad source's
 /// comptime `is_desktop`): only there are the SDL `extern`s referenced and SDL
@@ -110,10 +118,18 @@ pub fn build(b: *std.Build) void {
     // they hand the surface across as an opaque `*anyopaque` (see
     // src/window.zig), so no C header is pulled in yet.
     //
-    // `ndk` is non-null only for Android; the resolved sysroot include
-    // paths are reused below to wire the Android gfx/window/input modules.
-    const ndk: ?NdkPaths = if (is_android) resolveNdkPaths(b, target) else null;
-    if (ndk) |n| {
+    // `ndk` is non-null only for Android. It is resolved ONCE, up front, so a
+    // missing NDK fails the build here with the package's actionable message
+    // before any module is wired; the per-module sysroot wiring below goes
+    // through `labelle_android.addAndroidSysroot` (labelle-bgfx#149 phase
+    // 1e — the helper bodies that used to live at the bottom of this file
+    // are the package's now). NDK selection rule: `ANDROID_NDK_HOME`, else
+    // the greatest `ANDROID_HOME/ndk/<version>` that HAS a sysroot (the
+    // `backend.hook.zig` rule; this file used to take the greatest dir and
+    // only then check it, so a stray/partial install could shadow a valid
+    // older NDK).
+    const ndk: ?labelle_android.NdkPaths = if (is_android) labelle_android.resolveNdk(b, target, .{}) else null;
+    if (ndk != null) {
         // zbgfx builds three separate static libs — `bx`, `bimg`, and
         // `bgfx` — each its own `*Compile` with its own `root_module`.
         // The consumer can only fetch the top-level `bgfx` artifact, but
@@ -121,10 +137,10 @@ pub fn build(b: *std.Build) void {
         // bgfx's link_objects to reach them, then apply the NDK sysroot
         // paths to every C/C++ module so all three find the Bionic
         // headers. (Include paths don't propagate across linkLibrary.)
-        applyNdkSysroot(bgfx_artifact.root_module, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+        _ = labelle_android.addAndroidSysroot(b, bgfx_artifact.root_module, target);
         for (bgfx_artifact.root_module.link_objects.items) |lo| {
             if (lo == .other_step) {
-                applyNdkSysroot(lo.other_step.root_module, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+                _ = labelle_android.addAndroidSysroot(b, lo.other_step.root_module, target);
             }
         }
     }
@@ -148,13 +164,13 @@ pub fn build(b: *std.Build) void {
     // Android: stb_image_impl.c (and the translate-c `@cImport` of
     // stb_shim.h in gfx/texture.zig) need the NDK sysroot system-includes
     // to find Bionic's <stdlib.h>/<string.h> etc., exactly like the
-    // bgfx/bx/bimg C++ compile above. Apply the SAME `applyNdkSysroot`
+    // bgfx/bx/bimg C++ compile above. Apply the SAME `addAndroidSysroot`
     // helper. This MUST run BEFORE `addCSourceFile` so the include paths
     // are attached when the consuming Compile step collects translation
     // units (mirrors the ordering in the sokol backend's build.zig). On
     // desktop the system libc headers resolve without extra wiring.
     // (bgfx is desktop + Android only — no wasm/emsdk path, unlike sokol.)
-    if (ndk) |n| applyNdkSysroot(gfx_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+    if (ndk != null) _ = labelle_android.addAndroidSysroot(b, gfx_mod, target);
 
     // stb_image implementation TU — defines STB_IMAGE_IMPLEMENTATION +
     // STBI_NO_STDIO and includes stb_image.h. This is what gives the bgfx
@@ -252,7 +268,7 @@ pub fn build(b: *std.Build) void {
     // axis state) on every target — its Android-only `extern`/`@export` symbols
     // are gated internally, so off Android nothing is referenced. On Android we
     // also compile the JNI glue into THIS module (where the NDK sysroot/libc is
-    // wired by `applyNdkSysroot` below). The .c is `#ifdef __ANDROID__`-gated,
+    // wired by `addAndroidSysroot` below). The .c is `#ifdef __ANDROID__`-gated,
     // so it emits an empty object off Android. We pull its source via
     // `dep.path(...)` because cross-package `b.path("..")` is rejected by Zig
     // 0.16.
@@ -323,8 +339,8 @@ pub fn build(b: *std.Build) void {
         input_mod.link_libc = true;
         // NDK sysroot for the JNI glue's jni.h / android/*.h. Reuse the same
         // sysroot wiring bgfx/bx/bimg use; safe because `ndk` is non-null on
-        // Android. Must precede the C source add (see applyNdkSysroot).
-        if (ndk) |n| applyNdkSysroot(input_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+        // Android. Must precede the C source add (see addAndroidSysroot).
+        if (ndk != null) _ = labelle_android.addAndroidSysroot(b, input_mod, target);
         input_mod.addCSourceFile(.{
             .file = android_gp_dep.path("src/android_gamepad_jni.c"),
             .flags = &.{},
@@ -365,16 +381,15 @@ pub fn build(b: *std.Build) void {
     if (!is_android) {
         // ── miniaudio playback device (#297) — desktop only ─────────
         wireMiniaudio(b, audio_mod, target.result.os.tag);
-    } else if (ndk) |n| {
+    } else if (ndk != null) {
         // On Android the mixer is AAudio-backed via `labelle_android.aaudio`.
         // This module's own Zig source has no `@cInclude`, so the device-less
         // compile-check below emits its object without sysroot headers — but
         // apply the SAME NDK sysroot the other Android modules use so the lib
         // path / API level / PIC are wired for any consumer that actually
         // *links* it (e.g. the libgame.so app link). Desktop never reaches
-        // this branch. (Replaced by the package's `addAndroidSysroot` in
-        // phase 1e.)
-        applyNdkSysroot(audio_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+        // this branch.
+        _ = labelle_android.addAndroidSysroot(b, audio_mod, target);
     }
 
     // ── Window backend module ───────────────────────────────────────
@@ -1147,7 +1162,7 @@ pub fn build(b: *std.Build) void {
     // for the eventual link, but we depend on the *compile* step (object
     // emission), never a run/link step that would demand those libs be
     // present on the host.
-    if (ndk) |n| {
+    if (ndk != null) {
         const android_app_mod = b.addModule("android_app", .{
             .root_source_file = b.path("src/android_app.zig"),
             .target = target,
@@ -1165,9 +1180,10 @@ pub fn build(b: *std.Build) void {
         // <android_native_app_glue.h>) and its single C TU. The glue needs
         // the Bionic headers (android/native_window.h, looper.h, input.h),
         // which the NDK sysroot supplies — apply the same sysroot wiring
-        // bgfx/bx/bimg use.
-        applyNdkSysroot(android_app_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
-        const glue_dir = androidNativeAppGlueDir(b) orelse
+        // bgfx/bx/bimg use. The glue dir is resolved from the SAME NDK the
+        // sysroot came from (both go through the package's NDK root).
+        _ = labelle_android.addAndroidSysroot(b, android_app_mod, target);
+        const glue_dir = labelle_android.nativeAppGlueDir(b) orelse
             @panic("Could not find native_app_glue in the NDK (sources/android/native_app_glue).");
         android_app_mod.addIncludePath(.{ .cwd_relative = glue_dir });
         android_app_mod.addCSourceFile(.{
@@ -1585,163 +1601,6 @@ fn wireMiniaudio(b: *std.Build, mod: *std.Build.Module, os_tag: std.Target.Os.Ta
         },
         else => {},
     }
-}
-
-/// Add the Android NDK sysroot system-include paths, the arch/API
-/// library path, and `__ANDROID_API__` to a single C/C++ module so its
-/// translation units resolve the Bionic `<stdlib.h>` etc. that Zig's
-/// bundled libc++ headers pull from the global namespace.
-fn applyNdkSysroot(
-    mod: *std.Build.Module,
-    inc_common: []const u8,
-    inc_arch: []const u8,
-    lib_path: []const u8,
-    android_api: []const u8,
-) void {
-    mod.addSystemIncludePath(.{ .cwd_relative = inc_common });
-    mod.addSystemIncludePath(.{ .cwd_relative = inc_arch });
-    mod.addLibraryPath(.{ .cwd_relative = lib_path });
-    // bgfx + Bionic both gate Android-version behavior on __ANDROID_API__.
-    mod.addCMacro("__ANDROID_API__", android_api);
-    // Android .so consumers need PIC in every archived .o (see #147).
-    mod.pic = true;
-}
-
-/// Resolved Android NDK sysroot include/library paths + API level for a
-/// given target. Computed once in `build()` and threaded through
-/// `applyNdkSysroot` for each C/C++ module that needs the Bionic headers.
-const NdkPaths = struct {
-    inc_common: []const u8,
-    inc_arch: []const u8,
-    lib_path: []const u8,
-    android_api: []const u8,
-};
-
-/// Resolve the NDK sysroot paths for an Android `target`. Panics with an
-/// actionable message if the NDK can't be found or the arch is
-/// unsupported — the caller only invokes this when `is_android` is true.
-fn resolveNdkPaths(b: *std.Build, target: std.Build.ResolvedTarget) NdkPaths {
-    const ndk_sysroot = getAndroidNdkSysroot(b) orelse
-        @panic("Could not find Android NDK. Set ANDROID_NDK_HOME or ANDROID_HOME.");
-    const ndk_arch_triple: []const u8 = switch (target.result.cpu.arch) {
-        .aarch64 => "aarch64-linux-android",
-        .x86_64 => "x86_64-linux-android",
-        .arm, .thumb => "arm-linux-androideabi",
-        .x86 => "i686-linux-android",
-        else => @panic("unsupported Android arch for bgfx"),
-    };
-    // Match the toolkit's default Android min_sdk (28, see
-    // `src/config.zig`). Must be >= 23: bx's `file.cpp` references
-    // `stdout`/`stderr`, which Bionic exposes as real symbols only from
-    // API 23 (below that they alias `__sF[]`, marked `__REMOVED_IN(23)`
-    // and rejected by clang availability).
-    const android_api = "28";
-    return .{
-        .inc_common = b.pathJoin(&.{ ndk_sysroot, "usr/include" }),
-        .inc_arch = b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }),
-        .lib_path = b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, android_api }),
-        .android_api = android_api,
-    };
-}
-
-/// Locate the Android NDK sysroot, mirroring the sokol-Android path in
-/// `src/templates/build_zig.txt`. Checks `ANDROID_NDK_HOME` first, then
-/// `ANDROID_HOME/ndk/<latest>`. Returns null if neither resolves to an
-/// existing sysroot.
-///
-/// Env lookups go through `b.graph.environ_map.get` and filesystem
-/// checks through `std.Io.Dir.cwd().access(io, ...)` — Zig 0.16 removed
-/// `std.process.getEnvVarOwned`, `std.posix.getenv`, and `std.fs.cwd()`.
-fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
-    const io = b.graph.io;
-    // 1. ANDROID_NDK_HOME env var
-    if (b.graph.environ_map.get("ANDROID_NDK_HOME")) |ndk_home| {
-        const sysroot = b.pathJoin(&.{ ndk_home, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
-        if (std.Io.Dir.cwd().access(io, sysroot, .{})) |_| {
-            return sysroot;
-        } else |_| {}
-    }
-    // 2. ANDROID_HOME/ndk/<latest>/
-    if (b.graph.environ_map.get("ANDROID_HOME")) |home| {
-        const ndk_dir = b.pathJoin(&.{ home, "ndk" });
-        var dir = std.Io.Dir.cwd().openDir(io, ndk_dir, .{ .iterate = true }) catch return null;
-        defer dir.close(io);
-        var latest: ?[]const u8 = null;
-        var iter = dir.iterate();
-        while (iter.next(io) catch null) |entry| {
-            if (entry.kind == .directory) {
-                if (latest) |prev| {
-                    if (std.mem.order(u8, entry.name, prev) == .gt) {
-                        b.allocator.free(prev);
-                        latest = b.allocator.dupe(u8, entry.name) catch null;
-                    }
-                } else {
-                    latest = b.allocator.dupe(u8, entry.name) catch null;
-                }
-            }
-        }
-        if (latest) |version| {
-            defer b.allocator.free(version);
-            const sysroot = b.pathJoin(&.{ ndk_dir, version, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
-            if (std.Io.Dir.cwd().access(io, sysroot, .{})) |_| {
-                return sysroot;
-            } else |_| {}
-        }
-    }
-    return null;
-}
-
-/// Locate the NDK's `android_native_app_glue` source directory
-/// (`<ndk>/sources/android/native_app_glue`), which ships
-/// `android_native_app_glue.c` + `.h`. Resolves the NDK root the same way
-/// `getAndroidNdkSysroot` does (ANDROID_NDK_HOME, then
-/// ANDROID_HOME/ndk/<latest>) but returns the glue dir rather than the
-/// sysroot. Returns null if it can't be found.
-fn androidNativeAppGlueDir(b: *std.Build) ?[]const u8 {
-    const io = b.graph.io;
-    const rel = &.{ "sources", "android", "native_app_glue" };
-
-    // 1. ANDROID_NDK_HOME
-    if (b.graph.environ_map.get("ANDROID_NDK_HOME")) |ndk_home| {
-        const dir = b.pathJoin(&.{ ndk_home, rel[0], rel[1], rel[2] });
-        if (std.Io.Dir.cwd().access(io, dir, .{})) |_| return dir else |_| {}
-    }
-
-    // 2. ANDROID_HOME/ndk/<latest>
-    if (b.graph.environ_map.get("ANDROID_HOME")) |home| {
-        const ndk_dir = b.pathJoin(&.{ home, "ndk" });
-        var dir = std.Io.Dir.cwd().openDir(io, ndk_dir, .{ .iterate = true }) catch return null;
-        defer dir.close(io);
-        var latest: ?[]const u8 = null;
-        var iter = dir.iterate();
-        while (iter.next(io) catch null) |entry| {
-            if (entry.kind == .directory) {
-                if (latest) |prev| {
-                    if (std.mem.order(u8, entry.name, prev) == .gt) {
-                        b.allocator.free(prev);
-                        latest = b.allocator.dupe(u8, entry.name) catch null;
-                    }
-                } else {
-                    latest = b.allocator.dupe(u8, entry.name) catch null;
-                }
-            }
-        }
-        if (latest) |version| {
-            defer b.allocator.free(version);
-            const glue = b.pathJoin(&.{ ndk_dir, version, rel[0], rel[1], rel[2] });
-            if (std.Io.Dir.cwd().access(io, glue, .{})) |_| return glue else |_| {}
-        }
-    }
-    return null;
-}
-
-fn ndkHostTag() []const u8 {
-    return switch (builtin.os.tag) {
-        .linux => "linux-x86_64",
-        .macos => "darwin-x86_64",
-        .windows => "windows-x86_64",
-        else => "linux-x86_64",
-    };
 }
 
 // ── emsdk one-time setup (ported from sokol-zig) ───────────────────────
