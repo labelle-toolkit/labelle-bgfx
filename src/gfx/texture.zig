@@ -882,7 +882,9 @@ pub fn unloadPlaneTextures(pt: PlaneTextures) void {
 /// Draw the YUV video frame: same quad geometry as `drawTexturePro`, but binds
 /// the three plane textures to the `s_texY/U/V` samplers and submits with the
 /// `yuv_program` (GPU YUV→RGB). `source` is in luma (full-res) pixels.
-pub fn drawPlanesPro(pt: PlaneTextures, source: Rectangle, dest: Rectangle, origin: Vector2, rotation: f32, tint: Color) void {
+/// `yuv_params` is the stream's colour matrix as `fs_yuv` uniforms
+/// (`video/yuv_uniform.Params`, labelle-bgfx#155).
+pub fn drawPlanesPro(pt: PlaneTextures, source: Rectangle, dest: Rectangle, origin: Vector2, rotation: f32, tint: Color, yuv_params: *const [2][4]f32) void {
     if (pt.y.id.toInt() >= MAX_TEXTURES or pt.u.id.toInt() >= MAX_TEXTURES or pt.v.id.toInt() >= MAX_TEXTURES) return;
     const yh = texture_handles[pt.y.id.toInt()];
     const uh = texture_handles[pt.u.id.toInt()];
@@ -890,7 +892,7 @@ pub fn drawPlanesPro(pt: PlaneTextures, source: Rectangle, dest: Rectangle, orig
     if (yh.idx == std.math.maxInt(u16) or uh.idx == std.math.maxInt(u16) or vh.idx == std.math.maxInt(u16)) return;
 
     const vertices = buildQuadVertices(pt.width, pt.height, source, dest, origin, rotation, tint.toAbgr());
-    programs.submitYuvTriangles(&vertices, yh, uh, vh);
+    programs.submitYuvTriangles(&vertices, yh, uh, vh, yuv_params);
 }
 
 // ── Image decoding helpers ─────────────────────────────────────────────

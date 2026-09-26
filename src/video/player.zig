@@ -18,6 +18,7 @@ const std = @import("std");
 const texture = @import("../gfx/texture.zig");
 const types = @import("../gfx/types.zig");
 const planes = @import("labelle_android").video.planes;
+const yuv_uniform = @import("yuv_uniform.zig");
 
 /// Comptime kill-switch for the GPU-side YUV→RGBA path (perf/gpu-yuv-video).
 /// When true (default) the player uploads raw Y/U/V planes to three R8 textures
@@ -65,6 +66,14 @@ pub fn Player(comptime Decoder: type) type {
             y: []u8,
             u: []u8,
             v: []u8,
+            /// `fs_yuv`'s colour matrix for the frame on the planes
+            /// (labelle-bgfx#155): from the decoder's `colorSpace()` when it
+            /// has one (Android MediaCodec), else BT.601 limited — the
+            /// pre-#155 constants, so desktop/web are unchanged.
+            params: yuv_uniform.Params = yuv_uniform.default_params,
+            /// The matrix `params` was built from, so a colour-metadata change
+            /// (an OUTPUT_FORMAT_CHANGED) is logged once, not per frame.
+            matrix: yuv_uniform.Matrix = yuv_uniform.default_matrix,
         };
 
         decoder: Decoder,
@@ -113,7 +122,22 @@ pub fn Player(comptime Decoder: type) type {
         fn decodeNext(self: *Self) ?f64 {
             if (self.gpu) |*g| {
                 if (comptime @hasDecl(Decoder, "decodeFramePlanes")) {
-                    return self.decoder.decodeFramePlanes(g.y, g.u, g.v);
+                    const pts = self.decoder.decodeFramePlanes(g.y, g.u, g.v) orelse return null;
+                    // After a successful pop, `colorSpace()` is the popped
+                    // frame's (the decoder stamps each ring frame), so the
+                    // matrix only changes when the stream's format does.
+                    if (comptime @hasDecl(Decoder, "colorSpace")) {
+                        const m = yuv_uniform.matrixFor(Decoder, &self.decoder, g.tex.height);
+                        if (!std.meta.eql(m, g.matrix)) {
+                            const cs = self.decoder.colorSpace();
+                            std.log.info("video: GPU-YUV matrix from stream colour (standard={s} range={s}) → rv={d} gu={d} gv={d} bu={d} y_off={d}", .{
+                                @tagName(cs.standard), @tagName(cs.range), m.rv, m.gu, m.gv, m.bu, m.y_off,
+                            });
+                            g.matrix = m;
+                            g.params = yuv_uniform.fromMatrix(m);
+                        }
+                    }
+                    return pts;
                 }
             }
             return self.decoder.decodeFrame(self.pixels);
@@ -306,7 +330,7 @@ pub fn Player(comptime Decoder: type) type {
         /// path is active, else the sprite program with the RGBA texture.
         pub fn drawRegion(self: *const Self, src: types.Rectangle, dest: types.Rectangle) void {
             if (self.gpu) |g| {
-                texture.drawPlanesPro(g.tex, src, dest, .{ .x = 0, .y = 0 }, 0, types.white);
+                texture.drawPlanesPro(g.tex, src, dest, .{ .x = 0, .y = 0 }, 0, types.white, &g.params);
             } else {
                 texture.drawTexturePro(self.tex, src, dest, .{ .x = 0, .y = 0 }, 0, types.white);
             }
