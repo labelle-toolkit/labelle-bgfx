@@ -184,7 +184,7 @@ pub fn loadMusic(path: [:0]const u8) u32 {
 }
 
 /// Register an already-decoded interleaved PCM_16 buffer as a looping music
-/// stream. Used by the Android audio-track decoder (`video/android_audio.zig`)
+/// stream. Used by the Android audio-track decoder (`labelle_android.video.decodeTrack`)
 /// to feed decoded video audio into the mixer. `sample_rate` should be the
 /// device rate (48000): the mixer does not resample. Public signature keeps the
 /// `u16` channels arg bgfx exposed; the shared mixer takes `u8`, so we narrow.

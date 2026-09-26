@@ -261,13 +261,19 @@ pub fn build(b: *std.Build) void {
 
     // Shared Android platform services (labelle-bgfx#149 phase 1): launch
     // intent extras → env, the `android:debuggable` query, the #127 window
-    // relayout and the AAudio output device (#306), as the ONE named module
-    // `labelle_android`. The package compiles its own JNI C against the NDK
-    // sysroot it resolves itself and links `libaaudio`, so nothing here
+    // relayout, the AAudio output device (#306) and the MediaCodec video +
+    // audio-track decoders (FP#549) with the pure `yuv`/`planes` helpers the
+    // desktop decoder shares, as the ONE named module `labelle_android`. The
+    // package compiles its own JNI C against the NDK sysroot it resolves
+    // itself and links `libaaudio` + `libmediandk`, so nothing here
     // `addCSourceFile`s or links for it. Eager dependency: fetched on every
-    // target (tiny), imported by `android_app` and `audio` below.
+    // target (tiny), imported by `gfx` (video), `audio` and `android_app`.
     const android_dep = b.dependency("labelle_android", .{ .target = target, .optimize = optimize });
     const labelle_android_mod = android_dep.module("labelle_android");
+    // `gfx.zig`'s `AndroidVideoDecoder` + `video/{backend,desktop,player}.zig`
+    // reach `labelle_android.video` on every non-wasm target (the desktop
+    // decoder uses its `yuv`/`planes`; the Android one is comptime-gated).
+    gfx_mod.addImport("labelle_android", labelle_android_mod);
 
     // labelle-core, imported on EVERY target so `src/input.zig` can prove it
     // satisfies the engine input contract at comptime (`core.assertInput`) and
@@ -983,28 +989,9 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(font_run).step);
     }
 
-    // Run the video colour-conversion + plane-prep tests on the host. Both
-    // `video/yuv.zig` (CPU YUV→RGBA, BT.601) and `video/planes.zig` (row-tighten
-    // + NV12 de-interleave for the GPU plane-upload path, perf/gpu-yuv-video) are
-    // pure Zig with no zbgfx/NDK dependency, so they EXECUTE on the host — the
-    // verifiable core of the otherwise device-only video decode path.
-    const yuv_run = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/video/yuv.zig"),
-            .target = host_target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(yuv_run).step);
-
-    const planes_run = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/video/planes.zig"),
-            .target = host_target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(planes_run).step);
+    // The video colour-conversion (`yuv`) + plane-prep (`planes`) host tests
+    // moved to the labelle-android package with the files (#149 phase 1d);
+    // they run in that package's `zig build test`.
 
     // Browser video geometry (`video/web.zig`) plus the fit-rect math it shares
     // (`video/fit.zig`): pure Zig, host-run. The EM_JS externs are never
@@ -1035,6 +1022,12 @@ pub fn build(b: *std.Build) void {
     // test itself SKIPS (`error.SkipZigTest`) when no `ffmpeg` is on PATH — CI
     // installs one and asserts the run does not skip, so "green" cannot mean
     // "skipped everywhere".
+    //
+    // `desktop.zig` imports `labelle_android.video.{yuv,planes}` (#149 phase
+    // 1d), so this host-pinned root needs a HOST-resolved instance of the
+    // package (the main `labelle_android_mod` is resolved for the build
+    // target; mixing them into one root would be two module instances).
+    const labelle_android_host_dep = b.dependency("labelle_android", .{ .target = host_target, .optimize = optimize });
     const desktop_video_run = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/video/desktop.zig"),
@@ -1043,6 +1036,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    desktop_video_run.root_module.addImport("labelle_android", labelle_android_host_dep.module("labelle_android"));
     const desktop_video_run_step = b.addRunArtifact(desktop_video_run);
     test_step.dependOn(&desktop_video_run_step.step);
     // Standalone step so CI can run JUST this and assert on its summary
@@ -1369,6 +1363,11 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     });
     gfx_mod.addImport("zbgfx", zbgfx_mod);
     gfx_mod.addImport("labelle-core", core_mod);
+    // labelle-android (#149 phase 1d): gfx.zig's video aliases are `struct {}`
+    // on wasm, so the import is never analyzed here — wired anyway so the
+    // module graph is uniform with the desktop/Android `build()` above.
+    const android_dep = b.dependency("labelle_android", .{ .target = target, .optimize = optimize });
+    gfx_mod.addImport("labelle_android", android_dep.module("labelle_android"));
     gfx_mod.addIncludePath(b.path("src"));
     // Package (or overridden) emscripten sysroot for stb_image's `<stdlib.h>` etc.
     gfx_mod.addSystemIncludePath(emsdk_sysroot_lp);
