@@ -120,6 +120,17 @@
         .raw_gui_adapter,
     },
 
+    // Build-time ASTC upload limits (#407). Keep the verified 4x4/8x8 set;
+    // declaring all TextureFormat tags would overstate device support.
+    // `wasm` is the legacy target name; `web` supports the provider spelling.
+    // PNG remains the runtime fallback when a web GPU cannot sample ASTC.
+    .texture_caps = .{
+        .desktop = .{ .astc = .{ .blocks = .{ .@"4x4", .@"8x8" }, .default_block = .@"8x8" }, .fallback = .none },
+        .android = .{ .astc = .{ .blocks = .{ .@"4x4", .@"8x8" }, .default_block = .@"8x8" }, .fallback = .none },
+        .wasm = .{ .astc = .{ .blocks = .{ .@"4x4", .@"8x8" }, .default_block = .@"8x8" }, .fallback = .png },
+        .web = .{ .astc = .{ .blocks = .{ .@"4x4", .@"8x8" }, .default_block = .@"8x8" }, .fallback = .png },
+    },
+
     // Curated material effects this backend implements (labelle-gfx#305, the
     // `.capabilities` mirror of `core.materialCapabilities(bgfxImpl)` / the
     // runtime `materialSupported`). Advertised as DATA so a project declaring an
