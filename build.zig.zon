@@ -63,6 +63,24 @@
             .url = "https://github.com/labelle-toolkit/labelle-android-gamepad/archive/refs/tags/v0.1.0.tar.gz",
             .hash = "labelle_android_gamepad-0.1.0-aniuyr7OAADukHTeqRqavrEvsUDAutllmC2KJDek0Ox9",
         },
+        // Shared Android platform services (labelle-bgfx#149 phase 1): the
+        // launch-intent extras → env mapping, the `android:debuggable` query,
+        // the stuck-window relayout (JNI C compiled INSIDE the package — it
+        // owns the NDK sysroot helper), the AAudio output device (#306; the
+        // package links `libaaudio`) and the MediaCodec video + audio-track
+        // decoders with the shared `yuv`/`planes` helpers (FP#549; links
+        // `libmediandk`). One named module, `labelle_android`, imported by
+        // `gfx`, `audio` and `android_app`. Eager (not lazy): `build.zig`
+        // `@import`s its build helpers (`resolveNdk` / `addAndroidSysroot` /
+        // `nativeAppGlueDir`, phase 1e) at the top level, which resolves the
+        // package on every build — desktop and wasm included.
+        // Commit pin until labelle-android v0.1.0 is tagged. NEVER a committed
+        // `.path`: `.labelle/deps/labelle-bgfx` is a copy, so a relative path
+        // would not resolve from an assembled game.
+        .labelle_android = .{
+            .url = "https://github.com/labelle-toolkit/labelle-android/archive/df5b78ec2c07360f4e87c85bfdfd59e21db8b08d.tar.gz",
+            .hash = "labelle_android-0.1.0-sErgQs3nAwCwI6QRpkuN_OWgtPWxkoMJbvTzhGoaXZUr",
+        },
         // Shared windowless-SDL desktop gamepad source (core#28). In-tree
         // sub-package shared with the raylib and sokol desktop backends via a
         // relative path. On desktop targets, bgfx's `input` routes the gamepad

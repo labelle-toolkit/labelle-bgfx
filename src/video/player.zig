@@ -3,7 +3,7 @@
 //!
 //! Generic over the decoder so the same wiring drives either backend decoder:
 //!   - desktop: `video/desktop.zig` (ffmpeg)
-//!   - Android: `video/android.zig` (AMediaCodec)
+//!   - Android: `labelle_android.video.VideoDecoder` (AMediaCodec, #149 1d)
 //! A decoder just needs `width()`, `height()`, `decodeFrame([]u8) ?f64`, and
 //! `deinit()`. `decodeFrame` fills the RGBA8 buffer and returns the decoded
 //! frame's presentation timestamp in seconds (the PTS, used for A/V sync), or
@@ -17,7 +17,7 @@
 const std = @import("std");
 const texture = @import("../gfx/texture.zig");
 const types = @import("../gfx/types.zig");
-const planes = @import("planes.zig");
+const planes = @import("labelle_android").video.planes;
 
 /// Comptime kill-switch for the GPU-side YUV→RGBA path (perf/gpu-yuv-video).
 /// When true (default) the player uploads raw Y/U/V planes to three R8 textures

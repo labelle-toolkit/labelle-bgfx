@@ -39,17 +39,27 @@ const is_android = builtin.target.os.tag == .linux and
 const is_wasm = builtin.target.cpu.arch.isWasm();
 
 // Output device, selected per target — the shared `DeviceSink` the mixer
-// drives. On Android it's the AAudio device (#306); on desktop it's the
-// miniaudio device. Both expose `ensureStarted`/`stop`/`framesMixed`, so they
-// satisfy `labelle_audio.DeviceSink`. `if (is_android)` is comptime, so only
-// the taken branch is analyzed — the desktop miniaudio `@cImport` is never seen
-// on Android, and the AAudio externs are never seen on desktop.
+// drives. On Android it's labelle-android's AAudio device (#306, moved there
+// in #149 phase 1c); on desktop it's the miniaudio device. Both expose
+// `ensureStarted`/`stop`/`framesMixed`, so they satisfy
+// `labelle_audio.DeviceSink`. `if (is_android)` is comptime, so only the taken
+// branch is analyzed — the desktop miniaudio `@cImport` is never seen on
+// Android, and the `labelle_android` import (and its AAudio externs) is never
+// seen on desktop — the same pattern as `zglfw` in `window.zig`.
 const device_backend = if (is_android)
-    @import("audio_device_android.zig")
+    @import("labelle_android").aaudio
 else if (is_wasm)
     labelle_audio.NullSink
 else
     @import("audio_device.zig");
+
+// labelle-android declares the device's `MixCallback` structurally (it has no
+// labelle-audio dependency). Function-pointer types are structural in Zig, so
+// the two are one type — assert it, so a drift in either package is a compile
+// error at the `Mixer(...)` instantiation site rather than a silent mismatch.
+comptime {
+    if (is_android) std.debug.assert(@import("labelle_android").aaudio.MixCallback == labelle_audio.MixCallback);
+}
 
 /// The shared PCM mixer, parameterized by bgfx's OS device as the `DeviceSink`.
 /// Owns WAV decode + slot arrays + the spinlock + the full AudioInterface
@@ -174,7 +184,7 @@ pub fn loadMusic(path: [:0]const u8) u32 {
 }
 
 /// Register an already-decoded interleaved PCM_16 buffer as a looping music
-/// stream. Used by the Android audio-track decoder (`video/android_audio.zig`)
+/// stream. Used by the Android audio-track decoder (`labelle_android.video.decodeTrack`)
 /// to feed decoded video audio into the mixer. `sample_rate` should be the
 /// device rate (48000): the mixer does not resample. Public signature keeps the
 /// `u16` channels arg bgfx exposed; the shared mixer takes `u8`, so we narrow.

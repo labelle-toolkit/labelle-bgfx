@@ -11,7 +11,9 @@ const heap = @import("gfx/heap.zig");
 const audio_heap = @import("audio_heap.zig");
 
 /// Files allowed to name page_allocator: the two allocator files, and host-only
-/// tools that never build for wasm (goldens, probes, Android-only video).
+/// tools that never build for wasm (goldens, probes). The standalone Android
+/// decode harness (`video/apk/native.zig`, `video/test_decode.zig`) was retired
+/// with the decoder's move to labelle-android (#149 phase 1d, cli#405).
 const allowed = [_][]const u8{
     "gfx/heap.zig",
     "audio_heap.zig",
@@ -22,8 +24,6 @@ const allowed = [_][]const u8{
     "screenshot_probe.zig",
     "shader_material_probe.zig",
     "texture_sampling_probe.zig",
-    "video/apk/native.zig",
-    "video/test_decode.zig",
 };
 
 /// `path` as the walker returns it: native separators, so `\\` on Windows.
@@ -42,7 +42,8 @@ fn isAllowed(path: []const u8) bool {
 test "the allowlist matches Windows-style walker paths" {
     try std.testing.expect(isAllowed("gfx/heap.zig"));
     try std.testing.expect(isAllowed("gfx\\heap.zig"));
-    try std.testing.expect(isAllowed("video\\apk\\native.zig"));
+    // The retired Android harness must NOT be allowlisted any more (#149 1d).
+    try std.testing.expect(!isAllowed("video\\apk\\native.zig"));
     try std.testing.expect(!isAllowed("gfx\\texture.zig"));
 }
 
@@ -72,7 +73,9 @@ test "no production file names std.heap.page_allocator" {
     }
     for (offenders.items) |o| std.debug.print("src/{s} names std.heap.page_allocator; use heap.allocator (src/gfx/heap.zig)\n", .{o});
     // The walk really covered the tree (a wrong cwd would scan nothing and pass).
-    try std.testing.expect(scanned > 50);
+    // Floor lowered 50 → 40 as the Android services move out to
+    // labelle-android (#149); still far above an empty or wrong-cwd walk.
+    try std.testing.expect(scanned > 40);
     try std.testing.expectEqual(@as(usize, 0), offenders.items.len);
 }
 

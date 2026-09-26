@@ -397,7 +397,9 @@ pub const PostPassUniforms = core.backend_contract.PostPassUniforms;
 // ── In-engine video (#549 Path A) ──────────────────────────────────────
 // VideoPlayer wires a decoder → dynamic texture → drawTexturePro. Generic over
 // the decoder so the same player drives ffmpeg (desktop) or AMediaCodec
-// (Android). The Android decoder is hardware-verified (see video/apk/).
+// (Android). The Android decoder (and the pure `yuv`/`planes` helpers the
+// desktop decoder shares) comes from the `labelle_android` package (#149
+// phase 1d); it is verified on-device through a game's intro clip.
 // The NATIVE decoders are desktop/Android-only: the desktop decoder shells out
 // to ffmpeg and the CPU YUV path uses `std.Thread.spawn`, neither of which is
 // available (or wanted) on wasm32-emscripten (single-threaded WebGL, no
@@ -408,7 +410,7 @@ pub const PostPassUniforms = core.backend_contract.PostPassUniforms;
 const is_wasm = @import("builtin").target.cpu.arch.isWasm();
 pub const VideoPlayer = if (is_wasm) struct {} else @import("video/player.zig").Player;
 pub const DesktopVideoDecoder = if (is_wasm) struct {} else @import("video/desktop.zig").VideoDecoder;
-pub const AndroidVideoDecoder = if (is_wasm) struct {} else @import("video/android.zig").VideoDecoder;
+pub const AndroidVideoDecoder = if (is_wasm) struct {} else @import("labelle_android").video.VideoDecoder;
 // VideoBackend satisfies core.VideoInterface: a name → player handle pool the
 // assembler wires into the engine's VideoImpl slot, so a game plays a clip with
 // just its asset name (#549).

@@ -43,11 +43,19 @@ Since the bgfx API 161 vendor (#119):
   renderer: Linux without Vulkan, or the Windows GL fallback. macOS uses Metal;
   Android and WebGL2 use GLES 3.0 and are unaffected.
 
-## Shared gamepad packages
+## Shared gamepad and Android packages
 
 The desktop/Android gamepad sources are versioned packages this backend depends
 on (not vendored): [`labelle-sdl-gamepad`](https://github.com/labelle-toolkit/labelle-sdl-gamepad)
 and [`labelle-android-gamepad`](https://github.com/labelle-toolkit/labelle-android-gamepad).
+The generic Android services — launch-intent `LABELLE_*` extras → env
+(#139), the `android:debuggable` query (labelle-assembler#737), the
+stuck-window relayout (#127), the AAudio output device (#306) and the
+MediaCodec video + audio-track decoders with the `yuv`/`planes` helpers the
+desktop decoder shares (FP#549) — come from
+[`labelle-android`](https://github.com/labelle-toolkit/labelle-android)
+(module `labelle_android`, #149); the NativeActivity shell, surface
+ownership, the apk asset open and the bgfx-specific renderer glue stay here.
 
 | Path | Role |
 |------|------|
@@ -285,8 +293,8 @@ So, before writing a test, check `build.zig` for a `b.addTest` whose
 `root_source_file` **is the file you are writing in**. If there isn't one:
 
 - **Pure, dependency-free file?** Give it its own test artifact, the way
-  `src/gfx/state.zig`, `src/gfx/astc.zig`, `src/video/yuv.zig` and
-  `src/video/planes.zig` each have one.
+  `src/gfx/state.zig`, `src/gfx/astc.zig` and `src/video/web.zig` each
+  have one.
 - **File that pulls the module graph (zbgfx, the stb `@cImport`, shaders)?**
   Add a dedicated root file under `src/` that imports it and holds the blocks,
   then wire that as the artifact — `src/font_tests.zig` is the worked example.
