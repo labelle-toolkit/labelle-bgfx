@@ -80,8 +80,8 @@ pub fn build(b: *std.Build) void {
 
     // Shared audio engine (pluggable-backends RFC, Phase 2). `src/audio.zig`
     // now forwards to `labelle_audio.Mixer(device_backend)`; the device modules
-    // (`audio_device.zig` / `audio_device_android.zig`) satisfy its `DeviceSink`
-    // contract. Wired into the `audio` module (and the host audio test module)
+    // (`audio_device.zig` on desktop, `labelle_android.aaudio` on Android)
+    // satisfy its `DeviceSink` contract. Wired into the `audio` module (and the host audio test module)
     // under the `labelle-audio` import key. Resolved on every target — the
     // mixer/decoder are pure Zig and compile for Android unchanged.
     const labelle_audio_dep = b.dependency("labelle_audio", .{ .target = target, .optimize = optimize });
@@ -260,11 +260,12 @@ pub fn build(b: *std.Build) void {
     input_mod.addImport("android_gamepad", android_gp_dep.module("android_gamepad"));
 
     // Shared Android platform services (labelle-bgfx#149 phase 1): launch
-    // intent extras → env, the `android:debuggable` query and the #127 window
-    // relayout, as the ONE named module `labelle_android`. The package
-    // compiles its own JNI C against the NDK sysroot it resolves itself, so
-    // nothing here `addCSourceFile`s for it. Eager dependency: fetched on
-    // every target (tiny), referenced only by `android_app` below.
+    // intent extras → env, the `android:debuggable` query, the #127 window
+    // relayout and the AAudio output device (#306), as the ONE named module
+    // `labelle_android`. The package compiles its own JNI C against the NDK
+    // sysroot it resolves itself and links `libaaudio`, so nothing here
+    // `addCSourceFile`s or links for it. Eager dependency: fetched on every
+    // target (tiny), imported by `android_app` and `audio` below.
     const android_dep = b.dependency("labelle_android", .{ .target = target, .optimize = optimize });
     const labelle_android_mod = android_dep.module("labelle_android");
 
@@ -350,19 +351,24 @@ pub fn build(b: *std.Build) void {
     // Shared WAV decode + PCM mixer (Phase 2). `audio.zig` instantiates
     // `labelle_audio.Mixer(device_backend)` and forwards every public fn to it.
     audio_mod.addImport("labelle-audio", labelle_audio_mod);
+    // The Android output device (`labelle_android.aaudio`, #306 → #149 phase
+    // 1c). Wired on EVERY target: `audio.zig` reaches it only inside a dead
+    // comptime branch off Android (the `zglfw` pattern), and the package
+    // module itself links `libaaudio` on Android, so nothing here does.
+    audio_mod.addImport("labelle_android", labelle_android_mod);
     if (!is_android) {
         // ── miniaudio playback device (#297) — desktop only ─────────
         wireMiniaudio(b, audio_mod, target.result.os.tag);
     } else if (ndk) |n| {
-        // On Android the mixer is AAudio-backed (`audio_device_android.zig`,
-        // #306), which links `libaaudio`. The module's Zig source is pure
-        // `extern fn` (no `@cInclude`), so the device-less compile-check below
-        // emits its object without sysroot headers — but apply the SAME NDK
-        // sysroot the other Android modules use so the lib path / API level /
-        // PIC are wired for any consumer that actually *links* it (e.g. the
-        // libgame.so app link). Desktop never reaches this branch.
+        // On Android the mixer is AAudio-backed via `labelle_android.aaudio`.
+        // This module's own Zig source has no `@cInclude`, so the device-less
+        // compile-check below emits its object without sysroot headers — but
+        // apply the SAME NDK sysroot the other Android modules use so the lib
+        // path / API level / PIC are wired for any consumer that actually
+        // *links* it (e.g. the libgame.so app link). Desktop never reaches
+        // this branch. (Replaced by the package's `addAndroidSysroot` in
+        // phase 1e.)
         applyNdkSysroot(audio_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
-        audio_mod.linkSystemLibrary("aaudio", .{});
     }
 
     // ── Window backend module ───────────────────────────────────────
@@ -1237,6 +1243,8 @@ pub fn build(b: *std.Build) void {
     // host target so the run-test executes natively).
     const labelle_audio_host_dep = b.dependency("labelle_audio", .{ .target = host_target, .optimize = optimize });
     audio_test_mod.addImport("labelle-audio", labelle_audio_host_dep.module("labelle-audio"));
+    // No `labelle_android` import here: `audio.zig` names it only inside its
+    // dead `is_android` comptime branch, which Sema never reaches on the host.
     wireMiniaudio(b, audio_test_mod, host_target.result.os.tag);
     const audio_tests = b.addTest(.{ .root_module = audio_test_mod });
     test_step.dependOn(&b.addRunArtifact(audio_tests).step);
