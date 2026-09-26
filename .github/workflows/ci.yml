@@ -575,7 +575,8 @@ jobs:
             out=$(zig build "$step" 2>&1); rc=$?
             echo "$out"
             if [ "$rc" -ne 0 ]; then echo "FAIL: $step exited non-zero ($rc)"; fail=1; fi
-            echo "$out" | grep -qE 'HEADLESS_OFFSCREEN_READBACK_OK|HEADLESS_MIRROR_OK|SCREENSHOT_TGA_OK|SURFACELESS_SCALE_OK|ROTATED_RECT_FILLED|POSTFX_FIT_OK|COMPRESSED_SUPPORT_AGREES' \
+            # A here-string avoids producer SIGPIPE when grep exits early.
+            grep -qE 'HEADLESS_OFFSCREEN_READBACK_OK|HEADLESS_MIRROR_OK|SCREENSHOT_TGA_OK|SURFACELESS_SCALE_OK|ROTATED_RECT_FILLED|POSTFX_FIT_OK|COMPRESSED_SUPPORT_AGREES' <<< "$out" \
               || { echo "FAIL: $step did not report OK"; fail=1; }
             echo "::endgroup::"
           done

@@ -499,11 +499,12 @@ fn wasmWheel(_: i32, e: *const em.WheelEvent, _: ?*anyopaque) callconv(.c) bool 
 // layout-INDEPENDENT (physical position), matching how desktop GLFW reports
 // keys. TEXT input stays on the keypress/char path (`imgui_bridge_char`), which
 // SHOULD be layout-dependent — only engine key-state uses physical `code`.
-// Unmapped keys (F-keys, punctuation, numpad, …) are ignored for now.
+// F5/F8/F9 are game commands; other F-keys, punctuation and numpad remain unmapped.
 
 /// Physical `KeyboardEvent.code` token → GLFW/engine keycode, or null when
 /// unmapped. GLFW letter/digit codes coincide with ASCII: A=65..Z=90, 0=48..9=57.
 fn codeToGlfwKey(code: []const u8) ?u32 {
+    if (web_command_keys.key(code)) |command| return command;
     // Letter keys "KeyA".."KeyZ" → GLFW 65..90 (== the ASCII uppercase letter).
     if (code.len == 4 and std.mem.eql(u8, code[0..3], "Key")) {
         const c = code[3];
@@ -541,13 +542,23 @@ fn wasmKeyCode(e: *const em.KeyboardEvent) []const u8 {
     return std.mem.sliceTo(&e.code, 0);
 }
 
-// All three key callbacks return FALSE so emscripten does NOT call
-// `preventDefault()`. Returning true would suppress the follow-on `keypress`
-// event (so `wasmKeyPress`/`imgui_bridge_char` never fire → text input broken)
-// and swallow browser shortcuts. The FP web page is a fullscreen canvas, so we
-// don't need to consume keys to stop page-scroll; text-input correctness wins.
+const web_command_keys = @import("web_command_keys.zig");
+var wasm_command_gate: web_command_keys.Gate = .{};
+
+fn wasmMods(e: *const em.KeyboardEvent) web_command_keys.Mods {
+    return .{ .ctrl = e.ctrlKey, .shift = e.shiftKey, .alt = e.altKey, .meta = e.metaKey };
+}
+
+// Text keys return false so keypress still feeds ImGui. Plain F5/F8/F9
+// have no text event; consume them so quicksave cannot reload the page.
+// Modified browser shortcuts remain available and do not trigger a game action.
 fn wasmKeyDown(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) bool {
-    if (codeToGlfwKey(wasmKeyCode(e))) |code| {
+    const code_str = wasmKeyCode(e);
+    const mods = wasmMods(e);
+    // A modified F5/F8/F9 is a browser shortcut: not recorded, and the gate
+    // remembers that so its keyup is not reported either.
+    const accepted = wasm_command_gate.down(code_str, mods, e.repeat);
+    if (accepted) if (codeToGlfwKey(code_str)) |code| {
         wasm_key_down[code] = true; // held-state for isKeyDown (no poll on wasm)
         // Auto-repeat isn't a fresh press: skip the edge accum + the imgui key
         // event (imgui auto-repeats from held state), matching desktop.
@@ -555,17 +566,21 @@ fn wasmKeyDown(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) 
             wasm_key_pressed_accum[code] = true; // latched into keys_pressed in newFrame
             if (comptime gui_enabled) imgui.imgui_bridge_key(@intCast(code), true);
         }
-    }
-    return false;
+    };
+    return web_command_keys.capture(code_str, mods, accepted);
 }
 
 fn wasmKeyUp(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) bool {
-    if (codeToGlfwKey(wasmKeyCode(e))) |code| {
+    const code_str = wasmKeyCode(e);
+    // Only report (and forward to ImGui) the release of a key whose keydown
+    // was accepted — a modified command keyup must not record a release.
+    const accepted = wasm_command_gate.up(code_str);
+    if (accepted) if (codeToGlfwKey(code_str)) |code| {
         wasm_key_down[code] = false;
         wasm_key_released_accum[code] = true; // latched into keys_released in newFrame
         if (comptime gui_enabled) imgui.imgui_bridge_key(@intCast(code), false);
-    }
-    return false;
+    };
+    return web_command_keys.capture(code_str, wasmMods(e), accepted);
 }
 
 fn wasmKeyPress(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c) bool {
@@ -584,6 +599,7 @@ fn wasmKeyPress(_: i32, e: *const em.KeyboardEvent, _: ?*anyopaque) callconv(.c)
 /// held key + pointer state on blur (forwarding key-up to imgui for anything
 /// that was down), so returning to the tab starts from a clean slate.
 fn wasmBlur(_: i32, _: *const anyopaque, _: ?*anyopaque) callconv(.c) bool {
+    wasm_command_gate.reset();
     for (0..MAX_KEYS) |k| {
         if (wasm_key_down[k]) {
             wasm_key_down[k] = false;

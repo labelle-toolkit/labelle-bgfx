@@ -825,6 +825,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const test_step = b.step("test", "Run bgfx backend unit tests");
+    const web_command_keys = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/web_command_keys.zig"),
+        .target = host_target,
+        .optimize = optimize,
+    }) });
+    const web_command_keys_run = b.addRunArtifact(web_command_keys);
+    test_step.dependOn(&web_command_keys_run.step);
+    b.step("test-web-command-keys", "Test browser save/load shortcut routing").dependOn(&web_command_keys_run.step);
+
     const shader_material_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/shader_material_tests.zig"),
         .target = b.graph.host,
@@ -1398,6 +1407,10 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // Browser fullscreen (`window.zig` wasm `setFullscreen`/`isFullscreen`,
     // labelle-bgfx#99): the EM_JS half driving the DOM Fullscreen API.
     gfx_mod.addCSourceFile(.{ .file = b.path("src/web_fullscreen.c"), .flags = &.{} });
+    if (b.lazyDependency("labelle_web", .{ .target = target, .optimize = optimize })) |web_storage| {
+        gfx_mod.addImport("persistent_storage", web_storage.module("storage"));
+        gfx_mod.addCSourceFile(.{ .file = web_storage.path("src/web_storage.c"), .flags = &.{} });
+    }
 
     // ── Input backend module ────────────────────────────────────────
     // No zglfw / no sdl_gamepad (both desktop-only) — src/input.zig comptime-gates

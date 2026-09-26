@@ -720,3 +720,6 @@ test "the physical surface is reachable from the module root" {
         }
     }
 }
+
+/// Optional persistent storage bindings; native file storage is engine-owned.
+pub const PersistentStorage = if (is_wasm) @import("persistent_storage") else struct {};
