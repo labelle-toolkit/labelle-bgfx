@@ -72,7 +72,9 @@ test "no production file names std.heap.page_allocator" {
     }
     for (offenders.items) |o| std.debug.print("src/{s} names std.heap.page_allocator; use heap.allocator (src/gfx/heap.zig)\n", .{o});
     // The walk really covered the tree (a wrong cwd would scan nothing and pass).
-    try std.testing.expect(scanned > 50);
+    // Floor lowered 50 → 40 as the Android services move out to
+    // labelle-android (#149); still far above an empty or wrong-cwd walk.
+    try std.testing.expect(scanned > 40);
     try std.testing.expectEqual(@as(usize, 0), offenders.items.len);
 }
 

@@ -27,6 +27,9 @@ const builtin = @import("builtin");
 // which Zig 0.16 rejects ("file exists in modules ...").
 const window = @import("window");
 const input = @import("input");
+// Shared Android services (labelle-bgfx#149): intent extras → env, the
+// `android:debuggable` query and the #127 window relayout. Named module.
+const labelle_android = @import("labelle_android");
 // The `AInputEvent` handler (touch + gamepad) lives in its own file.
 const onInputEvent = @import("android_input_event.zig").onInputEvent;
 // `root` is the compilation's root module — the generated game's
@@ -117,15 +120,17 @@ pub const ANativeActivityCallbacks = extern struct {
 /// pointer, so the offset is correct.
 pub const ANativeActivity = extern struct {
     callbacks: *ANativeActivityCallbacks,
-    /// `JavaVM* vm` — handed to the JNI helper that reads this process's own
-    /// `ApplicationInfo.FLAG_DEBUGGABLE` (see `isDebuggable`).
+    /// `JavaVM* vm` — read by labelle-android's JNI helpers (through the
+    /// NDK's own `ANativeActivity` header) for `isDebuggable`, the intent
+    /// extras and the relayout; this struct is passed to them opaquely.
     vm: ?*anyopaque,
     /// `JNIEnv* env` — the UI thread's env. Deliberately untyped and unused:
     /// `android_main` runs on the glue's own thread, where this env is NOT
     /// valid; the helper attaches its own.
     _env: ?*anyopaque,
     /// `jobject clazz` — the NativeActivity's own Java object, the receiver
-    /// for the `getApplicationInfo()` call in `isDebuggable`.
+    /// for the JNI calls labelle-android makes (`getApplicationInfo()`,
+    /// `getIntent()`, `getWindow()`).
     clazz: ?*anyopaque,
     /// `const char* internalDataPath` — the app's OWN private directory
     /// (`/data/data/<package>/files`). The only filesystem location a
@@ -376,9 +381,6 @@ threadlocal var focus_activity: ?*ANativeActivity = null;
 /// The NDK glue's original `onWindowFocusChanged`, saved so `focusHook`
 /// can forward to it. Set in `run()` before `focusHook` is installed.
 var glue_focus_cb: ?*const fn (*ANativeActivity, c_int) callconv(.c) void = null;
-/// UI-thread half of the stuck-surface recovery (labelle-bgfx#127):
-/// `src/android_window_relayout.c`.
-extern "c" fn labelle_bgfx_force_window_relayout(vm: ?*anyopaque, clazz: ?*anyopaque) c_int;
 
 /// Our chained `onWindowFocusChanged`. Runs on the UI thread, so the
 /// engine's `WindowInsetsController.hide()` (driven via `immersive_cb`)
@@ -420,7 +422,8 @@ fn recoverDegenerateWindow(activity: *ANativeActivity) void {
     const w = @atomicLoad(?*ANativeWindow, &app.window, .acquire) orelse return;
     const size = [2]i32{ ANativeWindow_getWidth(w), ANativeWindow_getHeight(w) };
     if (!window.isDegenerateSurface(size)) return;
-    const ok = labelle_bgfx_force_window_relayout(activity.vm, activity.clazz) != 0;
+    // UI-thread half of the recovery: labelle-android's JNI relayout (#149).
+    const ok = labelle_android.relayout.forceWindowRelayout(@ptrCast(activity));
     std.log.info("bgfx: restored window is {d}x{d}; forcing a relayout (#127): {s}", .{ size[0], size[1], if (ok) "requested" else "JNI failed" });
 }
 
@@ -759,14 +762,14 @@ pub fn run(app: *android_app) void {
     if (app_ptr == null) adoptAccessorsLocked(app);
     unlockOwner();
 
-    // Launch-intent extras → env vars (labelle-bgfx#139), BEFORE the loop: the
-    // game's first `getenv` of a run option is in `init_fn` (engine + scene
-    // init, fired on the first INIT_WINDOW, which only this loop can deliver),
-    // so everything read from there on sees the copied values. The extras are
-    // read from THIS activity's intent. The debuggable gate reads
-    // `native_activity`, which can still be a previous instance while it owns
-    // bgfx (#143); it is the same package, so the answer is the same.
-    if (app.activity) |activity| applyLaunchIntentEnv(activity);
+    // Launch-intent extras → env vars (labelle-bgfx#139, now labelle-android's
+    // `launch_intent`, #149), BEFORE the loop: the game's first `getenv` of a
+    // run option is in `init_fn` (engine + scene init, fired on the first
+    // INIT_WINDOW, which only this loop can deliver), so everything read from
+    // there on sees the copied values. The extras AND the debuggable gate are
+    // read from THIS activity; with two instances alive (#143) it is the same
+    // package, so the (process-cached) debuggable answer is the same.
+    if (app.activity) |activity| labelle_android.launch_intent.apply(@ptrCast(activity));
 
     // Chain `onWindowFocusChanged` so the engine's immersive re-hide runs
     // on the UI thread (the only thread `WindowInsetsController.hide()` is
@@ -908,16 +911,6 @@ pub fn internalDataPath() ?[*:0]const u8 {
     return activity.internal_data_path;
 }
 
-/// JNI side of `isDebuggable` — `src/android_debuggable.c`, compiled into this
-/// module on Android and an empty TU everywhere else. Declared unconditionally
-/// (extern decls are only linked when referenced) so the non-Android path below
-/// folds away without a comptime block around the declaration.
-extern "c" fn labelle_bgfx_app_is_debuggable(vm: ?*anyopaque, clazz: ?*anyopaque) c_int;
-
-/// Cache: the flag cannot change for the life of the process, and the query is
-/// a JNI attach + four lookups. `null` = not asked yet.
-var is_debuggable_cached: ?bool = null;
-
 /// Is the RUNNING apk marked `android:debuggable`? (labelle-assembler#737)
 ///
 /// This gates the `labelle_env` knob-file channel. `adb shell run-as
@@ -928,84 +921,14 @@ var is_debuggable_cached: ?bool = null;
 /// about its own `ApplicationInfo.FLAG_DEBUGGABLE` closes that, so a release
 /// build ignores a stale file.
 ///
-/// Fails CLOSED: no activity, no VM, or any JNI failure answers `false`. A
-/// verification aid that cannot prove it is allowed must stay off.
+/// The JNI walk, its process-wide cache and the fail-CLOSED rule (no activity,
+/// no VM, or any JNI failure answers `false`) live in labelle-android (#149).
+/// Kept as a `pub fn` on this module: the generated Android main
+/// (`templates/android.txt`) reaches it through `@hasDecl(android_app,
+/// "isDebuggable")`.
 pub fn isDebuggable() bool {
-    // `comptime` so the extern is not even referenced off Android, where the C
-    // TU compiles to an empty object and the symbol does not exist.
-    if (comptime !is_android) return false;
-    if (is_debuggable_cached) |cached| return cached;
     const activity = @atomicLoad(?*ANativeActivity, &native_activity, .acquire) orelse return false; // not cached: asked too early
-    const result = labelle_bgfx_app_is_debuggable(activity.vm, activity.clazz) != 0;
-    is_debuggable_cached = result;
-    return result;
-}
-
-// ── Launch-intent extras → env vars (labelle-bgfx#139) ──────────────
-// `labelle run --platform=android --scene=X` launches with `am start ...
-// --es LABELLE_SCENE X` (labelle-cli#397); the allow-list and the per-key
-// decision live in `android_intent_env.zig` (host-tested), the JNI read in
-// `src/android_intent_extras.c`.
-const intent_env = @import("android_intent_env.zig");
-
-extern "c" fn labelle_bgfx_read_intent_extras(
-    vm: ?*anyopaque,
-    clazz: ?*anyopaque,
-    keys: [*]const [*:0]const u8,
-    count: c_int,
-    buf: [*]u8,
-    buf_cap: usize,
-    lens: [*]c_int,
-) c_int;
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
-/// Survives activity relaunches in a cached process, so a plain launch can
-/// clear what a previous `--scene` launch set (see `intent_env.action`).
-var intent_env_state: intent_env.State = .{};
-/// Backing store for the extras' values. setenv copies them, so it is only
-/// needed for the duration of `applyLaunchIntentEnv`.
-var intent_buf: [4096]u8 = undefined;
-
-extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-
-const LibcEnv = struct {
-    pub fn get(_: LibcEnv, name: [:0]const u8) ?[:0]const u8 {
-        return if (getenv(name.ptr)) |v| std.mem.span(v) else null;
-    }
-    pub fn set(_: LibcEnv, name: [:0]const u8, value: [:0]const u8) bool {
-        return setenv(name.ptr, value.ptr, 1) == 0;
-    }
-    pub fn unset(_: LibcEnv, name: [:0]const u8) void {
-        _ = unsetenv(name.ptr);
-    }
-    pub fn debuggable(_: LibcEnv) bool {
-        return isDebuggable();
-    }
-};
-
-/// Copy the launch intent's allow-listed `LABELLE_*` string extras into the
-/// process environment. A launch with no extras (the launcher icon) or any
-/// JNI failure changes nothing, except clearing values a previous intent set.
-fn applyLaunchIntentEnv(activity: *ANativeActivity) void {
-    if (comptime !is_android) return;
-    var names: [intent_env.keys.len][*:0]const u8 = undefined;
-    for (intent_env.keys, 0..) |k, i| names[i] = k.name.ptr;
-    var lens: [intent_env.keys.len]c_int = undefined;
-    if (labelle_bgfx_read_intent_extras(activity.vm, activity.clazz, &names, names.len, &intent_buf, intent_buf.len, &lens) == 0) {
-        std.log.warn("bgfx: could not read the launch intent; LABELLE_* extras ignored", .{});
-        return;
-    }
-    var extras: [intent_env.keys.len]?[:0]const u8 = @splat(null);
-    var off: usize = 0;
-    for (lens, 0..) |len, i| {
-        if (len == -2) std.log.warn("bgfx: intent extra {s} too long or contains a NUL; ignored", .{intent_env.keys[i].name});
-        if (len < 0) continue;
-        const n: usize = @intCast(len);
-        extras[i] = intent_buf[off .. off + n :0];
-        off += n + 1;
-    }
-    intent_env.apply(&intent_env_state, extras, LibcEnv{});
+    return labelle_android.debuggable.isDebuggable(@ptrCast(activity));
 }
 
 /// C-ABI accessor the bgfx Android backend adapter binds `extern "c"` (see
@@ -1044,7 +967,7 @@ comptime {
     _ = getNativeActivity;
     _ = setImmersiveCallback;
     _ = &focusHook;
-    _ = applyLaunchIntentEnv;
+    _ = isDebuggable;
 }
 
 test "android_app module compiles for the host as a no-op namespace" {

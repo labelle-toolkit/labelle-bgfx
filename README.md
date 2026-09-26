@@ -43,11 +43,17 @@ Since the bgfx API 161 vendor (#119):
   renderer: Linux without Vulkan, or the Windows GL fallback. macOS uses Metal;
   Android and WebGL2 use GLES 3.0 and are unaffected.
 
-## Shared gamepad packages
+## Shared gamepad and Android packages
 
 The desktop/Android gamepad sources are versioned packages this backend depends
 on (not vendored): [`labelle-sdl-gamepad`](https://github.com/labelle-toolkit/labelle-sdl-gamepad)
 and [`labelle-android-gamepad`](https://github.com/labelle-toolkit/labelle-android-gamepad).
+The generic Android services the NativeActivity shell uses — launch-intent
+`LABELLE_*` extras → env (#139), the `android:debuggable` query
+(labelle-assembler#737) and the stuck-window relayout (#127) — come from
+[`labelle-android`](https://github.com/labelle-toolkit/labelle-android)
+(module `labelle_android`, #149); the shell, surface ownership and the
+bgfx-specific renderer glue stay here.
 
 | Path | Role |
 |------|------|
