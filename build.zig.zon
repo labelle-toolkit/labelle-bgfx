@@ -7,8 +7,8 @@
         // Unreleased storage integration: immutable, real revision. Replace
         // with the first labelle-web release before merging this draft.
         .labelle_web = .{
-            .url = "https://github.com/labelle-toolkit/labelle-web/archive/003acf235bc49d2e352c6f72c372f61ada32d3e3.tar.gz",
-            .hash = "labelle_web-0.0.0-rzifm_4hAACRU_SLZdnQoG_yFuu2OBMydV4_t7sd0J2e",
+            .url = "https://github.com/labelle-toolkit/labelle-web/archive/43e2fc9c848c847f60d9cf698e7c4847e22cfaa6.tar.gz",
+            .hash = "labelle_web-0.0.0-rzifm1EkAABYsoTkV7Jctha59UzzYFTM9uwyzhl1JdOb",
             .lazy = true,
         },
         // Pinned to specific commits — same class of fix as #146.
