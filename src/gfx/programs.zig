@@ -147,6 +147,11 @@ var yuv_program: bgfx.ProgramHandle = .{ .idx = std.math.maxInt(u16) };
 var s_texY_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var s_texU_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var s_texV_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+/// `fs_yuv`'s colour-matrix uniforms (labelle-bgfx#155): `(Y offset, Y gain,
+/// chroma offset, 0)` and `(V->R, U->G, V->G, U->B)`, set per draw from the
+/// stream's colour metadata (`video/yuv_uniform.zig`).
+var u_yuvOffsetGain_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+var u_yuvCoeffs_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var yuv_initialized: bool = false;
 /// Set when `initYuvProgram` has tried and failed (e.g. `fs_yuv` won't link on
 /// this driver). Latches the failure so `ensureYuvProgram` gives up after ONE
@@ -319,10 +324,13 @@ fn initYuvProgram() void {
     s_texY_uniform = bgfx.createUniform("s_texY", .Sampler, 1);
     s_texU_uniform = bgfx.createUniform("s_texU", .Sampler, 1);
     s_texV_uniform = bgfx.createUniform("s_texV", .Sampler, 1);
+    u_yuvOffsetGain_uniform = bgfx.createUniform("u_yuvOffsetGain", .Vec4, 1);
+    u_yuvCoeffs_uniform = bgfx.createUniform("u_yuvCoeffs", .Vec4, 1);
     if (!isValidHandle(s_texY_uniform.idx) or !isValidHandle(s_texU_uniform.idx) or
-        !isValidHandle(s_texV_uniform.idx))
+        !isValidHandle(s_texV_uniform.idx) or !isValidHandle(u_yuvOffsetGain_uniform.idx) or
+        !isValidHandle(u_yuvCoeffs_uniform.idx))
     {
-        std.log.err("bgfx: failed to create YUV sampler uniforms; falling back to CPU YUV path", .{});
+        std.log.err("bgfx: failed to create YUV sampler/matrix uniforms; falling back to CPU YUV path", .{});
         // Tear down the whole group so we never cache a half-initialized program
         // (and never leak the program / the uniforms that DID create). Latch
         // yuv_failed like the other failure paths so we don't retry every frame.
@@ -331,9 +339,13 @@ fn initYuvProgram() void {
         if (isValidHandle(s_texY_uniform.idx)) bgfx.destroyUniform(s_texY_uniform);
         if (isValidHandle(s_texU_uniform.idx)) bgfx.destroyUniform(s_texU_uniform);
         if (isValidHandle(s_texV_uniform.idx)) bgfx.destroyUniform(s_texV_uniform);
+        if (isValidHandle(u_yuvOffsetGain_uniform.idx)) bgfx.destroyUniform(u_yuvOffsetGain_uniform);
+        if (isValidHandle(u_yuvCoeffs_uniform.idx)) bgfx.destroyUniform(u_yuvCoeffs_uniform);
         s_texY_uniform = .{ .idx = std.math.maxInt(u16) };
         s_texU_uniform = .{ .idx = std.math.maxInt(u16) };
         s_texV_uniform = .{ .idx = std.math.maxInt(u16) };
+        u_yuvOffsetGain_uniform = .{ .idx = std.math.maxInt(u16) };
+        u_yuvCoeffs_uniform = .{ .idx = std.math.maxInt(u16) };
         yuv_failed = true;
         return;
     }
@@ -352,7 +364,8 @@ pub fn ensureYuvProgram() bool {
         initYuvProgram();
     }
     return yuv_initialized and isValidProgram(yuv_program) and
-        isValidHandle(s_texY_uniform.idx) and isValidHandle(s_texU_uniform.idx) and isValidHandle(s_texV_uniform.idx);
+        isValidHandle(s_texY_uniform.idx) and isValidHandle(s_texU_uniform.idx) and isValidHandle(s_texV_uniform.idx) and
+        isValidHandle(u_yuvOffsetGain_uniform.idx) and isValidHandle(u_yuvCoeffs_uniform.idx);
 }
 
 // ── Material programs (curated per-draw effects, labelle-gfx#305) ──────────────
@@ -1027,6 +1040,14 @@ pub fn shutdownPrograms() void {
         bgfx.destroyUniform(s_texV_uniform);
         s_texV_uniform = .{ .idx = std.math.maxInt(u16) };
     }
+    if (isValidHandle(u_yuvOffsetGain_uniform.idx)) {
+        bgfx.destroyUniform(u_yuvOffsetGain_uniform);
+        u_yuvOffsetGain_uniform = .{ .idx = std.math.maxInt(u16) };
+    }
+    if (isValidHandle(u_yuvCoeffs_uniform.idx)) {
+        bgfx.destroyUniform(u_yuvCoeffs_uniform);
+        u_yuvCoeffs_uniform = .{ .idx = std.math.maxInt(u16) };
+    }
     yuv_initialized = false;
     // Give the program one honest re-create attempt after a surface cycle.
     yuv_failed = false;
@@ -1295,6 +1316,10 @@ pub fn submitYuvTriangles(
     y_handle: bgfx.TextureHandle,
     u_handle: bgfx.TextureHandle,
     v_handle: bgfx.TextureHandle,
+    /// `fs_yuv`'s matrix: `[0]` = u_yuvOffsetGain, `[1]` = u_yuvCoeffs
+    /// (`video/yuv_uniform.Params`; BT.601 limited unless the stream says
+    /// otherwise, labelle-bgfx#155).
+    yuv_params: *const [2][4]f32,
 ) void {
     if (!ensureYuvProgram()) return;
     ensureLayouts();
@@ -1324,6 +1349,8 @@ pub fn submitYuvTriangles(
     bgfx.setTexture(0, s_texY_uniform, y_handle, 0);
     bgfx.setTexture(1, s_texU_uniform, u_handle, 0);
     bgfx.setTexture(2, s_texV_uniform, v_handle, 0);
+    bgfx.setUniform(u_yuvOffsetGain_uniform, &yuv_params[0], 1);
+    bgfx.setUniform(u_yuvCoeffs_uniform, &yuv_params[1], 1);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
     submitProgram(active_view, yuv_program);
 }

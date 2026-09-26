@@ -1000,6 +1000,9 @@ pub fn build(b: *std.Build) void {
         });
         font_test_mod.addImport("zbgfx", zbgfx_mod);
         font_test_mod.addImport("labelle-core", core_mod);
+        // gfx.zig's test probes analyse `video/player.zig`, whose GPU state
+        // now carries the `labelle_android` colour matrix (#155).
+        font_test_mod.addImport("labelle_android", labelle_android_mod);
         font_test_mod.addIncludePath(b.path("src"));
         font_test_mod.addCSourceFile(.{ .file = b.path("src/stb_image_impl.c"), .flags = &.{} });
         font_test_mod.addCSourceFile(.{ .file = b.path("src/stb_truetype_impl.c"), .flags = &.{} });
@@ -1063,6 +1066,20 @@ pub fn build(b: *std.Build) void {
     desktop_video_run.root_module.addImport("labelle_android", labelle_android_host_dep.module("labelle_android"));
     const desktop_video_run_step = b.addRunArtifact(desktop_video_run);
     test_step.dependOn(&desktop_video_run_step.step);
+
+    // GPU-YUV matrix selection (`video/yuv_uniform.zig`, labelle-bgfx#155):
+    // pure ColorSpace → `fs_yuv` uniform math, host-run against the same
+    // host-resolved `labelle_android` instance. Its own root because the
+    // player/gfx re-exports never collect this file's tests.
+    const yuv_uniform_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/video/yuv_uniform.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    yuv_uniform_run.root_module.addImport("labelle_android", labelle_android_host_dep.module("labelle_android"));
+    test_step.dependOn(&b.addRunArtifact(yuv_uniform_run).step);
     // Standalone step so CI can run JUST this and assert on its summary
     // (passed, not skipped) without reading the whole suite's totals.
     b.step(
