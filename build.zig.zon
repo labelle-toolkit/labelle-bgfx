@@ -66,9 +66,9 @@
         // `.path`: `.labelle/deps/labelle-bgfx` is a copy, so a relative path
         // would not resolve from an assembled game.
         .labelle_android = .{
-            .url = "https://github.com/labelle-toolkit/labelle-android/archive/816570ab9ac05a2ce6ddf5c3f08f65f343fdd65f.tar.gz",
-            .hash = "labelle_android-0.1.0-sErgQjXeAAChwvA1ts96qERW6531XcdUsn6IwIcflEuu",
-        },
+        .url = "https://github.com/labelle-toolkit/labelle-android/archive/6545d9ed5f71f6022c72efd9f97f49e0c877cbff.tar.gz",
+        .hash = "labelle_android-0.1.0-sErgQuP6AAC8HU1lyCyW3pc7v2FvfW8KoRKo_MQxb6FR",
+    },
         // Shared windowless-SDL desktop gamepad source (core#28). In-tree
         // sub-package shared with the raylib and sokol desktop backends via a
         // relative path. On desktop targets, bgfx's `input` routes the gamepad
