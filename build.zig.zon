@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0x9cd73c2cb5d6d1eb,
     .name = .labelle_bgfx,
-    .version = "0.28.1",
+    .version = "0.29.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Browser persistent storage (IndexedDB bridge), wasm-only (lazy).
@@ -78,7 +78,7 @@
         // `.path`: `.labelle/deps/labelle-bgfx` is a copy, so a relative path
         // would not resolve from an assembled game.
         .labelle_android = .{
-            .url = "https://github.com/labelle-toolkit/labelle-android/archive/df5b78ec2c07360f4e87c85bfdfd59e21db8b08d.tar.gz",
+            .url = "https://github.com/labelle-toolkit/labelle-android/archive/refs/tags/v0.1.0.tar.gz",
             .hash = "labelle_android-0.1.0-sErgQs3nAwCwI6QRpkuN_OWgtPWxkoMJbvTzhGoaXZUr",
         },
         // Shared windowless-SDL desktop gamepad source (core#28). In-tree
