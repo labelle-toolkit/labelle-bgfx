@@ -387,8 +387,35 @@ jobs:
           chmod +x labelle-assembler-linux-x86_64
           asm="$PWD/labelle-assembler-linux-x86_64"
 
+          # The bare assembler does not fetch packages: `generate` links them
+          # from ~/.labelle/packages and fails on a clean runner. Stage every
+          # package the fixture pins, in the layout the CLI/assembler cache
+          # writes (the tag's source archive, top-level dir stripped):
+          #   <kind>/<version> for core/gfx/engine,
+          #   plugins/<repo>/<version> for a plugin. Keep in step with
+          #   test/android-provider/project.labelle.
+          pkgs="$HOME/.labelle/packages"
+          stage() {  # <cache slot> <owner/repo> <tag>
+            dst="$pkgs/$1"
+            rm -rf "$dst"
+            mkdir -p "$dst"
+            curl -fsSL "https://github.com/$2/archive/$3.tar.gz" -o "$RUNNER_TEMP/d11-stage.tar.gz"
+            tar -xzf "$RUNNER_TEMP/d11-stage.tar.gz" -C "$dst" --strip-components=1
+            if [ ! -f "$dst/build.zig.zon" ]; then echo "FAIL: $dst has no build.zig.zon"; exit 1; fi
+            echo "staged $1 <- $2@$3"
+          }
+          stage core/2.1.0 labelle-toolkit/labelle-core v2.1.0
+          stage gfx/2.2.0 labelle-toolkit/labelle-gfx v2.2.0
+          stage engine/3.4.1 labelle-toolkit/labelle-engine v3.4.1
+          stage plugins/github.com/labelle-toolkit/labelle-android/0.2.0 labelle-toolkit/labelle-android v0.2.0
+
           cd "$GITHUB_WORKSPACE/labelle-bgfx/test/android-provider"
-          "$asm" generate --project-root . --platform android
+          # Capture, then check: a missing package is only a WARNING to
+          # `generate` ("could not link dep"), and must fail this step.
+          "$asm" generate --project-root . --platform android 2>&1 | tee "$RUNNER_TEMP/d11-generate.log"
+          if grep -q 'could not link dep' "$RUNNER_TEMP/d11-generate.log"; then
+            echo "FAIL: generate could not link a package; stage it above"; exit 1
+          fi
           # The link IS the check: duplicate JNI C fails it.
           (cd .labelle/bgfx_android && zig build)
 
