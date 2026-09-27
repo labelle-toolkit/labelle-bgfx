@@ -74,12 +74,23 @@
         // `@import`s its build helpers (`resolveNdk` / `addAndroidSysroot` /
         // `nativeAppGlueDir`, phase 1e) at the top level, which resolves the
         // package on every build — desktop and wasm included.
-        // Commit pin until labelle-android v0.1.0 is tagged. NEVER a committed
-        // `.path`: `.labelle/deps/labelle-bgfx` is a copy, so a relative path
-        // would not resolve from an assembled game.
+        // Pinned to the labelle-android v0.2.0 release tag: the release that
+        // also ships the `android` CLI provider (labelle-cli#405). `src/` and
+        // the build helpers above are unchanged from v0.1.1; v0.2.0 only adds
+        // the provider host tool (`tools/`, `install-provider`). NEVER a
+        // committed `.path`: `.labelle/deps/labelle-bgfx` is a copy, so a
+        // relative path would not resolve from an assembled game.
+        //
+        // A project that lists the `android` provider plugin gets the same
+        // package a second time, as a `.path` plugin dep. Zig does not merge a
+        // `.path` dep with this url+hash dep, even at the same release, so two
+        // copies of the JNI C would reach `libgame.so` (labelle-cli#405 D11).
+        // `backend.hook.zig` `unifyLabelleAndroid` points this backend's
+        // `labelle_android` imports at the plugin's module; CI's
+        // test/android-provider fixture checks the link.
         .labelle_android = .{
-            .url = "https://github.com/labelle-toolkit/labelle-android/archive/refs/tags/v0.1.1.tar.gz",
-            .hash = "labelle_android-0.1.1-sErgQqniBAD-kbmufSQm1XJ2RZfkATRPB22Ad0o_cTXI",
+            .url = "https://github.com/labelle-toolkit/labelle-android/archive/refs/tags/v0.2.0.tar.gz",
+            .hash = "labelle_android-0.2.0-sErgQhOvDgDBEqwMU4h1VZY1tTVpsUnnw1qXaabKT438",
         },
         // Shared windowless-SDL desktop gamepad source (core#28). In-tree
         // sub-package shared with the raylib and sokol desktop backends via a
