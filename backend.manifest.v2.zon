@@ -188,11 +188,15 @@
             // which forwards only `gui_enabled` (no gamepad flags on android).
             .dep_options = .{},
             // The apk manifest string is parsed by the assembler but never read:
-            // labelle-cli generates the real `AndroidManifest.xml` itself
-            // (`generateAndroidManifest`, cli#737). It used to name the standalone
-            // decode harness's manifest, retired with the decoder's move to
-            // labelle-android (#149 phase 1d, cli#405); the value now matches the
-            // assembler's own fixture.
+            // APK packaging (and the real `AndroidManifest.xml`) belongs to the
+            // `android` provider in labelle-android (labelle-cli#405). The value
+            // matches the assembler's own fixture; this package ships no such file.
+            //
+            // KEPT for older assemblers: through v0.115.0 the schema requires
+            // `.apk` to carry `.manifest`. labelle-assembler#764 (v0.116.0)
+            // retires the generated `zig build package` step and accepts
+            // `.apk = .{}`; once bgfx can require assembler >= v0.116.0, this
+            // becomes `.package = .{ .apk = .{} }`.
             .package = .{ .apk = .{ .manifest = "AndroidManifest.xml.tmpl" } },
         },
         // WASM/Emscripten/WebGL2 (bgfx-wasm epic labelle-bgfx#8, shipped in
