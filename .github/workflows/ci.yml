@@ -359,6 +359,64 @@ jobs:
           nm -D "$so" | grep -q 'android_main' || { echo "FAIL: android_main not exported"; exit 1; }
           nm -D "$so" | grep -q 'ANativeActivity_onCreate' || { echo "FAIL: ANativeActivity_onCreate not exported"; exit 1; }
 
+      # ── labelle-cli#405 D11: the `android` provider next to bgfx ──────
+      # A project that lists the provider plugin (labelle-android) gets that
+      # package twice: the assembler wires the plugin as a `.path` dep, bgfx
+      # pins it by url+hash, and Zig never merges the two, even at the same
+      # release. Both copies compile the JNI C, so the `libgame.so` link fails
+      # on `duplicate symbol: labelle_android_*` unless bgfx's build hook
+      # (`backend.hook.zig` `unifyLabelleAndroid`) points bgfx's imports at
+      # the plugin's module. test/android-provider is that project.
+      #
+      # Generated with a RELEASED assembler binary, not the pinned CLI: CLIs
+      # before v2.0.0 reserve the `android` namespace and reject the provider,
+      # and the job's pinned assembler (v0.109.0) cannot read its manifest-v2
+      # plugin.labelle. The binary is checked against the release's SHA256SUMS.
+      - name: D11 — provider plugin + bgfx link ONE labelle_android (cli#405)
+        env:
+          D11_ASSEMBLER_TAG: v0.116.0
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/labelle-toolkit/labelle-assembler/releases/download/$D11_ASSEMBLER_TAG"
+          mkdir -p "$RUNNER_TEMP/d11-assembler"
+          cd "$RUNNER_TEMP/d11-assembler"
+          curl -fsSLO "$base/labelle-assembler-linux-x86_64"
+          curl -fsSLO "$base/SHA256SUMS"
+          grep ' labelle-assembler-linux-x86_64$' SHA256SUMS | sha256sum -c -
+          chmod +x labelle-assembler-linux-x86_64
+          asm="$PWD/labelle-assembler-linux-x86_64"
+
+          cd "$GITHUB_WORKSPACE/labelle-bgfx/test/android-provider"
+          "$asm" generate --project-root . --platform android
+          # The link IS the check: duplicate JNI C fails it.
+          (cd .labelle/bgfx_android && zig build)
+
+          so=$(find .labelle/bgfx_android/zig-out -name 'libgame.so' | head -1)
+          if [ -z "$so" ]; then echo "FAIL: libgame.so not found"; exit 1; fi
+          fail=0
+          defined=$(nm -D --defined-only "$so" | awk '$3 ~ /^labelle_android_/ { print $3 }' | sort)
+          for sym in labelle_android_acquire_env labelle_android_read_intent_extras \
+                     labelle_android_app_is_debuggable labelle_android_force_window_relayout; do
+            n=$(printf '%s\n' "$defined" | grep -cx "$sym" || true)
+            if [ "$n" -ne 1 ]; then echo "FAIL: $sym defined $n times (want 1)"; fail=1; else echo "ok    $sym x1"; fi
+          done
+          dups=$(printf '%s\n' "$defined" | uniq -d)
+          if [ -n "$dups" ]; then echo "FAIL: duplicated: $dups"; fail=1; fi
+          # The mechanism, not just the count: the JNI C in the .so is the
+          # PLUGIN's copy (.labelle/deps/labelle-android), and bgfx's
+          # hash-fetched copy (zig-pkg/labelle_android-<ver>-<hash>) is absent.
+          # Into a file first: `strings | grep -q` under pipefail fails on the
+          # SIGPIPE when grep stops reading early.
+          strings -a "$so" > "$RUNNER_TEMP/d11-strings.txt"
+          if ! grep -q 'deps/labelle-android/src/jni/intent_extras\.c' "$RUNNER_TEMP/d11-strings.txt"; then
+            echo "FAIL: the JNI C is not the provider plugin's copy"; fail=1
+          fi
+          if grep -q 'labelle_android-[0-9][0-9.]*-[A-Za-z0-9_-]*/src/jni' "$RUNNER_TEMP/d11-strings.txt"; then
+            echo "FAIL: bgfx's own labelle_android copy reached the .so"; fail=1
+          fi
+          exit "$fail"
+
       # ── The gap this job had (labelle-bgfx#104) ──────────────────────
       # Everything above only CROSS-COMPILES. An .so that aborts in `gameInit`
       # is byte-for-byte as convincing as one that renders perfectly, which is
