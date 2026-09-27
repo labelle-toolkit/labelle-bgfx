@@ -11,9 +11,11 @@
 // INIT_WINDOW) and a per-frame tick callback, then hands the event/frame
 // loop to `android_app.run`.
 //
-// Build: `labelle-assembler generate --project-root .` then
-// `cd .labelle/bgfx_android && zig build` (produces the .so) +
-// `zig build package` (wraps it as a NativeActivity APK).
+// Build: `labelle generate --platform=android` then
+// `cd .labelle/bgfx_android && zig build` (produces the .so; CI's
+// android-example job). APK packaging, install and launch belong to the
+// `android` provider (labelle-android v0.2.0, labelle-cli >= v2.0.0); see
+// README.md.
 .{
     .name = "example_bgfx_android",
     .title = "LaBelle — bgfx (Android)",
