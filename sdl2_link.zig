@@ -10,7 +10,7 @@
 //! when SDL2 is missing, fails with ONE line instead — `missing_message`.
 //!
 //! The check only runs for a NATIVE Windows build (Windows target on a
-//! Windows host), where the dirs Zig searches are known: the
+//! Windows host of the same CPU arch), where the dirs Zig searches are known: the
 //! `LABELLE_SDL2_LIB` dir this file adds, plus whatever the host's
 //! `pkg-config` reports (Zig's own fallback, mirrored here). Everything else
 //! (other targets, and cross-compiles to Windows, whose SDL2 may come from
@@ -75,7 +75,10 @@ pub fn link(b: *std.Build, mod: *std.Build.Module, opts: Options) void {
     if (env_lib) |p| {
         if (p.len != 0) mod.addLibraryPath(.{ .cwd_relative = p });
     }
-    const native_windows = target.result.os.tag == .windows and builtin.target.os.tag == .windows;
+    // Native = same OS AND arch as the build host: e.g. an aarch64-windows
+    // build on an x86_64 Windows host is a cross-compile and is not checked.
+    const native_windows = target.result.os.tag == .windows and builtin.target.os.tag == .windows and
+        target.result.cpu.arch == builtin.target.cpu.arch;
     switch (resolve(native_windows, env_lib, RealProbe{ .b = b })) {
         .unchecked, .env_dir, .pkg_config => mod.linkSystemLibrary("SDL2", .{}),
         .missing => failOnUse(b, mod),
