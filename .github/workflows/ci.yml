@@ -591,6 +591,46 @@ jobs:
           # GNU (single space) and BSD (double) od.
           head -c 4 zig-out/web/wasm_demo.wasm | od -An -tx1 | tr -s ' ' | grep -q '00 61 73 6d' \
             || { echo "FAIL: wasm_demo.wasm has no wasm magic"; exit 1; }
+      # labelle-bgfx#163: the hook's emcc link (`backend.hook.zig` emLinkStep,
+      # the code a generated game runs) must activate the emsdk DEPENDENCY
+      # when it falls back to it and it is installed but not activated. The
+      # build above installed + activated the package, so remove only its
+      # `.emscripten` (activation is cheap, nothing is downloaded) and link via
+      # the hook. Asserts the hook's own activate step RAN, the marker is back,
+      # and the module is real.
+      - name: Hook link activates an unactivated dependency emsdk (#163)
+        env:
+          EMSDK: ''
+        run: |
+          set -uo pipefail
+          # The emsdk this build.zig.zon pins (a restored cache can also hold
+          # an older pin's package, so never pick by glob order).
+          hash=$(python3 -c "import re;t=open('build.zig.zon').read();print(re.search(r'\.emsdk\s*=\s*\.\{.*?\.hash\s*=\s*\"([^\"]+)\"',t,re.S).group(1))")
+          pkg="zig-pkg/$hash/"
+          [ -d "$pkg/upstream/emscripten" ] || { echo "FAIL: the pinned emsdk package $pkg is not installed"; exit 1; }
+          rm -f "$pkg/.emscripten"
+          zig build -Dtarget=wasm32-emscripten -Demsdk_expect=package wasm-example-hook --summary all > hook.log 2>&1
+          status=$?
+          cat hook.log
+          [ "$status" -eq 0 ] || { echo "FAIL: hook build exited $status"; exit 1; }
+          grep -E "hook: emsdk activate latest \(zig-pkg emsdk\) success" hook.log \
+            || { echo "FAIL: the hook's dependency activate step did not run"; exit 1; }
+          [ -f "$pkg/.emscripten" ] || { echo "FAIL: $pkg.emscripten was not recreated"; exit 1; }
+          head -c 4 zig-out/web/wasm_demo_hook.wasm | od -An -tx1 | tr -s ' ' | grep -q '00 61 73 6d' \
+            || { echo "FAIL: wasm_demo_hook.wasm has no wasm magic"; exit 1; }
+      - name: Hook link on an activated dependency adds no activate step (#163)
+        env:
+          EMSDK: ''
+        run: |
+          set -uo pipefail
+          zig build -Dtarget=wasm32-emscripten -Demsdk_expect=package wasm-example-hook --summary all > hook2.log 2>&1
+          status=$?
+          cat hook2.log
+          [ "$status" -eq 0 ] || { echo "FAIL: hook build exited $status"; exit 1; }
+          if grep -F "hook: emsdk activate" hook2.log; then
+            echo "FAIL: the hook added an activate step for an already-activated emsdk"
+            exit 1
+          fi
 
   # A valid EMSDK is honoured and the emsdk Zig package is never activated
   # (labelle-bgfx#159). labelle-web 0.3's provider installs its own emsdk and
@@ -671,6 +711,37 @@ jobs:
           status=$?
           cat build.log
           [ "$status" -eq 0 ] || { echo "FAIL: build exited $status"; exit 1; }
+      # The hook's link (what a generated game runs) under an inherited
+      # EM_CONFIG that names ANOTHER, broken SDK (#161): it must pin EM_CONFIG
+      # to EMSDK's own `.emscripten` and never activate the package (#163).
+      - name: Hook link ignores an inherited EM_CONFIG naming another SDK (#161, #163)
+        run: |
+          set -uo pipefail
+          bogus="$RUNNER_TEMP/other-sdk.emscripten"
+          printf '%s\n' "LLVM_ROOT = '/nonexistent-other-sdk/upstream/bin'" \
+            "BINARYEN_ROOT = '/nonexistent-other-sdk/upstream'" \
+            "NODE_JS = '/nonexistent-other-sdk/node/bin/node'" > "$bogus"
+          # Control: the same emcc under that config really fails, so a green
+          # hook link below proves the pin, not luck. EM_CACHE is redirected:
+          # emcc clears its cache when the config changes.
+          echo 'int main(void){return 0;}' > "$RUNNER_TEMP/t.c"
+          if EM_CONFIG="$bogus" EM_CACHE="$RUNNER_TEMP/bogus-cache" emcc -c "$RUNNER_TEMP/t.c" -o "$RUNNER_TEMP/t.o" > control.log 2>&1; then
+            cat control.log; echo "FAIL: control: emcc worked under the other SDK's config"; exit 1
+          fi
+          grep -F "nonexistent-other-sdk" control.log || { cat control.log; echo "FAIL: control failed for another reason"; exit 1; }
+          # A fresh cache dir so the emcc link really runs (not a cache hit).
+          EM_CONFIG="$bogus" zig build -Dtarget=wasm32-emscripten -Demsdk_expect=external wasm-example-hook \
+            --cache-dir "$RUNNER_TEMP/hook-cache" --summary all > hook.log 2>&1
+          status=$?
+          cat hook.log
+          [ "$status" -eq 0 ] || { echo "FAIL: hook link exited $status under the inherited EM_CONFIG"; exit 1; }
+          grep -E "emcc \(wasm_demo_hook\.html\) success" hook.log \
+            || { echo "FAIL: the hook's emcc link did not run"; exit 1; }
+          if grep -F "(zig-pkg emsdk)" hook.log; then
+            echo "FAIL: the hook ran emsdk install/activate on the zig-pkg emsdk"; exit 1
+          fi
+          head -c 4 zig-out/web/wasm_demo_hook.wasm | od -An -tx1 | tr -s ' ' | grep -q '00 61 73 6d' \
+            || { echo "FAIL: wasm_demo_hook.wasm has no wasm magic"; exit 1; }
       - name: Assert no zig-pkg emsdk install/activate ran
         run: |
           set -euo pipefail

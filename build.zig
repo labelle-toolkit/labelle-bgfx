@@ -10,6 +10,10 @@ const builtin = @import("builtin");
 const labelle_android = @import("labelle_android");
 // Which emsdk a wasm build uses (external EMSDK vs the emsdk package, #159).
 const emsdk_source = @import("emsdk_source.zig");
+// The manifest-v2 build hook (std-only). build.zig uses its `emLinkStep` for the
+// `wasm-example-hook` step, so CI links through the SAME code a generated game
+// does (#161 EM_CONFIG pin, #163 dependency activation).
+const build_hook = @import("backend.hook.zig");
 
 /// True when `t` is a native desktop OS (matches the shared sdl_gamepad source's
 /// comptime `is_desktop`): only there are the SDL `extern`s referenced and SDL
@@ -1382,6 +1386,8 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     var emcc_exe: []const u8 = undefined;
     var em_config: []const u8 = undefined;
     var emsdk_setup: ?*std.Build.Step.Run = null;
+    // The emsdk package, only when it is the source (never fetched otherwise).
+    var package_emsdk: ?*std.Build.Dependency = null;
     switch (source) {
         .external => |root| {
             default_sysroot = .{ .cwd_relative = emsdk_source.sysrootInclude(b.allocator, root) catch @panic("OOM") };
@@ -1393,6 +1399,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
             // configure it may be missing; the build runner fetches it and
             // re-runs build().
             const emsdk_dep = b.lazyDependency("emsdk", .{}) orelse return;
+            package_emsdk = emsdk_dep;
             // One-time emsdk setup (install + activate). A no-op (null) when the
             // `.emscripten` marker is already present (shared package cache
             // already activated).
@@ -1626,6 +1633,45 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
 
     const wasm_step = b.step("wasm-example", "Build the bgfx WebGL/wasm smoke example (emcc → zig-out/web/wasm_demo.html)");
     wasm_step.dependOn(&install_web.step);
+
+    // The same example, linked by `backend.hook.zig`'s `emLinkStep` (the code a
+    // generated game's `post_wire` runs) instead of the emcc step above. Lets CI
+    // assert the hook's own emsdk handling: the EM_CONFIG pin (#161) and, on
+    // the dependency fallback, its activate step (#163). Installs to the same
+    // `web/` dir as `wasm_demo_hook.{html,js,wasm}`.
+    //
+    // The hook links `lib_main`'s transitive libs, the way a game's lib_main
+    // reaches bgfx through the assembler's `linkLibrary(bgfx)`. `example_lib`
+    // doesn't link bgfx (the emcc step above adds bgfx's libs itself), so the
+    // hook gets its own lib (and module, so `example_lib` stays as it was) that does.
+    const hook_example_mod = b.createModule(.{
+        .root_source_file = b.path("example/wasm_demo.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    hook_example_mod.addImport("window", window_mod);
+    hook_example_mod.addImport("backend_gfx", gfx_mod);
+    const hook_example_lib = b.addLibrary(.{
+        .name = "wasm_demo_hook",
+        .linkage = .static,
+        .root_module = hook_example_mod,
+    });
+    if (emsdk_setup) |setup| hook_example_lib.step.dependOn(&setup.step);
+    hook_example_lib.root_module.linkLibrary(bgfx_artifact);
+    const hook_install = build_hook.emLinkStep(b, .{
+        .optimize = optimize,
+        .lib_main = hook_example_lib,
+        .lib_backend = bgfx_artifact,
+        // Null on the external path: the package is not fetched there.
+        .emsdk = package_emsdk,
+        // The same EMSDK test emsdk_source.resolve applied above, so the hook
+        // never picks a different emsdk than the C compiles (and never falls
+        // back to a package that wasn't fetched).
+        .need_sysroot = emsdk_sysroot_override == null,
+    });
+    const wasm_hook_step = b.step("wasm-example-hook", "Build the wasm example, linked by backend.hook.zig's emLinkStep (same code as a generated game)");
+    wasm_hook_step.dependOn(&hook_install.step);
 
     // A `test` step is expected by CI even on wasm; wire a no-op so `zig build
     // test -Dtarget=wasm32-emscripten` succeeds (the real unit tests run on the
