@@ -2,8 +2,9 @@
 # Drives `zig build sdl2-link-check` through the real SDL2 wiring
 # (sdl2_link.zig) on a Windows host and asserts which path ran
 # (labelle-cli#471 S2):
-#   1. SDL2 missing (LABELLE_SDL2_LIB -> empty dir, and unset): the build
-#      fails with exactly the one-line message and no linker error.
+#   1. SDL2 missing (LABELLE_SDL2_LIB -> empty dir, unset, and with a
+#      pkg-config that exits 1): the build fails with exactly the one-line
+#      message and no linker error.
 #   2. `.gamepad = .none` (-Dgamepad_enabled=false) with SDL2 missing: builds.
 #   3. SDL2 present (SDL2_PRESENT_LIB = a lib dir holding SDL2.dll): links.
 # pkg-config is pointed at a non-existent exe so the result can't depend on
@@ -52,6 +53,20 @@ expect_success() { # $1 = label; remaining = env assignments, then `--` zig args
 empty_w="$(cygpath -w "$empty" 2>/dev/null || echo "$empty")"
 expect_missing "env -> empty dir" "LABELLE_SDL2_LIB=$empty_w"
 expect_missing "env unset" -u LABELLE_SDL2_LIB
+# A pkg-config that runs but doesn't know sdl2 (exit 1) must not count as
+# "found": `false` stands in for it.
+false_exe="$(command -v false)"
+expect_missing "pkg-config without sdl2" "LABELLE_SDL2_LIB=$empty_w" "PKG_CONFIG=$(cygpath -w "$false_exe" 2>/dev/null || echo "$false_exe")"
+# Control for the scenario above: a pkg-config that exits 0 (`true`) must be
+# trusted, i.e. the check defers to Zig (whose link then fails its own way).
+# Proves the probe really runs pkg-config and reads its exit status.
+true_exe="$(command -v true)"
+env "LABELLE_SDL2_LIB=$empty_w" "PKG_CONFIG=$(cygpath -w "$true_exe" 2>/dev/null || echo "$true_exe")"   zig build sdl2-link-check >"$log" 2>&1
+if grep -qF -- "$msg" "$log"; then
+  cat "$log"; echo "FAIL[pkg-config knows sdl2]: missing line printed"; failures=$((failures + 1))
+else
+  echo "ok[pkg-config knows sdl2 -> deferred to Zig]"
+fi
 expect_success "gamepad opt-out, SDL2 missing" "LABELLE_SDL2_LIB=$empty_w" -- -Dgamepad_enabled=false
 if [ -n "${SDL2_PRESENT_LIB:-}" ]; then
   expect_success "SDL2 present" "LABELLE_SDL2_LIB=$SDL2_PRESENT_LIB" --
