@@ -9,16 +9,18 @@
 //! dynamic system library 'SDL2' ..."). Here the build checks up front and,
 //! when SDL2 is missing, fails with ONE line instead — `missing_message`.
 //!
-//! The check only runs for a Windows target, where the dirs Zig searches are
-//! known: the `LABELLE_SDL2_LIB` dir this file adds, plus whatever
-//! `pkg-config` reports (Zig's own fallback, mirrored here). Every other
-//! target keeps linking SDL2 exactly as before, since the message's fix
-//! (`LABELLE_SDL2_LIB`) only applies on Windows. A library dir a consumer
-//! adds to its own exe is not visible here; on Windows, point
-//! `LABELLE_SDL2_LIB` at it instead.
+//! The check only runs for a NATIVE Windows build (Windows target on a
+//! Windows host), where the dirs Zig searches are known: the
+//! `LABELLE_SDL2_LIB` dir this file adds, plus whatever the host's
+//! `pkg-config` reports (Zig's own fallback, mirrored here). Everything else
+//! (other targets, and cross-compiles to Windows, whose SDL2 may come from
+//! paths or pkg-config setups this file can't see) keeps linking SDL2
+//! exactly as before. A library dir a consumer adds to its own exe is not
+//! visible here either; on Windows, point `LABELLE_SDL2_LIB` at it instead.
 //!
 //! The file is kept identical in labelle-bgfx and labelle-raylib.
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// The single line printed when SDL2 is needed but missing.
 pub const missing_message = "SDL2 not found: set LABELLE_SDL2_LIB or use `.gamepad = .none`";
@@ -30,7 +32,7 @@ pub const windows_lib_names = [_][]const u8{ "SDL2.dll", "SDL2.lib", "libSDL2.a"
 
 /// How SDL2 will be resolved at link time — which code path `link` takes.
 pub const Resolution = enum {
-    /// Not a Windows target: link SDL2 by name as before, no check.
+    /// Not a native Windows build: link SDL2 by name as before, no check.
     unchecked,
     /// Found in the `LABELLE_SDL2_LIB` dir.
     env_dir,
@@ -44,8 +46,8 @@ pub const Resolution = enum {
 /// lookups (real ones in `link`, fakes in the tests):
 ///   * `probe.hasFile(dir, name) bool`
 ///   * `probe.pkgConfigHasSdl2() bool`
-pub fn resolve(target_is_windows: bool, env_lib: ?[]const u8, probe: anytype) Resolution {
-    if (!target_is_windows) return .unchecked;
+pub fn resolve(native_windows: bool, env_lib: ?[]const u8, probe: anytype) Resolution {
+    if (!native_windows) return .unchecked;
     if (env_lib) |dir| {
         if (dir.len != 0) {
             for (windows_lib_names) |name| {
@@ -65,7 +67,7 @@ pub const Options = struct {
 
 /// Link SDL2 into `mod` (a module that imports the desktop gamepad source).
 /// Adds `LABELLE_SDL2_LIB` as a library path when `opts.honor_env`, then
-/// either links SDL2 or — Windows target, SDL2 missing — makes every compile
+/// either links SDL2 or — native Windows build, SDL2 missing — makes every compile
 /// that uses `mod` fail with `missing_message` instead of a linker error.
 pub fn link(b: *std.Build, mod: *std.Build.Module, opts: Options) void {
     const target = mod.resolved_target orelse @panic("sdl2_link.link: module has no target");
@@ -73,7 +75,8 @@ pub fn link(b: *std.Build, mod: *std.Build.Module, opts: Options) void {
     if (env_lib) |p| {
         if (p.len != 0) mod.addLibraryPath(.{ .cwd_relative = p });
     }
-    switch (resolve(target.result.os.tag == .windows, env_lib, RealProbe{ .b = b })) {
+    const native_windows = target.result.os.tag == .windows and builtin.target.os.tag == .windows;
+    switch (resolve(native_windows, env_lib, RealProbe{ .b = b })) {
         .unchecked, .env_dir, .pkg_config => mod.linkSystemLibrary("SDL2", .{}),
         .missing => failOnUse(b, mod),
     }
@@ -152,7 +155,7 @@ const FakeProbe = struct {
     }
 };
 
-test "resolve: non-Windows targets are never checked" {
+test "resolve: non-native-Windows builds (other targets, cross to Windows) are never checked" {
     var calls: FakeProbe.Calls = .{};
     try std.testing.expectEqual(Resolution.unchecked, resolve(false, null, FakeProbe{ .calls = &calls }));
     try std.testing.expectEqual(Resolution.unchecked, resolve(false, "/nowhere", FakeProbe{ .calls = &calls }));

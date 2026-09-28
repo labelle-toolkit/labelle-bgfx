@@ -54,13 +54,14 @@ empty_w="$(cygpath -w "$empty" 2>/dev/null || echo "$empty")"
 expect_missing "env -> empty dir" "LABELLE_SDL2_LIB=$empty_w"
 expect_missing "env unset" -u LABELLE_SDL2_LIB
 # A pkg-config that runs but doesn't know sdl2 (exit 1) must not count as
-# "found": `false` stands in for it.
-false_exe="$(command -v false)"
+# "found": `false` stands in for it. (`type -P`: the executable, not the
+# shell builtin, so Zig can spawn it by path.)
+false_exe="$(type -P false)"
 expect_missing "pkg-config without sdl2" "LABELLE_SDL2_LIB=$empty_w" "PKG_CONFIG=$(cygpath -w "$false_exe" 2>/dev/null || echo "$false_exe")"
 # Control for the scenario above: a pkg-config that exits 0 (`true`) must be
 # trusted, i.e. the check defers to Zig (whose link then fails its own way).
 # Proves the probe really runs pkg-config and reads its exit status.
-true_exe="$(command -v true)"
+true_exe="$(type -P true)"
 env "LABELLE_SDL2_LIB=$empty_w" "PKG_CONFIG=$(cygpath -w "$true_exe" 2>/dev/null || echo "$true_exe")"   zig build sdl2-link-check >"$log" 2>&1
 if grep -qF -- "$msg" "$log"; then
   cat "$log"; echo "FAIL[pkg-config knows sdl2]: missing line printed"; failures=$((failures + 1))
