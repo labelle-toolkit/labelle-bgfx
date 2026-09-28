@@ -389,7 +389,7 @@ jobs:
       - name: Verify libgame.so
         run: |
           set -euo pipefail
-          so=$(find labelle-bgfx/examples/bgfx-android/.labelle/bgfx_android -name 'libgame.so' | head -1)
+          so=$(find labelle-bgfx/examples/bgfx-android/.labelle/bgfx_android/zig-out -name 'libgame.so' | head -1)
           if [ -z "$so" ]; then echo "libgame.so not found"; exit 1; fi
           echo "found: $so"
           file "$so"
