@@ -530,6 +530,33 @@ pub fn build(b: *std.Build) void {
     const sprobe_step = b.step("screenshot-probe", "Run the headless screenshot-to-file validation probe (#36)");
     sprobe_step.dependOn(&b.addRunArtifact(sprobe).step);
 
+    // ── Windowed screenshot + overlay-view probe (labelle-bgfx#68) ──
+    // `zig build windowed-screenshot-probe` — the WINDOWED `--screenshot` path
+    // (`takeScreenshot` → async `requestScreenShot` on the backbuffer), which
+    // `screenshot-probe` (surfaceless `captureHeadless`) does not touch. Paints
+    // the scene on view 0 and the imgui bridge's unbound view 200 on the capture
+    // frame, then reads the `.tga` back and asserts both are in it. Opens an
+    // invisible GLFW window, so it needs a display server (macOS CI, a desktop).
+    const wsprobe = b.addExecutable(.{
+        .name = "windowed_screenshot_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/windowed_screenshot_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    wsprobe.root_module.addImport("zbgfx", zbgfx_mod);
+    wsprobe.root_module.addImport("window", window_mod);
+    wsprobe.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| wsprobe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        wsprobe.root_module.linkSystemLibrary("gdi32", .{});
+        wsprobe.root_module.linkSystemLibrary("user32", .{});
+    }
+    const wsprobe_step = b.step("windowed-screenshot-probe", "Run the windowed screenshot + imgui-overlay-view probe (#68)");
+    wsprobe_step.dependOn(&b.addRunArtifact(wsprobe).step);
+
     // Exercise real per-frame exhaustion on demand; no GPU needed by unit tests.
     const transient_probe = b.addExecutable(.{
         .name = "transient_exhaustion_probe",

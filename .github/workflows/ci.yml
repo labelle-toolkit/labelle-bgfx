@@ -124,6 +124,15 @@ jobs:
         run: zig build postfx-fit-probe
       - name: compressedSupported agrees with uploadCompressed (#134)
         run: zig build compressed-support-probe
+      # `--screenshot` must capture the Dear ImGui overlay, which the imgui bridge
+      # draws on its own unbound view (#68). Both capture paths, on Metal: the
+      # surfaceless readback, and the WINDOWED backbuffer `requestScreenShot`
+      # (an invisible GLFW window — the runner has a GUI session; the
+      # display-less Linux job cannot run this one).
+      - name: Surfaceless --screenshot includes the overlay view (#68)
+        run: zig build screenshot-probe
+      - name: Windowed --screenshot includes the overlay view (#68)
+        run: zig build windowed-screenshot-probe
       # This renderer probe does not exercise gamepads. Use the supported
       # GLFW fallback so cross-linking does not require a Windows SDL2 SDK;
       # the native build above retains the default SDL gamepad integration.

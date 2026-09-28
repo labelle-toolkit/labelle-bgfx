@@ -269,11 +269,15 @@ as `error(bgfx): FATAL …` first. If you see one, that message names the bug.
 ```shell
 zig build headless-probe            # bgfx inits + reads back with no window (#36)
 zig build mirror-probe              # render target → composite → capture (#36)
-zig build screenshot-probe          # captureHeadless writes a valid TGA (#36)
+zig build screenshot-probe          # captureHeadless writes a valid TGA, overlay view included (#36, #68)
 zig build surfaceless-scale-probe   # 512 quads + a view this backend doesn't own (#61)
 ```
 
 All four run surfaceless and are wired into the display-less CI job.
+`zig build windowed-screenshot-probe` is their windowed counterpart for #68: it
+opens an invisible window, so it needs a display server and runs in the macOS
+job. It checks that the windowed `--screenshot` (`requestScreenShot` on the
+backbuffer) contains the Dear ImGui overlay's view as well as the scene.
 `surfaceless-scale-probe` is the one that covers **scale** and **third-party
 views** (Dear ImGui's overlay submits on its own bgfx view): the other three
 render a small fixed scene and were green while a real game crashed two frames
