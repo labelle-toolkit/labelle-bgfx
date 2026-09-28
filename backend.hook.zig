@@ -417,7 +417,9 @@ const EmToolResolution = union(enum) {
 /// Pure decision behind `emTool`: prefer an external `EMSDK` (the studio's
 /// managed emsdk, `~/.labelle/emsdk/<ver>/`, layout from cli#283) when it is set
 /// AND the tool actually exists at `<EMSDK>/upstream/emscripten/<tool>` on disk
-/// AND the emsdk is activated (`<EMSDK>/.emscripten` exists, #161);
+/// AND the emsdk is activated (`<EMSDK>/.emscripten` exists, #161)
+/// AND it has `upstream/emscripten/cache/sysroot/include` (#163) — the same
+/// test as build.zig's `emsdk_source.resolve` without `-Demsdk_sysroot`;
 /// otherwise fall back to the emsdk build dependency. EMSDK-unset (or an empty
 /// value, or a missing file) yields `.dep` — byte-identical to the pre-#535
 /// behavior for everyone who doesn't set EMSDK. `fs` is any value exposing
@@ -440,7 +442,16 @@ fn emToolPath(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, tool: []const u8, 
         gpa.free(abs);
         return .dep;
     };
-    if (!fs.exists(em_config)) {
+    // And the sysroot, like `emsdk_source.resolve`'s default (#163): build.zig
+    // compiles bgfx against the package emsdk when EMSDK lacks it, so the link
+    // must fall back too, or the compile and the link would use two SDKs.
+    const sysroot = std.fs.path.join(gpa, &.{ root, "upstream", "emscripten", "cache", "sysroot", "include" }) catch {
+        gpa.free(abs);
+        gpa.free(em_config);
+        return .dep;
+    };
+    defer gpa.free(sysroot);
+    if (!fs.exists(em_config) or !fs.exists(sysroot)) {
         gpa.free(abs);
         gpa.free(em_config);
         return .dep;
@@ -977,7 +988,7 @@ test "emToolPath: EMSDK set + tool present on disk → managed absolute path" {
         fn exists(_: @This(), path: []const u8) bool {
             return (std.mem.endsWith(u8, path, "emcc") and
                 std.mem.indexOf(u8, path, "upstream") != null) or
-                std.mem.endsWith(u8, path, ".emscripten");
+                std.mem.endsWith(u8, path, ".emscripten") or std.mem.endsWith(u8, path, "include");
         }
     };
     const root = "/home/u/.labelle/emsdk/4.0.0";
@@ -1001,7 +1012,7 @@ test "emToolPath: Windows tool name (emcc.bat) flows through → managed abs pat
     const Fs = struct {
         fn exists(_: @This(), path: []const u8) bool {
             return std.mem.endsWith(u8, path, "emcc.bat") or
-                std.mem.endsWith(u8, path, ".emscripten");
+                std.mem.endsWith(u8, path, ".emscripten") or std.mem.endsWith(u8, path, "include");
         }
     };
     const root = "C:/Users/u/.labelle/emsdk/4.0.0";
@@ -1036,7 +1047,8 @@ test "emToolPath: managed emcc runs under THAT emsdk's .emscripten (#161)" {
     // `.emscripten`, never some other SDK's (e.g. an inherited EM_CONFIG).
     const Fs = struct {
         fn exists(_: @This(), path: []const u8) bool {
-            return std.mem.endsWith(u8, path, "emcc") or std.mem.endsWith(u8, path, ".emscripten");
+            return std.mem.endsWith(u8, path, "emcc") or std.mem.endsWith(u8, path, ".emscripten") or
+                std.mem.endsWith(u8, path, "include");
         }
     };
     const root = "/home/u/.cache/labelle-web/emsdk/v1/x86_64-linux/4.0.9-tag";
@@ -1064,6 +1076,23 @@ test "emToolPath: emcc present but EMSDK not activated (no .emscripten) → dep 
     };
     switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", Fs{})) {
         .dep => {}, // both constructed paths are freed internally
+        .managed => |p| {
+            p.deinit(testing.allocator);
+            return error.TestUnexpectedManaged;
+        },
+    }
+}
+
+test "emToolPath: emcc + .emscripten but no sysroot → dep, like build.zig (#163)" {
+    // build.zig compiles bgfx against the package emsdk for this EMSDK, so the
+    // link must not pick the external emcc (two SDKs in one module).
+    const Fs = struct {
+        fn exists(_: @This(), path: []const u8) bool {
+            return std.mem.endsWith(u8, path, "emcc") or std.mem.endsWith(u8, path, ".emscripten");
+        }
+    };
+    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", Fs{})) {
+        .dep => {},
         .managed => |p| {
             p.deinit(testing.allocator);
             return error.TestUnexpectedManaged;
