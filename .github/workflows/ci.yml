@@ -10,6 +10,44 @@ permissions:
   contents: read
 
 jobs:
+  # Missing-SDL2 message (labelle-cli#471 S2). On Windows, Zig has no default
+  # SDL2 search path, so a desktop build with the gamepad source wired used
+  # to die with a multi-line linker error when SDL2 was absent. The script
+  # forces that case through the real wiring (`zig build sdl2-link-check`)
+  # and asserts the ONE-line message, that `-Dgamepad_enabled=false` still
+  # builds, and that a provisioned SDL2 (laid out like ~/.labelle/sdl2:
+  # static archives hidden, SDL2.dll in lib/) links.
+  sdl2-missing-windows:
+    name: missing-SDL2 message (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      SDL2_VERSION: 2.30.11
+      SDL2_SHA256: 0590db0a47b564aab92499ed03eaa75db9aee17c371080caa3b05df9d49d9ff9
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Provision SDL2 (MinGW devel) for the "present" scenario
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o sdl2.tar.gz "https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-devel-${SDL2_VERSION}-mingw.tar.gz"
+          echo "${SDL2_SHA256}  sdl2.tar.gz" | sha256sum -c -
+          tar xzf sdl2.tar.gz
+          lib="$RUNNER_TEMP/SDL2-${SDL2_VERSION}/x86_64-w64-mingw32/lib"
+          mv "$lib/libSDL2.a" "$lib/libSDL2.a.static-hidden"
+          cp "$lib/../bin/SDL2.dll" "$lib/"
+          echo "SDL2_PRESENT_LIB=$(cygpath -w "$lib")" >> "$GITHUB_ENV"
+      - name: sdl2-link-check scenarios
+        run: bash .github/scripts/sdl2-link-check.sh
+
   build-test:
     name: bgfx backend build + test (macOS)
     runs-on: macos-latest

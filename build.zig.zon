@@ -171,6 +171,8 @@
         "backend.hook.zig",
         // Imported by build.zig: which emsdk a wasm build uses (#159).
         "emsdk_source.zig",
+        // Imported by build.zig: SDL2 link + missing-SDL2 message (cli#471 S2).
+        "sdl2_link.zig",
         "build_fragments",
         "templates",
         // Build inputs:

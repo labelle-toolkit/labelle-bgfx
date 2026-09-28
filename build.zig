@@ -14,6 +14,8 @@ const emsdk_source = @import("emsdk_source.zig");
 // `wasm-example-hook` step, so CI links through the SAME code a generated game
 // does (#161 EM_CONFIG pin, #163 dependency activation).
 const build_hook = @import("backend.hook.zig");
+// SDL2 link + the one-line "SDL2 not found" failure (labelle-cli#471 S2).
+const sdl2_link = @import("sdl2_link.zig");
 
 /// True when `t` is a native desktop OS (matches the shared sdl_gamepad source's
 /// comptime `is_desktop`): only there are the SDL `extern`s referenced and SDL
@@ -258,12 +260,9 @@ pub fn build(b: *std.Build) void {
         // holding the import lib (`libSDL2.dll.a`). `SDL2.dll` must be on PATH
         // (or beside the exe) at runtime. Gated on the TARGET os only, so it
         // also applies when cross-compiling to Windows from a non-Windows host.
-        if (target.result.os.tag == .windows) {
-            if (b.graph.environ_map.get("LABELLE_SDL2_LIB")) |p| {
-                input_mod.addLibraryPath(.{ .cwd_relative = p });
-            }
-        }
-        input_mod.linkSystemLibrary("SDL2", .{});
+        // When SDL2 is missing there, the build fails with one line
+        // (`sdl2_link.missing_message`) instead of a linker error.
+        sdl2_link.link(b, input_mod, .{ .honor_env = target.result.os.tag == .windows });
     }
 
     // Shared Android gamepad source (#310 Stage 4): the per-device STATE
@@ -935,6 +934,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(emsdk_source_tests).step);
+
+    // SDL2 resolution + the one-line missing-SDL2 message (cli#471 S2);
+    // `sdl2-link-check` drives the real wiring (CI forces the missing case).
+    const sdl2_link_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("sdl2_link.zig"),
+        .target = host_target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(sdl2_link_tests).step);
+    sdl2_link.addCheckStep(b, target, sdl_gp_mod != null, .{ .honor_env = target.result.os.tag == .windows });
 
     // Run the gfx coordinate-math tests (#331). `gfx/state.zig` imports only
     // `types.zig` (pure), so it runs on the host independent of zbgfx — and
