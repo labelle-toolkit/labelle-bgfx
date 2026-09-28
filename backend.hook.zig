@@ -389,11 +389,10 @@ const EmToolResolution = union(enum) {
     const Managed = struct {
         /// `<EMSDK>/upstream/emscripten/<tool>`.
         tool: []const u8,
-        /// `<EMSDK>/.emscripten`: the EM_CONFIG the tool must run under
-        /// (labelle-bgfx#161), whether or not it exists yet. Pinned so an
-        /// inherited EM_CONFIG naming ANOTHER SDK can't redirect this emcc's
-        /// LLVM/binaryen/node; a missing file makes emcc use its defaults, not
-        /// another SDK's config.
+        /// `<EMSDK>/.emscripten` (exists: `emToolPath` requires an activated
+        /// EMSDK): the EM_CONFIG the tool must run under (labelle-bgfx#161).
+        /// Pinned so an inherited EM_CONFIG naming ANOTHER SDK can't redirect
+        /// this emcc's LLVM/binaryen/node.
         em_config: []const u8,
 
         fn deinit(self: Managed, gpa: std.mem.Allocator) void {
@@ -405,7 +404,8 @@ const EmToolResolution = union(enum) {
 
 /// Pure decision behind `emTool`: prefer an external `EMSDK` (the studio's
 /// managed emsdk, `~/.labelle/emsdk/<ver>/`, layout from cli#283) when it is set
-/// AND the tool actually exists at `<EMSDK>/upstream/emscripten/<tool>` on disk;
+/// AND the tool actually exists at `<EMSDK>/upstream/emscripten/<tool>` on disk
+/// AND the emsdk is activated (`<EMSDK>/.emscripten` exists, #161);
 /// otherwise fall back to the emsdk build dependency. EMSDK-unset (or an empty
 /// value, or a missing file) yields `.dep` — byte-identical to the pre-#535
 /// behavior for everyone who doesn't set EMSDK. `fs` is any value exposing
@@ -421,10 +421,18 @@ fn emToolPath(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, tool: []const u8, 
         gpa.free(abs);
         return .dep;
     }
+    // Activated too (#161): the tool runs under `<root>/.emscripten`, so an
+    // installed-but-not-activated EMSDK is not usable here — same rule as
+    // `emsdk_source.resolve` in build.zig.
     const em_config = std.fs.path.join(gpa, &.{ root, ".emscripten" }) catch {
         gpa.free(abs);
         return .dep;
     };
+    if (!fs.exists(em_config)) {
+        gpa.free(abs);
+        gpa.free(em_config);
+        return .dep;
+    }
     return .{ .managed = .{ .tool = abs, .em_config = em_config } };
 }
 
@@ -883,12 +891,14 @@ test "emToolPath: empty EMSDK → emsdk dependency (treated as unset)" {
 }
 
 test "emToolPath: EMSDK set + tool present on disk → managed absolute path" {
-    // Fake fs where only the managed emcc under the studio root exists — mirrors
-    // the cli#283 layout `<EMSDK>/upstream/emscripten/emcc`.
+    // Fake fs where only the managed emcc under the studio root (and its
+    // activation marker) exist — mirrors the cli#283 layout
+    // `<EMSDK>/upstream/emscripten/emcc` + `<EMSDK>/.emscripten`.
     const Fs = struct {
         fn exists(_: @This(), path: []const u8) bool {
-            return std.mem.endsWith(u8, path, "emcc") and
-                std.mem.indexOf(u8, path, "upstream") != null;
+            return (std.mem.endsWith(u8, path, "emcc") and
+                std.mem.indexOf(u8, path, "upstream") != null) or
+                std.mem.endsWith(u8, path, ".emscripten");
         }
     };
     const root = "/home/u/.labelle/emsdk/4.0.0";
@@ -911,7 +921,8 @@ test "emToolPath: Windows tool name (emcc.bat) flows through → managed abs pat
     // probe/return that exact name (Windows can't exec the extensionless wrapper).
     const Fs = struct {
         fn exists(_: @This(), path: []const u8) bool {
-            return std.mem.endsWith(u8, path, "emcc.bat");
+            return std.mem.endsWith(u8, path, "emcc.bat") or
+                std.mem.endsWith(u8, path, ".emscripten");
         }
     };
     const root = "C:/Users/u/.labelle/emsdk/4.0.0";
@@ -942,11 +953,11 @@ test "emToolPath: EMSDK set but tool missing on disk → falls back to dep" {
 }
 
 test "emToolPath: managed emcc runs under THAT emsdk's .emscripten (#161)" {
-    // Only the external emcc exists. The EM_CONFIG must name the same root's
+    // An activated external emsdk. The EM_CONFIG must name the same root's
     // `.emscripten`, never some other SDK's (e.g. an inherited EM_CONFIG).
     const Fs = struct {
         fn exists(_: @This(), path: []const u8) bool {
-            return std.mem.endsWith(u8, path, "emcc");
+            return std.mem.endsWith(u8, path, "emcc") or std.mem.endsWith(u8, path, ".emscripten");
         }
     };
     const root = "/home/u/.cache/labelle-web/emsdk/v1/x86_64-linux/4.0.9-tag";
@@ -960,6 +971,24 @@ test "emToolPath: managed emcc runs under THAT emsdk's .emscripten (#161)" {
             try testing.expect(std.mem.startsWith(u8, p.tool, root));
         },
         .dep => return error.TestExpectedManaged,
+    }
+}
+
+test "emToolPath: emcc present but EMSDK not activated (no .emscripten) → dep (#161)" {
+    // Installed but not activated: pinning EM_CONFIG to a missing file would run
+    // emcc without its config, so this EMSDK is not usable (same rule as
+    // build.zig's emsdk_source.resolve).
+    const Fs = struct {
+        fn exists(_: @This(), path: []const u8) bool {
+            return std.mem.endsWith(u8, path, "emcc");
+        }
+    };
+    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", Fs{})) {
+        .dep => {}, // both constructed paths are freed internally
+        .managed => |p| {
+            p.deinit(testing.allocator);
+            return error.TestUnexpectedManaged;
+        },
     }
 }
 
