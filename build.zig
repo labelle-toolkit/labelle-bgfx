@@ -1347,31 +1347,46 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         "emsdk_expect",
         "Fail unless the wasm build takes emscripten from this source (external = a valid EMSDK, package = the emsdk Zig package)",
     );
-    const BuildFs = struct {
-        b: *std.Build,
-        pub fn exists(self: @This(), path: []const u8) bool {
-            return if (std.Io.Dir.cwd().access(self.b.graph.io, path, .{})) |_| true else |_| false;
-        }
-    };
-    const source = emsdk_source.resolve(b.allocator, b.graph.environ_map.get("EMSDK"), BuildFs{ .b = b });
-    if (emsdk_source.mismatch(source, emsdk_expect)) |msg| std.debug.panic("emsdk: {s}", .{msg});
-
     const emsdk_sysroot_override = b.option(
         []const u8,
         "emsdk_sysroot",
         "Path to the emscripten sysroot 'include' dir for the wasm C/C++ compiles (defaults to EMSDK's, else the emsdk package's)",
     );
-
     const emcc_name = if (builtin.os.tag == .windows) "emcc.bat" else "emcc";
-    // The default sysroot (LazyPath), the emcc to link with, and the one-time
-    // setup step every C/C++ compile + the link wait on (null = nothing to run).
+
+    const BuildFs = struct {
+        b: *std.Build,
+        pub fn exists(self: @This(), path: []const u8) bool {
+            std.Io.Dir.cwd().access(self.b.graph.io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return false,
+                // Anything else (permissions, I/O) is not "missing": report it
+                // rather than silently falling back to installing the package.
+                else => std.debug.panic("emsdk: cannot check EMSDK path '{s}': {s}", .{ path, @errorName(err) }),
+            };
+            return true;
+        }
+    };
+    const source = emsdk_source.resolve(b.allocator, b.graph.environ_map.get("EMSDK"), .{
+        .emcc_name = emcc_name,
+        // With `-Demsdk_sysroot` the default sysroot dir is not needed.
+        .need_sysroot = emsdk_sysroot_override == null,
+    }, BuildFs{ .b = b });
+    if (emsdk_source.mismatch(source, emsdk_expect)) |msg| std.debug.panic("emsdk: {s}", .{msg});
+
+    // The default sysroot (LazyPath), the emcc to link with plus the EM_CONFIG
+    // it must run under (the SAME emsdk's `.emscripten`, so an inherited
+    // EM_CONFIG naming another SDK can't redirect its tool paths), and the
+    // one-time setup step every C/C++ compile + the link wait on (null =
+    // nothing to run).
     var default_sysroot: std.Build.LazyPath = undefined;
     var emcc_exe: []const u8 = undefined;
+    var em_config: []const u8 = undefined;
     var emsdk_setup: ?*std.Build.Step.Run = null;
     switch (source) {
         .external => |root| {
             default_sysroot = .{ .cwd_relative = emsdk_source.sysrootInclude(b.allocator, root) catch @panic("OOM") };
             emcc_exe = emsdk_source.toolPath(b.allocator, root, emcc_name) catch @panic("OOM");
+            em_config = b.pathJoin(&.{ root, ".emscripten" });
         },
         .package => {
             // Lazy: only fetched when no valid EMSDK is set. On the first
@@ -1384,6 +1399,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
             emsdk_setup = emSdkSetupStep(b, emsdk_dep) catch @panic("emsdk setup failed");
             default_sysroot = emsdk_dep.path("upstream/emscripten/cache/sysroot/include");
             emcc_exe = emsdk_dep.path(b.fmt("upstream/emscripten/{s}", .{emcc_name})).getPath(b);
+            em_config = emsdk_dep.path(".emscripten").getPath(b);
         },
     }
 
@@ -1567,6 +1583,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // raylib — there is NO GLFW emulation and NO asyncify; the frame is driven by
     // emscripten_set_main_loop.
     const emcc = b.addSystemCommand(&.{emcc_exe});
+    emcc.setEnvironmentVariable("EM_CONFIG", em_config);
     if (emsdk_setup) |setup| emcc.step.dependOn(&setup.step);
     if (optimize == .Debug) {
         emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1", "-sASSERTIONS=1" });
