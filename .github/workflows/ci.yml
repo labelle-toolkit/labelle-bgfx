@@ -396,6 +396,10 @@ jobs:
           file "$so" | grep -q 'ELF 64-bit.*ARM aarch64' || { echo "FAIL: not an aarch64 ELF"; exit 1; }
           nm -D "$so" | grep -q 'android_main' || { echo "FAIL: android_main not exported"; exit 1; }
           nm -D "$so" | grep -q 'ANativeActivity_onCreate' || { echo "FAIL: ANativeActivity_onCreate not exported"; exit 1; }
+          # labelle-engine#800: the gamepad JNI glue's callbacks must be
+          # DEFINED; a shared-lib link accepts them undefined and the app
+          # then dies at dlopen on a device.
+          bash labelle-bgfx/.github/scripts/android-jni-exports-check.sh "$so"
 
       # ── labelle-cli#405 D11: the `android` provider next to bgfx ──────
       # A project that lists the provider plugin (labelle-android) gets that
@@ -468,6 +472,10 @@ jobs:
           done
           dups=$(printf '%s\n' "$defined" | uniq -d)
           if [ -n "$dups" ]; then echo "FAIL: duplicated: $dups"; fail=1; fi
+          # labelle-engine#800: this fixture is gamepad-less (`.gamepad = .none`),
+          # the exact case where core's hotplug exports used to vanish while
+          # the JNI C still referenced them (dlopen "cannot locate symbol").
+          bash "$GITHUB_WORKSPACE/labelle-bgfx/.github/scripts/android-jni-exports-check.sh" "$so" || fail=1
           # The mechanism, not just the count: the JNI C in the .so is the
           # PLUGIN's copy (.labelle/deps/labelle-android), and bgfx's
           # hash-fetched copy (zig-pkg/labelle_android-<ver>-<hash>) is absent.
