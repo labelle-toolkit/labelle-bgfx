@@ -146,10 +146,13 @@
         // libc headers for wasm32-emscripten). Same pin the sokol + raylib
         // backends use — copied verbatim from labelle-raylib's build.zig.zon so
         // all three web backends resolve one shared emsdk. Only fetched on a wasm
-        // build (`b.lazyDependency`); desktop/android never pull it.
+        // build (`b.lazyDependency`); desktop/android never pull it, and nor
+        // does a wasm build with a valid `EMSDK` set (labelle-bgfx#159, see
+        // emsdk_source.zig): that build takes the sysroot + emcc from EMSDK.
         .emsdk = .{
             .url = "git+https://github.com/emscripten-core/emsdk?ref=4.0.9#3bcf1dcd01f040f370e10fe673a092d9ed79ebb5",
             .hash = "N-V-__8AAJl1DwBezhYo_VE6f53mPVm00R-Fk28NPW7P14EQ",
+            .lazy = true,
         },
         .labelle_gfx = .{
             .url = "https://github.com/labelle-toolkit/labelle-gfx/archive/refs/tags/v1.29.2.tar.gz",
@@ -166,6 +169,8 @@
         // stages the hook it names; both must ship with the package.
         "backend.manifest.v2.zon",
         "backend.hook.zig",
+        // Imported by build.zig: which emsdk a wasm build uses (#159).
+        "emsdk_source.zig",
         "build_fragments",
         "templates",
         // Build inputs:
