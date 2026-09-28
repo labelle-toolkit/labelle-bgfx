@@ -1665,6 +1665,10 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .lib_backend = bgfx_artifact,
         // Null on the external path: the package is not fetched there.
         .emsdk = package_emsdk,
+        // The same EMSDK test emsdk_source.resolve applied above, so the hook
+        // never picks a different emsdk than the C compiles (and never falls
+        // back to a package that wasn't fetched).
+        .need_sysroot = emsdk_sysroot_override == null,
     });
     const wasm_hook_step = b.step("wasm-example-hook", "Build the wasm example, linked by backend.hook.zig's emLinkStep (same code as a generated game)");
     wasm_hook_step.dependOn(&hook_install.step);

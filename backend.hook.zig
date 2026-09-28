@@ -385,6 +385,11 @@ pub const EmLinkOptions = struct {
     /// `wasm_editor_exported_functions_arg`). Threaded from
     /// `HookContext.editor_preview` by `post_wire`.
     editor_preview: bool = false,
+    /// Whether an external EMSDK must also have the default sysroot include dir
+    /// to be used. False only when the caller's C compiles take the sysroot
+    /// from elsewhere (build.zig's `-Demsdk_sysroot`), so the link and
+    /// `emsdk_source.resolve` accept the same EMSDKs.
+    need_sysroot: bool = true,
 };
 
 /// Where `emTool` resolves an emscripten tool from.
@@ -422,9 +427,12 @@ const EmToolResolution = union(enum) {
 /// test as build.zig's `emsdk_source.resolve` without `-Demsdk_sysroot`;
 /// otherwise fall back to the emsdk build dependency. EMSDK-unset (or an empty
 /// value, or a missing file) yields `.dep` — byte-identical to the pre-#535
-/// behavior for everyone who doesn't set EMSDK. `fs` is any value exposing
-/// `exists(path) bool`, so the branch is testable without a live `*std.Build`.
-fn emToolPath(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, tool: []const u8, fs: anytype) EmToolResolution {
+/// behavior for everyone who doesn't set EMSDK. `need_sysroot` is false only
+/// when the caller supplies the sysroot itself (build.zig's `-Demsdk_sysroot`),
+/// exactly as `emsdk_source.resolve`'s `Options.need_sysroot`. `fs` is any value
+/// exposing `exists(path) bool`, so the branch is testable without a live
+/// `*std.Build`.
+fn emToolPath(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, tool: []const u8, need_sysroot: bool, fs: anytype) EmToolResolution {
     const root = env_emsdk orelse return .dep;
     if (root.len == 0) return .dep;
     // The managed layout (cli#283) mirrors the zig-pkg dep EXACTLY — only the
@@ -451,7 +459,7 @@ fn emToolPath(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, tool: []const u8, 
         return .dep;
     };
     defer gpa.free(sysroot);
-    if (!fs.exists(em_config) or !fs.exists(sysroot)) {
+    if (!fs.exists(em_config) or (need_sysroot and !fs.exists(sysroot))) {
         gpa.free(abs);
         gpa.free(em_config);
         return .dep;
@@ -513,7 +521,7 @@ fn pinEmConfig(run: anytype, em_config: []const u8) void {
 /// override (no HookContext/EmLinkOptions ABI change — the dep is still passed in).
 /// Also returns the EM_CONFIG of whichever emsdk was chosen (#161), and on the
 /// dependency fallback the activate step the link must wait on, if any (#163).
-fn emTool(b: *std.Build, emsdk_opt: ?*std.Build.Dependency, tool: []const u8) EmTool {
+fn emTool(b: *std.Build, emsdk_opt: ?*std.Build.Dependency, tool: []const u8, need_sysroot: bool) EmTool {
     const BuildFs = struct {
         b: *std.Build,
         fn exists(self: @This(), path: []const u8) bool {
@@ -525,7 +533,7 @@ fn emTool(b: *std.Build, emsdk_opt: ?*std.Build.Dependency, tool: []const u8) Em
     // there. Match the `.bat` suffix build.zig already appends, and use the SAME
     // resolved name for BOTH the managed probe and the dep fallback so they agree.
     const actual_tool = if (builtin.os.tag == .windows) b.fmt("{s}.bat", .{tool}) else tool;
-    switch (emToolPath(b.allocator, b.graph.environ_map.get("EMSDK"), actual_tool, fs)) {
+    switch (emToolPath(b.allocator, b.graph.environ_map.get("EMSDK"), actual_tool, need_sysroot, fs)) {
         // `b.allocator` is the build arena, so the absolute slices outlive config.
         .managed => |m| return .{ .exe = .{ .cwd_relative = m.tool }, .em_config = m.em_config },
         .dep => {
@@ -575,7 +583,7 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
     // + `addFileArg` is the lazy-safe form; the step name "emcc" also hides the
     // resolved path in the log. Mirrors raylib's hook.
     const emcc = std.Build.Step.Run.create(b, "emcc");
-    const em = emTool(b, options.emsdk, "emcc");
+    const em = emTool(b, options.emsdk, "emcc", options.need_sysroot);
     emcc.addFileArg(em.exe);
     // Run under the SAME emsdk's `.emscripten` (#161): an inherited EM_CONFIG
     // naming another SDK would otherwise redirect this emcc's tools.
@@ -956,7 +964,7 @@ test "emToolPath: EMSDK unset → emsdk dependency (behavior byte-identical to p
             return true; // even if "everything exists", a null env must NOT go managed
         }
     };
-    switch (emToolPath(testing.allocator, null, "emcc", Fs{})) {
+    switch (emToolPath(testing.allocator, null, "emcc", true, Fs{})) {
         .dep => {}, // no allocation happens on this path — nothing to free
         .managed => |p| {
             p.deinit(testing.allocator);
@@ -971,7 +979,7 @@ test "emToolPath: empty EMSDK → emsdk dependency (treated as unset)" {
             return true;
         }
     };
-    switch (emToolPath(testing.allocator, "", "emcc", Fs{})) {
+    switch (emToolPath(testing.allocator, "", "emcc", true, Fs{})) {
         .dep => {},
         .managed => |p| {
             p.deinit(testing.allocator);
@@ -992,7 +1000,7 @@ test "emToolPath: EMSDK set + tool present on disk → managed absolute path" {
         }
     };
     const root = "/home/u/.labelle/emsdk/4.0.0";
-    switch (emToolPath(testing.allocator, root, "emcc", Fs{})) {
+    switch (emToolPath(testing.allocator, root, "emcc", true, Fs{})) {
         .managed => |p| {
             defer p.deinit(testing.allocator);
             const expected = try std.fs.path.join(
@@ -1016,7 +1024,7 @@ test "emToolPath: Windows tool name (emcc.bat) flows through → managed abs pat
         }
     };
     const root = "C:/Users/u/.labelle/emsdk/4.0.0";
-    switch (emToolPath(testing.allocator, root, "emcc.bat", Fs{})) {
+    switch (emToolPath(testing.allocator, root, "emcc.bat", true, Fs{})) {
         .managed => |p| {
             defer p.deinit(testing.allocator);
             try testing.expect(std.mem.endsWith(u8, p.tool, "emcc.bat"));
@@ -1033,7 +1041,7 @@ test "emToolPath: EMSDK set but tool missing on disk → falls back to dep" {
             return false;
         }
     };
-    switch (emToolPath(testing.allocator, "/nonexistent/emsdk", "emcc", Fs{})) {
+    switch (emToolPath(testing.allocator, "/nonexistent/emsdk", "emcc", true, Fs{})) {
         .dep => {}, // helper frees the constructed path internally
         .managed => |p| {
             p.deinit(testing.allocator);
@@ -1052,7 +1060,7 @@ test "emToolPath: managed emcc runs under THAT emsdk's .emscripten (#161)" {
         }
     };
     const root = "/home/u/.cache/labelle-web/emsdk/v1/x86_64-linux/4.0.9-tag";
-    switch (emToolPath(testing.allocator, root, "emcc", Fs{})) {
+    switch (emToolPath(testing.allocator, root, "emcc", true, Fs{})) {
         .managed => |p| {
             defer p.deinit(testing.allocator);
             const expected = try std.fs.path.join(testing.allocator, &.{ root, ".emscripten" });
@@ -1074,7 +1082,7 @@ test "emToolPath: emcc present but EMSDK not activated (no .emscripten) → dep 
             return std.mem.endsWith(u8, path, "emcc");
         }
     };
-    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", Fs{})) {
+    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", true, Fs{})) {
         .dep => {}, // both constructed paths are freed internally
         .managed => |p| {
             p.deinit(testing.allocator);
@@ -1091,12 +1099,26 @@ test "emToolPath: emcc + .emscripten but no sysroot → dep, like build.zig (#16
             return std.mem.endsWith(u8, path, "emcc") or std.mem.endsWith(u8, path, ".emscripten");
         }
     };
-    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", Fs{})) {
+    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", true, Fs{})) {
         .dep => {},
         .managed => |p| {
             p.deinit(testing.allocator);
             return error.TestUnexpectedManaged;
         },
+    }
+}
+
+test "emToolPath: with the sysroot supplied elsewhere, emcc + .emscripten is enough (#163)" {
+    // build.zig's `-Demsdk_sysroot` makes emsdk_source.resolve accept an EMSDK
+    // without the default sysroot; the link must accept the same EMSDK.
+    const Fs = struct {
+        fn exists(_: @This(), path: []const u8) bool {
+            return std.mem.endsWith(u8, path, "emcc") or std.mem.endsWith(u8, path, ".emscripten");
+        }
+    };
+    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", false, Fs{})) {
+        .managed => |p| p.deinit(testing.allocator),
+        .dep => return error.TestExpectedManaged,
     }
 }
 

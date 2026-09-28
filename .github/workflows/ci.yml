@@ -603,11 +603,11 @@ jobs:
           EMSDK: ''
         run: |
           set -uo pipefail
-          pkg=""
-          for dir in zig-pkg/*/; do
-            [ -f "$dir/emsdk.py" ] && [ -d "$dir/upstream/emscripten" ] && pkg="$dir"
-          done
-          [ -n "$pkg" ] || { echo "FAIL: no installed emsdk package under zig-pkg/"; exit 1; }
+          # The emsdk this build.zig.zon pins (a restored cache can also hold
+          # an older pin's package, so never pick by glob order).
+          hash=$(python3 -c "import re;t=open('build.zig.zon').read();print(re.search(r'\.emsdk\s*=\s*\.\{.*?\.hash\s*=\s*\"([^\"]+)\"',t,re.S).group(1))")
+          pkg="zig-pkg/$hash/"
+          [ -d "$pkg/upstream/emscripten" ] || { echo "FAIL: the pinned emsdk package $pkg is not installed"; exit 1; }
           rm -f "$pkg/.emscripten"
           zig build -Dtarget=wasm32-emscripten -Demsdk_expect=package wasm-example-hook --summary all > hook.log 2>&1
           status=$?
