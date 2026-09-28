@@ -85,11 +85,21 @@ pub fn link(b: *std.Build, mod: *std.Build.Module, opts: Options) void {
 /// failure is hung off a generated library dir. Only builds that actually
 /// link the module fail (e.g. `--help`, or a step that doesn't use input,
 /// still work), and SDL2 is not linked, so no linker error follows.
+/// One gate per `std.Build`, shared by every module that needs it, so a
+/// build that uses several such modules still prints the line once.
 fn failOnUse(b: *std.Build, mod: *std.Build.Module) void {
-    const fail = b.addFail(missing_message);
-    const gate = b.addWriteFiles();
-    gate.step.dependOn(&fail.step);
-    mod.addLibraryPath(gate.getDirectory());
+    const Cache = struct {
+        var owner: ?*std.Build = null;
+        var gate: ?*std.Build.Step.WriteFile = null;
+    };
+    if (Cache.owner != b or Cache.gate == null) {
+        const fail = b.addFail(missing_message);
+        const gate = b.addWriteFiles();
+        gate.step.dependOn(&fail.step);
+        Cache.owner = b;
+        Cache.gate = gate;
+    }
+    mod.addLibraryPath(Cache.gate.?.getDirectory());
 }
 
 const RealProbe = struct {
@@ -198,14 +208,18 @@ test "missing_message is one line naming both fixes" {
 /// predicate, so `-Dgamepad_enabled=false` (`.gamepad = .none`) must build
 /// with SDL2 absent.
 pub fn addCheckStep(b: *std.Build, target: std.Build.ResolvedTarget, sdl_needed: bool, opts: Options) void {
-    const mod = b.createModule(.{
-        .root_source_file = b.path("sdl2_link.zig"),
-        .target = target,
-        .optimize = .Debug,
-        .link_libc = true,
-    });
-    if (sdl_needed) link(b, mod, opts);
-    const exe = b.addTest(.{ .name = "sdl2-link-check", .root_module = mod });
-    const step = b.step("sdl2-link-check", "Link a tiny binary against SDL2 via the backend's SDL2 wiring (fails with one line when SDL2 is missing)");
-    step.dependOn(&exe.step);
+    const step = b.step("sdl2-link-check", "Link tiny binaries against SDL2 via the backend's SDL2 wiring (fails with one line when SDL2 is missing)");
+    // Two independent modules, like a real build's exe + host test module:
+    // proves the missing-SDL2 line is still printed only once.
+    for ([_][]const u8{ "sdl2-link-check", "sdl2-link-check-2" }) |name| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("sdl2_link.zig"),
+            .target = target,
+            .optimize = .Debug,
+            .link_libc = true,
+        });
+        if (sdl_needed) link(b, mod, opts);
+        const exe = b.addTest(.{ .name = name, .root_module = mod });
+        step.dependOn(&exe.step);
+    }
 }

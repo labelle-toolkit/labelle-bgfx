@@ -31,7 +31,7 @@ expect_missing() { # $1 = label; remaining = env assignments for `env`
   if grep -q "unable to find dynamic system library" "$log"; then
     echo "FAIL[$label]: the linker ran (its error was printed)"; failures=$((failures + 1)); return
   fi
-  if [ "$(grep -c "SDL2" "$log")" -ne 1 ]; then
+  if [ "$(grep -c "SDL2" "$log")" -ne 1 ]; then # two SDL modules in the graph, one line
     echo "FAIL[$label]: expected exactly one line mentioning SDL2"; failures=$((failures + 1)); return
   fi
   echo "ok[$label]"
