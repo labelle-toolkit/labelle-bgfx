@@ -193,8 +193,9 @@ pub fn loadMusic(path: [:0]const u8) u32 {
 /// takes (`src/video/backend.zig`). The asset must be stored uncompressed in
 /// the APK: `AAsset_openFileDescriptor64` refuses compressed entries.
 ///
-/// The decode is synchronous and takes a noticeable time for a long track on
-/// a slow device, so load music while a loading screen is up, not mid-game.
+/// The decode is synchronous and takes seconds for a long track on a slow
+/// device (a 2-minute MP3 is ~7 s on the MT6750 P42), long enough for an
+/// Android "not responding" dialog. Games should use `loadMusicAssetAsync`.
 ///
 /// Elsewhere it loads `assets/<name>` with `loadMusic`, so only a WAV at the
 /// device rate works there until desktop and web decode compressed audio.
@@ -203,6 +204,52 @@ pub fn loadMusicAsset(name: []const u8) u32 {
     var buf: [512]u8 = undefined;
     const path = std.fmt.bufPrintZ(&buf, "assets/{s}", .{name}) catch return 0;
     return loadMusic(path);
+}
+
+/// A music asset being decoded off the calling thread by
+/// `loadMusicAssetAsync`. The caller owns it (e.g. a file-scope `var`) and
+/// keeps it alive until `poll` returns non-null.
+pub const MusicAssetLoad = struct {
+    name_buf: [256]u8 = undefined,
+    name_len: usize = 0,
+    result: std.atomic.Value(u32) = .init(pending),
+    thread: ?std.Thread = null,
+
+    const pending: u32 = std.math.maxInt(u32);
+
+    /// `null` while decoding; then the music id, or 0 if the load failed.
+    pub fn poll(self: *MusicAssetLoad) ?u32 {
+        const id = self.result.load(.acquire);
+        if (id == pending) return null;
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        return id;
+    }
+};
+
+/// `loadMusicAsset` on a worker thread, so a long decode doesn't freeze the
+/// game. Poll `load.poll()` each frame. Returns false if it couldn't start
+/// (name too long, no thread). Single-threaded targets load synchronously,
+/// so `poll` is ready at once.
+pub fn loadMusicAssetAsync(load: *MusicAssetLoad, name: []const u8) bool {
+    if (name.len > load.name_buf.len) return false;
+    @memcpy(load.name_buf[0..name.len], name);
+    load.name_len = name.len;
+    // Bring the mixer up here, on the caller's thread, not from the worker.
+    ensureInit();
+    if (comptime builtin.single_threaded) {
+        load.result.store(loadMusicAsset(name), .release);
+        return true;
+    }
+    load.result.store(MusicAssetLoad.pending, .release);
+    load.thread = std.Thread.spawn(.{}, loadMusicAssetWorker, .{load}) catch return false;
+    return true;
+}
+
+fn loadMusicAssetWorker(load: *MusicAssetLoad) void {
+    load.result.store(loadMusicAsset(load.name_buf[0..load.name_len]), .release);
 }
 
 // APK asset access for `loadMusicAsset`: the same AAssetManager route the
@@ -353,4 +400,19 @@ test "loadMusicAsset returns 0 for an asset that isn't there" {
 test "loadMusicAsset returns 0 for a name too long for its path buffer" {
     const long = "m" ** 600;
     try testing.expectEqual(@as(u32, 0), loadMusicAsset(long));
+}
+
+test "loadMusicAssetAsync reports a missing asset as 0 once the worker is done" {
+    var load: MusicAssetLoad = .{};
+    try testing.expect(loadMusicAssetAsync(&load, "music/does_not_exist.ogg"));
+    const id = while (true) {
+        if (load.poll()) |v| break v;
+        std.Thread.yield() catch {};
+    };
+    try testing.expectEqual(@as(u32, 0), id);
+}
+
+test "loadMusicAssetAsync refuses a name longer than its buffer" {
+    var load: MusicAssetLoad = .{};
+    try testing.expect(!loadMusicAssetAsync(&load, "m" ** 300));
 }
