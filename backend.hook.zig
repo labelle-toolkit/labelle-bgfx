@@ -27,6 +27,14 @@
 //! wasm32-emscripten when handed `-Demsdk_sysroot`), and emcc is given bgfx's full
 //! transitive lib set (bgfx + bx + bimg).
 //!
+//! emsdk contract (labelle-bgfx#161/#163): a valid, activated `EMSDK` wins and
+//! the emsdk dependency is never activated or installed. On the dependency
+//! fallback, INSTALLING the toolchain is the generated build.zig's job (the
+//! `ensureEmsdkActivated` preflight, labelle-assembler#492, stops the configure
+//! with the exact command); this hook only ACTIVATES an installed-but-inactive
+//! dependency before emcc runs (`needsDepActivation`). Either way emcc runs
+//! with `EM_CONFIG` pinned to the chosen emsdk's `.emscripten`.
+//!
 //! ANDROID exercises BOTH hook phases:
 //!
 //!   * `resolve_target` — runs BEFORE any `b.dependency` and produces the android
@@ -367,8 +375,12 @@ pub const EmLinkOptions = struct {
     /// wasm32-emscripten by the apotema/zbgfx fork). Retained for callers/context;
     /// its subtree is already covered by walking `lib_main`'s graph.
     lib_backend: *std.Build.Step.Compile,
-    /// The emsdk dependency, resolved by the caller via `b.dependency("emsdk", .{})`.
-    emsdk: *std.Build.Dependency,
+    /// The emsdk dependency, resolved by the caller via `b.dependency("emsdk", .{})`
+    /// (`post_wire` always passes it). Null only when the caller already knows a
+    /// valid EMSDK is set (build.zig's `wasm-example-hook` on the external path,
+    /// which never fetches the package); falling back to the dependency without
+    /// one is a configure-time panic.
+    emsdk: ?*std.Build.Dependency,
     /// Editor-preview build: add the `editor_*` export args (see
     /// `wasm_editor_exported_functions_arg`). Threaded from
     /// `HookContext.editor_preview` by `post_wire`.
@@ -442,7 +454,37 @@ const EmTool = struct {
     exe: std.Build.LazyPath,
     /// Absolute path to that emsdk's `.emscripten`.
     em_config: []const u8,
+    /// `emsdk activate latest` on the emsdk DEPENDENCY, when the link falls back
+    /// to it and it is not activated yet (#163); the emcc step must wait on it.
+    /// Always null on the external-EMSDK path. See `needsDepActivation`.
+    activate: ?*std.Build.Step.Run = null,
 };
+
+/// Which emsdk the link uses, for `needsDepActivation`.
+const EmSource = enum { managed, dep };
+
+/// Whether the emcc link must first run `emsdk activate latest` on the emsdk
+/// dependency (labelle-bgfx#163). Only on the dependency fallback, and only while
+/// it has no `.emscripten`. Never on the external-EMSDK path, so a valid EMSDK
+/// never touches the package.
+///
+/// The hook ACTIVATES but never INSTALLS: `emsdk activate` only writes the
+/// config for an already-installed toolchain and fails ("tool is not installed")
+/// rather than downloading. Installing the ~1.5 GB toolchain stays with the
+/// assembler contract: the generated build.zig's `ensureEmsdkActivated`
+/// preflight (labelle-assembler#492) stops the configure, with the exact
+/// `emsdk install latest && emsdk activate latest` command, when neither a
+/// usable EMSDK nor an installed dependency emcc exists. So after that
+/// preflight the dependency is installed, and this step only closes the
+/// "installed but not activated" gap, where emcc would otherwise run under a
+/// missing EM_CONFIG.
+fn needsDepActivation(source: EmSource, dep_activated: bool) bool {
+    return source == .dep and !dep_activated;
+}
+
+/// `--summary all` name of the hook's activate step. It contains
+/// "(zig-pkg emsdk)", which the external-EMSDK CI job requires to be absent.
+const dep_activate_step_name = "hook: emsdk activate latest (zig-pkg emsdk)";
 
 /// Pin `run`'s EM_CONFIG to `em_config` (the chosen emsdk's `.emscripten`), so
 /// an EM_CONFIG inherited from the environment can't point this emcc at another
@@ -458,29 +500,57 @@ fn pinEmConfig(run: anytype, em_config: []const u8) void {
 /// a forward-slash join (NOT `b.pathJoin`) so the emsdk-relative sub-path stays
 /// portable — mirrors raylib's hook. The dep stays the default source; env is an
 /// override (no HookContext/EmLinkOptions ABI change — the dep is still passed in).
-/// Also returns the EM_CONFIG of whichever emsdk was chosen (#161).
-fn emTool(b: *std.Build, emsdk: *std.Build.Dependency, tool: []const u8) EmTool {
+/// Also returns the EM_CONFIG of whichever emsdk was chosen (#161), and on the
+/// dependency fallback the activate step the link must wait on, if any (#163).
+fn emTool(b: *std.Build, emsdk_opt: ?*std.Build.Dependency, tool: []const u8) EmTool {
     const BuildFs = struct {
         b: *std.Build,
         fn exists(self: @This(), path: []const u8) bool {
             return if (std.Io.Dir.cwd().access(self.b.graph.io, path, .{})) |_| true else |_| false;
         }
     };
+    const fs: BuildFs = .{ .b = b };
     // Windows can't execute the extensionless wrapper — emscripten ships `emcc.bat`
     // there. Match the `.bat` suffix build.zig already appends, and use the SAME
     // resolved name for BOTH the managed probe and the dep fallback so they agree.
     const actual_tool = if (builtin.os.tag == .windows) b.fmt("{s}.bat", .{tool}) else tool;
-    switch (emToolPath(b.allocator, b.graph.environ_map.get("EMSDK"), actual_tool, BuildFs{ .b = b })) {
+    switch (emToolPath(b.allocator, b.graph.environ_map.get("EMSDK"), actual_tool, fs)) {
         // `b.allocator` is the build arena, so the absolute slices outlive config.
         .managed => |m| return .{ .exe = .{ .cwd_relative = m.tool }, .em_config = m.em_config },
-        .dep => return .{
-            .exe = emsdk.path(b.fmt("upstream/emscripten/{s}", .{actual_tool})),
+        .dep => {
+            const emsdk = emsdk_opt orelse std.debug.panic(
+                "emsdk: no valid EMSDK (needs upstream/emscripten/{s} and .emscripten) and no emsdk dependency was passed to emLinkStep",
+                .{actual_tool},
+            );
             // An env var needs a string now. A dependency's root is known at
             // configure time (it is fetched before build() runs), so this
             // resolves to the same path the lazy `exe` does at run time.
-            .em_config = emsdk.path(".emscripten").getPath(b),
+            const em_config = emsdk.path(".emscripten").getPath(b);
+            return .{
+                .exe = emsdk.path(b.fmt("upstream/emscripten/{s}", .{actual_tool})),
+                .em_config = em_config,
+                .activate = if (needsDepActivation(.dep, fs.exists(em_config)))
+                    depActivateStep(b, emsdk)
+                else
+                    null,
+            };
         },
     }
+}
+
+/// `emsdk activate latest` on the emsdk dependency (never `install`; see
+/// `needsDepActivation`). Windows runs `emsdk.bat`; elsewhere `bash emsdk`.
+fn depActivateStep(b: *std.Build, emsdk: *std.Build.Dependency) *std.Build.Step.Run {
+    const run = if (builtin.os.tag == .windows)
+        b.addSystemCommand(&.{emsdk.path("emsdk.bat").getPath(b)})
+    else blk: {
+        const r = b.addSystemCommand(&.{"bash"});
+        r.addArg(emsdk.path("emsdk").getPath(b));
+        break :blk r;
+    };
+    run.addArgs(&.{ "activate", "latest" });
+    run.setName(dep_activate_step_name);
+    return run;
 }
 
 /// Reconstruction of the emcc link step using only `std.Build` + the emsdk
@@ -499,6 +569,15 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
     // Run under the SAME emsdk's `.emscripten` (#161): an inherited EM_CONFIG
     // naming another SDK would otherwise redirect this emcc's tools.
     pinEmConfig(emcc, em.em_config);
+    // Dependency fallback, not yet activated (#163): activate it before emcc runs.
+    // The activate step itself waits for `lib_main`, so it runs after every
+    // compile the game needs, including any other package's own emsdk
+    // install/activate on the same emsdk package (e.g. labelle-imgui's bgfx
+    // bridge), instead of racing them.
+    if (em.activate) |activate| {
+        activate.step.dependOn(&options.lib_main.step);
+        emcc.step.dependOn(&activate.step);
+    }
     if (options.optimize == .Debug) {
         emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1" });
     } else {
@@ -990,6 +1069,28 @@ test "emToolPath: emcc present but EMSDK not activated (no .emscripten) → dep 
             return error.TestUnexpectedManaged;
         },
     }
+}
+
+test "needsDepActivation: a valid EMSDK never activates (or downloads) the package (#163)" {
+    // The whole point of #159/#161: with a usable external EMSDK the package is
+    // never touched, whether or not it happens to be activated.
+    try testing.expect(!needsDepActivation(.managed, false));
+    try testing.expect(!needsDepActivation(.managed, true));
+}
+
+test "needsDepActivation: the dependency fallback activates only while unactivated (#163)" {
+    try testing.expect(needsDepActivation(.dep, false));
+    // Already activated (the assembler preflight's instructions were followed,
+    // or a cached package): no step, no extra work.
+    try testing.expect(!needsDepActivation(.dep, true));
+}
+
+test "the hook's activate step is named for the external-EMSDK CI gate (#163)" {
+    // CI's external job fails on any "(zig-pkg emsdk)" step, and the fallback
+    // job requires this exact name to have run. Keep both in sync.
+    try testing.expect(std.mem.indexOf(u8, dep_activate_step_name, "(zig-pkg emsdk)") != null);
+    try testing.expect(std.mem.indexOf(u8, dep_activate_step_name, "activate") != null);
+    try testing.expect(std.mem.indexOf(u8, dep_activate_step_name, "install") == null);
 }
 
 test "pinEmConfig: sets EM_CONFIG (and only it) on the emcc step (#161)" {
