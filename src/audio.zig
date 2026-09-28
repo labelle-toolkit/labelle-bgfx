@@ -183,6 +183,65 @@ pub fn loadMusic(path: [:0]const u8) u32 {
     return Audio.loadMusicFromMemory(bytes);
 }
 
+/// Load the bundled asset `name` (e.g. `"music/theme.ogg"`) and register it
+/// as a looping music stream. Returns the music id, or 0 on failure.
+///
+/// On Android the file is read from the APK and decoded by the platform
+/// decoder, `labelle_android.video.decodeTrack` (AMediaExtractor +
+/// AMediaCodec, so MP3, OGG Vorbis, AAC and Opus), which also resamples to
+/// the mixer's 48 kHz stereo — the path the intro video's audio already
+/// takes (`src/video/backend.zig`). The asset must be stored uncompressed in
+/// the APK: `AAsset_openFileDescriptor64` refuses compressed entries.
+///
+/// The decode is synchronous and takes a noticeable time for a long track on
+/// a slow device, so load music while a loading screen is up, not mid-game.
+///
+/// Elsewhere it loads `assets/<name>` with `loadMusic`, so only a WAV at the
+/// device rate works there until desktop and web decode compressed audio.
+pub fn loadMusicAsset(name: []const u8) u32 {
+    if (comptime is_android) return loadMusicAssetAndroid(name);
+    var buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&buf, "assets/{s}", .{name}) catch return 0;
+    return loadMusic(path);
+}
+
+// APK asset access for `loadMusicAsset`: the same AAssetManager route the
+// video backend uses for bundled clips. The bgfx Android shell exports the
+// running NativeActivity. Only referenced on Android, so never linked
+// elsewhere.
+extern fn labelle_bgfx_get_native_activity() ?*anyopaque;
+const AAssetManager = opaque {};
+const AAsset = opaque {};
+extern fn AAssetManager_open(*AAssetManager, [*:0]const u8, c_int) ?*AAsset;
+extern fn AAsset_openFileDescriptor64(*AAsset, *i64, *i64) c_int;
+extern fn AAsset_close(*AAsset) void;
+extern fn close(c_int) c_int;
+const AASSET_MODE_STREAMING: c_int = 2;
+
+fn loadMusicAssetAndroid(name: []const u8) u32 {
+    const act = labelle_bgfx_get_native_activity() orelse return 0;
+    // ANativeActivity field 8 is `assetManager` (callbacks, vm, env, clazz,
+    // internalDataPath, externalDataPath, sdkVersion, instance, assetManager).
+    const fields: [*]const ?*anyopaque = @ptrCast(@alignCast(act));
+    const am: *AAssetManager = @ptrCast(fields[8] orelse return 0);
+    var name_buf: [256]u8 = undefined;
+    const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch return 0;
+    const asset = AAssetManager_open(am, name_z.ptr, AASSET_MODE_STREAMING) orelse return 0;
+    defer AAsset_close(asset);
+    var start: i64 = 0;
+    var len: i64 = 0;
+    // An independent (dup'd) fd, so closing the AAsset above is fine; we own
+    // it, and `decodeTrack` reads it synchronously.
+    const fd = AAsset_openFileDescriptor64(asset, &start, &len);
+    if (fd < 0) return 0;
+    defer _ = close(fd);
+    var pcm = @import("labelle_android").video.decodeTrack(heap.allocator, fd, start, len) catch return 0;
+    defer pcm.deinit(heap.allocator);
+    std.log.info("[audio] music asset {s}: {d} frames ({d:.2} s at 48 kHz)", .{ name, pcm.frames, @as(f64, @floatFromInt(pcm.frames)) / 48000.0 });
+    // The mixer copies the samples, so the decoded buffer is freed here.
+    return loadMusicFromPcm(pcm.samples, 2, 48000);
+}
+
 /// Register an already-decoded interleaved PCM_16 buffer as a looping music
 /// stream. Used by the Android audio-track decoder (`labelle_android.video.decodeTrack`)
 /// to feed decoded video audio into the mixer. `sample_rate` should be the
@@ -285,4 +344,13 @@ test "loadMusicFromPcm rejects an out-of-range channel count" {
     Audio.resetForTest();
     const pcm = [_]i16{ 1, 2, 3, 4 };
     try testing.expectEqual(@as(u32, 0), loadMusicFromPcm(&pcm, 3, 48000));
+}
+
+test "loadMusicAsset returns 0 for an asset that isn't there" {
+    try testing.expectEqual(@as(u32, 0), loadMusicAsset("music/does_not_exist.ogg"));
+}
+
+test "loadMusicAsset returns 0 for a name too long for its path buffer" {
+    const long = "m" ** 600;
+    try testing.expectEqual(@as(u32, 0), loadMusicAsset(long));
 }
