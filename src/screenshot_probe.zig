@@ -13,6 +13,7 @@
 //!   2 = HEADLESS_INIT_FAILED
 //!   5 = SCREENSHOT_FILE_MISSING   (requestScreenShot never wrote the file)
 //!   6 = SCREENSHOT_TGA_INVALID    (file written but header/dims/pixel wrong)
+//!   7 = SCREENSHOT_OVERLAY_MISSING (the imgui overlay view isn't in the file, #68)
 //!
 //! Run with:  zig build screenshot-probe
 
@@ -24,6 +25,8 @@ const W: u16 = 96;
 const H: u16 = 96;
 const BASE: [:0]const u8 = "headless_screenshot_probe"; // captureHeadless appends ".tga"
 const TGA_PATH: [:0]const u8 = "headless_screenshot_probe.tga";
+/// The labelle-imgui bridge's overlay view (`IMGUI_VIEW_ID`), unbound here.
+const OVERLAY_VIEW: u16 = 200;
 
 // libc file IO — Zig 0.16 dropped `std.fs.cwd()` (needs an `Io`), and the gfx/
 // window modules already link libc, so read the TGA back the same way
@@ -85,6 +88,13 @@ pub fn main() !void {
     window.beginFrame();
     window.endFrame();
     window.beginFrame();
+    // The Dear ImGui overlay's shape (labelle-bgfx#68): the labelle-imgui bridge
+    // draws on its own view, which this backend never binds. `--screenshot` must
+    // capture it too, so the LAST frame before the capture paints the left half
+    // GREEN on that view, and the check below reads it back out of the file.
+    bgfx.setViewRect(OVERLAY_VIEW, 0, 0, W / 2, H, 0.0, 1.0);
+    bgfx.setViewClear(OVERLAY_VIEW, bgfx.ClearFlags_Color, 0x00ff00ff, 1.0, 0);
+    bgfx.touch(OVERLAY_VIEW);
     window.endFrame();
 
     // Capture the offscreen framebuffer to disk (readback + TGA write; appends
@@ -147,6 +157,20 @@ pub fn main() !void {
     if (!content_ok) {
         std.debug.print("PROBE_RESULT: SCREENSHOT_TGA_INVALID (blank/garbage pixels)\n", .{});
         std.process.exit(6);
+    }
+
+    // The overlay view (#68): the left-half pixel must be the GREEN it painted.
+    // `captureHeadless` always writes uncompressed 32 bpp B,G,R,A, so no RLE
+    // escape hatch here.
+    const ov_off = 18 + (@as(usize, W) * @as(usize, H) / 2 + @as(usize, W) / 4) * 4;
+    const ov_ok = datatype == 2 and bpp == 32 and ov_off + 4 <= buf.len and
+        buf[ov_off] < 0x40 and buf[ov_off + 1] > 0x80 and buf[ov_off + 2] < 0x40;
+    if (ov_off + 4 <= buf.len) {
+        std.debug.print("PROBE: overlay pixel bytes = {x:0>2} {x:0>2} {x:0>2}\n", .{ buf[ov_off], buf[ov_off + 1], buf[ov_off + 2] });
+    }
+    if (!ov_ok) {
+        std.debug.print("PROBE_RESULT: SCREENSHOT_OVERLAY_MISSING (view {d} not in the capture)\n", .{OVERLAY_VIEW});
+        std.process.exit(7);
     }
 
     std.debug.print("PROBE_RESULT: SCREENSHOT_TGA_OK\n", .{});
