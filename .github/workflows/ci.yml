@@ -568,8 +568,13 @@ jobs:
           key: bgfx-wasm-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
             bgfx-wasm-${{ runner.os }}-
+      # EMSDK unset: this job pins the FALLBACK (the emsdk Zig package).
+      # `-Demsdk_expect=package` fails the configure if any other source was
+      # chosen (#159); the external-EMSDK path has its own job below.
       - name: Build the wasm/WebGL example
-        run: zig build -Dtarget=wasm32-emscripten wasm-example --summary all
+        env:
+          EMSDK: ''
+        run: zig build -Dtarget=wasm32-emscripten -Demsdk_expect=package wasm-example --summary all
       # A green emcc step that emitted nothing would be the same kind of empty
       # evidence this PR is about. Assert the three real artifacts exist and
       # that the .wasm is not a stub.
@@ -584,6 +589,114 @@ jobs:
           [ "$size" -gt 100000 ] || { echo "FAIL: wasm_demo.wasm is only $size bytes"; exit 1; }
           # `tr -s ' '` normalizes od's column padding, which differs between
           # GNU (single space) and BSD (double) od.
+          head -c 4 zig-out/web/wasm_demo.wasm | od -An -tx1 | tr -s ' ' | grep -q '00 61 73 6d' \
+            || { echo "FAIL: wasm_demo.wasm has no wasm magic"; exit 1; }
+
+  # A valid EMSDK is honoured and the emsdk Zig package is never activated
+  # (labelle-bgfx#159). labelle-web 0.3's provider installs its own emsdk and
+  # exports EMSDK, EM_CONFIG and PATH into the build; before #159 this build
+  # still ran `emsdk install/activate latest` on the package copy, a second
+  # ~1.5 GB download per cold runner. This job sets up the same env contract
+  # and asserts the MECHANISM, not only a green build:
+  #   1. `-Demsdk_expect=external` fails the configure unless build.zig chose
+  #      the external EMSDK, and `-Demsdk_expect=package` must FAIL here (so
+  #      the gate is not vacuous);
+  #   2. the build summary shows no `emsdk install/activate (zig-pkg emsdk)`
+  #      step;
+  #   3. no emsdk package under zig-pkg/ was installed or activated (no
+  #      `upstream/`, no `.emscripten`). zig-pkg is NOT cached in this job, so
+  #      a restored cache cannot fake or mask that.
+  wasm-example-external-emsdk:
+    name: wasm example with an external EMSDK (no zig-pkg emsdk install)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      EXT_EMSDK_VERSION: 4.0.9
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Cache the external emsdk
+        id: ext-emsdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/ext-emsdk
+          key: ext-emsdk-${{ runner.os }}-${{ env.EXT_EMSDK_VERSION }}
+      # A plain emsdk checkout, installed + activated: the layout labelle-web's
+      # provider hands the build (`upstream/emscripten` + `.emscripten`).
+      - name: Install the external emsdk
+        if: steps.ext-emsdk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$EXT_EMSDK_VERSION" https://github.com/emscripten-core/emsdk ~/ext-emsdk
+          cd ~/ext-emsdk
+          ./emsdk install "$EXT_EMSDK_VERSION"
+          ./emsdk activate "$EXT_EMSDK_VERSION"
+      # labelle-web 0.3's env contract: EMSDK, EM_CONFIG, PATH += upstream/emscripten.
+      - name: Export EMSDK, EM_CONFIG and PATH
+        run: |
+          set -euo pipefail
+          root="$HOME/ext-emsdk"
+          test -d "$root/upstream/emscripten"
+          test -f "$root/.emscripten"
+          echo "EMSDK=$root" >> "$GITHUB_ENV"
+          echo "EM_CONFIG=$root/.emscripten" >> "$GITHUB_ENV"
+          echo "$root/upstream/emscripten" >> "$GITHUB_PATH"
+      - name: Cache Zig artifacts (not zig-pkg)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: bgfx-wasm-ext-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            bgfx-wasm-ext-${{ runner.os }}-
+      - name: The source gate is not vacuous (expect=package must fail)
+        run: |
+          set -uo pipefail
+          if zig build -Dtarget=wasm32-emscripten -Demsdk_expect=package --help > gate.log 2>&1; then
+            cat gate.log
+            echo "FAIL: -Demsdk_expect=package passed with a valid EMSDK set"
+            exit 1
+          fi
+          grep -F "a valid EMSDK was found and used" gate.log \
+            || { cat gate.log; echo "FAIL: expect=package failed for another reason"; exit 1; }
+      - name: Build the wasm/WebGL example from the external EMSDK
+        run: |
+          set -uo pipefail
+          zig build -Dtarget=wasm32-emscripten -Demsdk_expect=external wasm-example --summary all > build.log 2>&1
+          status=$?
+          cat build.log
+          [ "$status" -eq 0 ] || { echo "FAIL: build exited $status"; exit 1; }
+      - name: Assert no zig-pkg emsdk install/activate ran
+        run: |
+          set -euo pipefail
+          if grep -F "(zig-pkg emsdk)" build.log; then
+            echo "FAIL: the build ran emsdk install/activate on the zig-pkg emsdk"
+            exit 1
+          fi
+          fail=0
+          for dir in zig-pkg/*/; do
+            [ -f "$dir/emsdk.py" ] || continue
+            echo "emsdk package present (fetched, not necessarily used): $dir"
+            for marker in upstream .emscripten; do
+              if [ -e "$dir/$marker" ]; then
+                echo "FAIL: $dir$marker exists: the package emsdk was installed/activated"
+                fail=1
+              fi
+            done
+          done
+          exit $fail
+      - name: Verify the emitted wasm artifacts
+        run: |
+          set -euo pipefail
+          for f in zig-out/web/wasm_demo.html zig-out/web/wasm_demo.js zig-out/web/wasm_demo.wasm; do
+            [ -s "$f" ] || { echo "FAIL: missing or empty $f"; exit 1; }
+            ls -l "$f"
+          done
           head -c 4 zig-out/web/wasm_demo.wasm | od -An -tx1 | tr -s ' ' | grep -q '00 61 73 6d' \
             || { echo "FAIL: wasm_demo.wasm has no wasm magic"; exit 1; }
 
