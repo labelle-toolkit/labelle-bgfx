@@ -4,9 +4,10 @@
 /// `audio.zig` so the pure-Zig mixer/decoder can compile for Android
 /// without dragging in miniaudio's C TU or a real output device (#306).
 ///
-/// `audio.zig` selects this module on desktop and a `NoopDevice` stub on
-/// Android (`const device_backend = if (is_android) NoopDevice else
-/// @import("audio_device.zig");`). Both expose the same control surface:
+/// `audio.zig` selects this module on desktop and labelle-android's AAudio
+/// device on Android (`const device_backend = if (is_android)
+/// @import("labelle_android").aaudio else @import("audio_device.zig");`,
+/// #306 → #149 phase 1c). Both expose the same control surface:
 ///
 ///   * `ensureStarted(mix: MixFn) void` — lazily open + start the playback
 ///     device, wiring `mix` as the audio-thread fill callback. Idempotent.

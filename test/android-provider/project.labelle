@@ -1,0 +1,45 @@
+// labelle-cli#405 D11 fixture: this bgfx checkout next to the `android`
+// provider plugin (labelle-android v0.2.0, the release bgfx pins).
+//
+// The assembler wires a plugin as a `.path` dependency and bgfx pins
+// labelle-android by url+hash, so the Android build graph holds two
+// `labelle_android` modules even at the same release. bgfx's build hook
+// (`backend.hook.zig` `unifyLabelleAndroid`) points them at one, so the JNI C
+// links once. CI's android-example job generates this project, builds
+// `libgame.so`, and asserts each `labelle_android_*` JNI helper is defined
+// exactly once.
+//
+// CI generates it with a released `labelle-assembler` binary (the first
+// release that reads manifest-v2 plugins and `.provider_config`), not with
+// `labelle generate`: CLIs before v2.0.0 reserve the `android` namespace and
+// reject the provider.
+.{
+    .name = "android_provider_d11",
+    .title = "bgfx + android provider (D11)",
+    .width = 800,
+    .height = 600,
+    .target_fps = 60,
+    .backend = .bgfx,
+    .backend_package = .{
+        .name = "bgfx",
+        .repo = "local:../..",
+        .version = "0.30.0",
+    },
+    .gamepad = .none,
+    .y_axis = .up,
+    .ecs = .mock,
+    .initial_prefab = "main",
+    .states = .{"playing"},
+    .layers = .{
+        .{ .name = "hud", .order = 0, .space = .screen },
+    },
+    .plugins = .{
+        .{ .name = "android", .repo = "github.com/labelle-toolkit/labelle-android", .version = "0.2.0" },
+    },
+    .provider_config = .{
+        .{ .package = "android", .file = "providers/android.json" },
+    },
+    .core_version = "2.1.0",
+    .engine_version = "3.4.1",
+    .gfx_version = "2.2.0",
+}

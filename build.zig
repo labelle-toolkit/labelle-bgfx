@@ -1,5 +1,21 @@
 const std = @import("std");
 const builtin = @import("builtin");
+// Build-time helpers from the labelle-android package (labelle-bgfx#149
+// phase 1e): NDK sysroot detection (`resolveNdk` / `addAndroidSysroot`) and
+// the native_app_glue locator (`nativeAppGlueDir`). This is the reason the
+// `labelle_android` dependency is EAGER (`b.dependency`, never
+// `lazyDependency`): a `build.zig`-level `@import` of a dependency's build
+// script resolves on every build, desktop and wasm included — the same
+// mechanism `labelle-sokol/build.zig` uses for sokol's `emLinkStep`.
+const labelle_android = @import("labelle_android");
+// Which emsdk a wasm build uses (external EMSDK vs the emsdk package, #159).
+const emsdk_source = @import("emsdk_source.zig");
+// The manifest-v2 build hook (std-only). build.zig uses its `emLinkStep` for the
+// `wasm-example-hook` step, so CI links through the SAME code a generated game
+// does (#161 EM_CONFIG pin, #163 dependency activation).
+const build_hook = @import("backend.hook.zig");
+// SDL2 link + the one-line "SDL2 not found" failure (labelle-cli#471 S2).
+const sdl2_link = @import("sdl2_link.zig");
 
 /// True when `t` is a native desktop OS (matches the shared sdl_gamepad source's
 /// comptime `is_desktop`): only there are the SDL `extern`s referenced and SDL
@@ -80,8 +96,8 @@ pub fn build(b: *std.Build) void {
 
     // Shared audio engine (pluggable-backends RFC, Phase 2). `src/audio.zig`
     // now forwards to `labelle_audio.Mixer(device_backend)`; the device modules
-    // (`audio_device.zig` / `audio_device_android.zig`) satisfy its `DeviceSink`
-    // contract. Wired into the `audio` module (and the host audio test module)
+    // (`audio_device.zig` on desktop, `labelle_android.aaudio` on Android)
+    // satisfy its `DeviceSink` contract. Wired into the `audio` module (and the host audio test module)
     // under the `labelle-audio` import key. Resolved on every target — the
     // mixer/decoder are pure Zig and compile for Android unchanged.
     const labelle_audio_dep = b.dependency("labelle_audio", .{ .target = target, .optimize = optimize });
@@ -110,10 +126,18 @@ pub fn build(b: *std.Build) void {
     // they hand the surface across as an opaque `*anyopaque` (see
     // src/window.zig), so no C header is pulled in yet.
     //
-    // `ndk` is non-null only for Android; the resolved sysroot include
-    // paths are reused below to wire the Android gfx/window/input modules.
-    const ndk: ?NdkPaths = if (is_android) resolveNdkPaths(b, target) else null;
-    if (ndk) |n| {
+    // `ndk` is non-null only for Android. It is resolved ONCE, up front, so a
+    // missing NDK fails the build here with the package's actionable message
+    // before any module is wired; the per-module sysroot wiring below goes
+    // through `labelle_android.addAndroidSysroot` (labelle-bgfx#149 phase
+    // 1e — the helper bodies that used to live at the bottom of this file
+    // are the package's now). NDK selection rule: `ANDROID_NDK_HOME`, else
+    // the greatest `ANDROID_HOME/ndk/<version>` that HAS a sysroot (the
+    // `backend.hook.zig` rule; this file used to take the greatest dir and
+    // only then check it, so a stray/partial install could shadow a valid
+    // older NDK).
+    const ndk: ?labelle_android.NdkPaths = if (is_android) labelle_android.resolveNdk(b, target, .{}) else null;
+    if (ndk != null) {
         // zbgfx builds three separate static libs — `bx`, `bimg`, and
         // `bgfx` — each its own `*Compile` with its own `root_module`.
         // The consumer can only fetch the top-level `bgfx` artifact, but
@@ -121,10 +145,10 @@ pub fn build(b: *std.Build) void {
         // bgfx's link_objects to reach them, then apply the NDK sysroot
         // paths to every C/C++ module so all three find the Bionic
         // headers. (Include paths don't propagate across linkLibrary.)
-        applyNdkSysroot(bgfx_artifact.root_module, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+        _ = labelle_android.addAndroidSysroot(b, bgfx_artifact.root_module, target);
         for (bgfx_artifact.root_module.link_objects.items) |lo| {
             if (lo == .other_step) {
-                applyNdkSysroot(lo.other_step.root_module, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+                _ = labelle_android.addAndroidSysroot(b, lo.other_step.root_module, target);
             }
         }
     }
@@ -148,13 +172,13 @@ pub fn build(b: *std.Build) void {
     // Android: stb_image_impl.c (and the translate-c `@cImport` of
     // stb_shim.h in gfx/texture.zig) need the NDK sysroot system-includes
     // to find Bionic's <stdlib.h>/<string.h> etc., exactly like the
-    // bgfx/bx/bimg C++ compile above. Apply the SAME `applyNdkSysroot`
+    // bgfx/bx/bimg C++ compile above. Apply the SAME `addAndroidSysroot`
     // helper. This MUST run BEFORE `addCSourceFile` so the include paths
     // are attached when the consuming Compile step collects translation
     // units (mirrors the ordering in the sokol backend's build.zig). On
     // desktop the system libc headers resolve without extra wiring.
     // (bgfx is desktop + Android only — no wasm/emsdk path, unlike sokol.)
-    if (ndk) |n| applyNdkSysroot(gfx_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+    if (ndk != null) _ = labelle_android.addAndroidSysroot(b, gfx_mod, target);
 
     // stb_image implementation TU — defines STB_IMAGE_IMPLEMENTATION +
     // STBI_NO_STDIO and includes stb_image.h. This is what gives the bgfx
@@ -236,12 +260,9 @@ pub fn build(b: *std.Build) void {
         // holding the import lib (`libSDL2.dll.a`). `SDL2.dll` must be on PATH
         // (or beside the exe) at runtime. Gated on the TARGET os only, so it
         // also applies when cross-compiling to Windows from a non-Windows host.
-        if (target.result.os.tag == .windows) {
-            if (b.graph.environ_map.get("LABELLE_SDL2_LIB")) |p| {
-                input_mod.addLibraryPath(.{ .cwd_relative = p });
-            }
-        }
-        input_mod.linkSystemLibrary("SDL2", .{});
+        // When SDL2 is missing there, the build fails with one line
+        // (`sdl2_link.missing_message`) instead of a linker error.
+        sdl2_link.link(b, input_mod, .{ .honor_env = target.result.os.tag == .windows });
     }
 
     // Shared Android gamepad source (#310 Stage 4): the per-device STATE
@@ -252,12 +273,28 @@ pub fn build(b: *std.Build) void {
     // axis state) on every target — its Android-only `extern`/`@export` symbols
     // are gated internally, so off Android nothing is referenced. On Android we
     // also compile the JNI glue into THIS module (where the NDK sysroot/libc is
-    // wired by `applyNdkSysroot` below). The .c is `#ifdef __ANDROID__`-gated,
+    // wired by `addAndroidSysroot` below). The .c is `#ifdef __ANDROID__`-gated,
     // so it emits an empty object off Android. We pull its source via
     // `dep.path(...)` because cross-package `b.path("..")` is rejected by Zig
     // 0.16.
     const android_gp_dep = b.dependency("labelle_android_gamepad", .{ .target = target, .optimize = optimize });
     input_mod.addImport("android_gamepad", android_gp_dep.module("android_gamepad"));
+
+    // Shared Android platform services (labelle-bgfx#149 phase 1): launch
+    // intent extras → env, the `android:debuggable` query, the #127 window
+    // relayout, the AAudio output device (#306) and the MediaCodec video +
+    // audio-track decoders (FP#549) with the pure `yuv`/`planes` helpers the
+    // desktop decoder shares, as the ONE named module `labelle_android`. The
+    // package compiles its own JNI C against the NDK sysroot it resolves
+    // itself and links `libaaudio` + `libmediandk`, so nothing here
+    // `addCSourceFile`s or links for it. Eager dependency: fetched on every
+    // target (tiny), imported by `gfx` (video), `audio` and `android_app`.
+    const android_dep = b.dependency("labelle_android", .{ .target = target, .optimize = optimize });
+    const labelle_android_mod = android_dep.module("labelle_android");
+    // `gfx.zig`'s `AndroidVideoDecoder` + `video/{backend,desktop,player}.zig`
+    // reach `labelle_android.video` on every non-wasm target (the desktop
+    // decoder uses its `yuv`/`planes`; the Android one is comptime-gated).
+    gfx_mod.addImport("labelle_android", labelle_android_mod);
 
     // labelle-core, imported on EVERY target so `src/input.zig` can prove it
     // satisfies the engine input contract at comptime (`core.assertInput`) and
@@ -307,8 +344,8 @@ pub fn build(b: *std.Build) void {
         input_mod.link_libc = true;
         // NDK sysroot for the JNI glue's jni.h / android/*.h. Reuse the same
         // sysroot wiring bgfx/bx/bimg use; safe because `ndk` is non-null on
-        // Android. Must precede the C source add (see applyNdkSysroot).
-        if (ndk) |n| applyNdkSysroot(input_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
+        // Android. Must precede the C source add (see addAndroidSysroot).
+        if (ndk != null) _ = labelle_android.addAndroidSysroot(b, input_mod, target);
         input_mod.addCSourceFile(.{
             .file = android_gp_dep.path("src/android_gamepad_jni.c"),
             .flags = &.{},
@@ -341,19 +378,23 @@ pub fn build(b: *std.Build) void {
     // Shared WAV decode + PCM mixer (Phase 2). `audio.zig` instantiates
     // `labelle_audio.Mixer(device_backend)` and forwards every public fn to it.
     audio_mod.addImport("labelle-audio", labelle_audio_mod);
+    // The Android output device (`labelle_android.aaudio`, #306 → #149 phase
+    // 1c). Wired on EVERY target: `audio.zig` reaches it only inside a dead
+    // comptime branch off Android (the `zglfw` pattern), and the package
+    // module itself links `libaaudio` on Android, so nothing here does.
+    audio_mod.addImport("labelle_android", labelle_android_mod);
     if (!is_android) {
         // ── miniaudio playback device (#297) — desktop only ─────────
         wireMiniaudio(b, audio_mod, target.result.os.tag);
-    } else if (ndk) |n| {
-        // On Android the mixer is AAudio-backed (`audio_device_android.zig`,
-        // #306), which links `libaaudio`. The module's Zig source is pure
-        // `extern fn` (no `@cInclude`), so the device-less compile-check below
-        // emits its object without sysroot headers — but apply the SAME NDK
-        // sysroot the other Android modules use so the lib path / API level /
-        // PIC are wired for any consumer that actually *links* it (e.g. the
-        // libgame.so app link). Desktop never reaches this branch.
-        applyNdkSysroot(audio_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
-        audio_mod.linkSystemLibrary("aaudio", .{});
+    } else if (ndk != null) {
+        // On Android the mixer is AAudio-backed via `labelle_android.aaudio`.
+        // This module's own Zig source has no `@cInclude`, so the device-less
+        // compile-check below emits its object without sysroot headers — but
+        // apply the SAME NDK sysroot the other Android modules use so the lib
+        // path / API level / PIC are wired for any consumer that actually
+        // *links* it (e.g. the libgame.so app link). Desktop never reaches
+        // this branch.
+        _ = labelle_android.addAndroidSysroot(b, audio_mod, target);
     }
 
     // ── Window backend module ───────────────────────────────────────
@@ -572,6 +613,76 @@ pub fn build(b: *std.Build) void {
     const sfprobe_step = b.step("screen-fill-cover-probe", "Run the screen_fill coverage probe (#42)");
     sfprobe_step.dependOn(&b.addRunArtifact(sfprobe).step);
 
+    // `zig build rotated-rect-probe` — rotated filled rectangles really fill
+    // (#98): readback proves fill vs outline, rotation direction vs
+    // labelle-core's shim, and rotation 0 == drawRectangleRec. Surfaceless.
+    const rrprobe = b.addExecutable(.{
+        .name = "rotated_rect_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/rotated_rect_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    rrprobe.root_module.addImport("zbgfx", zbgfx_mod);
+    rrprobe.root_module.addImport("gfx", gfx_mod);
+    rrprobe.root_module.addImport("window", window_mod);
+    rrprobe.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| rrprobe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        rrprobe.root_module.linkSystemLibrary("gdi32", .{});
+        rrprobe.root_module.linkSystemLibrary("user32", .{});
+    }
+    const rrprobe_step = b.step("rotated-rect-probe", "Run the rotated filled-rectangle probe (#98)");
+    rrprobe_step.dependOn(&b.addRunArtifact(rrprobe).step);
+
+    // `zig build postfx-fit-probe` — a render-target (post-fx) pass keeps the
+    // scene's shape on a framebuffer that isn't the design size (#120).
+    const pfprobe = b.addExecutable(.{
+        .name = "postfx_fit_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/postfx_fit_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    pfprobe.root_module.addImport("zbgfx", zbgfx_mod);
+    pfprobe.root_module.addImport("gfx", gfx_mod);
+    pfprobe.root_module.addImport("window", window_mod);
+    pfprobe.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| pfprobe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        pfprobe.root_module.linkSystemLibrary("gdi32", .{});
+        pfprobe.root_module.linkSystemLibrary("user32", .{});
+    }
+    const pfprobe_step = b.step("postfx-fit-probe", "Run the post-fx letterbox probe (#120)");
+    pfprobe_step.dependOn(&b.addRunArtifact(pfprobe).step);
+
+    // `zig build compressed-support-probe` — compressedSupported agrees with
+    // uploadCompressed on the running GPU (#134: the web ASTC/PNG pick).
+    const csprobe = b.addExecutable(.{
+        .name = "compressed_support_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/compressed_support_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    csprobe.root_module.addImport("zbgfx", zbgfx_mod);
+    csprobe.root_module.addImport("gfx", gfx_mod);
+    csprobe.root_module.addImport("window", window_mod);
+    csprobe.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| csprobe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        csprobe.root_module.linkSystemLibrary("gdi32", .{});
+        csprobe.root_module.linkSystemLibrary("user32", .{});
+    }
+    const csprobe_step = b.step("compressed-support-probe", "Run the compressedSupported/uploadCompressed agreement probe (#134)");
+    csprobe_step.dependOn(&b.addRunArtifact(csprobe).step);
+
     // ── Material golden harness (labelle-gfx#305 Slice B, RFC §6) ────────────
     // `zig build material-golden`       — render the fixed flash + palette_swap
     //     scene headless and DIFF it against the committed golden TGA (CI gate).
@@ -723,6 +834,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const test_step = b.step("test", "Run bgfx backend unit tests");
+    const web_command_keys = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/web_command_keys.zig"),
+        .target = host_target,
+        .optimize = optimize,
+    }) });
+    const web_command_keys_run = b.addRunArtifact(web_command_keys);
+    test_step.dependOn(&web_command_keys_run.step);
+    b.step("test-web-command-keys", "Test browser save/load shortcut routing").dependOn(&web_command_keys_run.step);
+
     const shader_material_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/shader_material_tests.zig"),
         .target = b.graph.host,
@@ -776,6 +896,23 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(screenshot_path_tests).step);
 
+    // Android activity-instance bgfx ownership (labelle-bgfx#143). Pure
+    // bookkeeping the NativeActivity shell drives, so it EXECUTES on the host;
+    // the shell itself only gets the Android compile-check below.
+    const android_owner_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/android_bgfx_owner.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(android_owner_tests).step);
+
+    // The Android launch-intent → env mapping (#139) moved to labelle-android
+    // (#149); its allow-list / decision tests run in THAT package's suite.
+
+    addHeapGuard(b, test_step, optimize);
+
     // ── Unit tests for the shipped build hook ───────────────────────
     // `backend.hook.zig` is std-only (it's the file the assembler stages
     // and `@import`s into a generated build.zig — see build.zig.zon's
@@ -792,6 +929,26 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(hook_tests).step);
 
+    // The wasm emsdk-source decision (#159): external EMSDK vs the package.
+    const emsdk_source_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("emsdk_source.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(emsdk_source_tests).step);
+
+    // SDL2 resolution + the one-line missing-SDL2 message (cli#471 S2);
+    // `sdl2-link-check` drives the real wiring (CI forces the missing case).
+    const sdl2_link_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("sdl2_link.zig"),
+        .target = host_target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(sdl2_link_tests).step);
+    sdl2_link.addCheckStep(b, target, sdl_gp_mod != null, .{ .honor_env = target.result.os.tag == .windows });
+
     // Run the gfx coordinate-math tests (#331). `gfx/state.zig` imports only
     // `types.zig` (pure), so it runs on the host independent of zbgfx — and
     // unlike the compile-only `gfx_tests` below, this EXECUTES the
@@ -804,6 +961,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(state_run).step);
+
+    // Rotated-rectangle corner math (#98): pure, so it EXECUTES on the host
+    // and pins the convention shared with labelle-core's outline fallback.
+    const rotated_rect_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gfx/rotated_rect.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(rotated_rect_run).step);
 
     // Run the transient-buffer budgeting tests (labelle-assembler#648).
     // `gfx/transient_budget.zig` is std-only arithmetic (no zbgfx), so the
@@ -861,6 +1029,9 @@ pub fn build(b: *std.Build) void {
         });
         font_test_mod.addImport("zbgfx", zbgfx_mod);
         font_test_mod.addImport("labelle-core", core_mod);
+        // gfx.zig's test probes analyse `video/player.zig`, whose GPU state
+        // now carries the `labelle_android` colour matrix (#155).
+        font_test_mod.addImport("labelle_android", labelle_android_mod);
         font_test_mod.addIncludePath(b.path("src"));
         font_test_mod.addCSourceFile(.{ .file = b.path("src/stb_image_impl.c"), .flags = &.{} });
         font_test_mod.addCSourceFile(.{ .file = b.path("src/stb_truetype_impl.c"), .flags = &.{} });
@@ -874,28 +1045,9 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(font_run).step);
     }
 
-    // Run the video colour-conversion + plane-prep tests on the host. Both
-    // `video/yuv.zig` (CPU YUV→RGBA, BT.601) and `video/planes.zig` (row-tighten
-    // + NV12 de-interleave for the GPU plane-upload path, perf/gpu-yuv-video) are
-    // pure Zig with no zbgfx/NDK dependency, so they EXECUTE on the host — the
-    // verifiable core of the otherwise device-only video decode path.
-    const yuv_run = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/video/yuv.zig"),
-            .target = host_target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(yuv_run).step);
-
-    const planes_run = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/video/planes.zig"),
-            .target = host_target,
-            .optimize = optimize,
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(planes_run).step);
+    // The video colour-conversion (`yuv`) + plane-prep (`planes`) host tests
+    // moved to the labelle-android package with the files (#149 phase 1d);
+    // they run in that package's `zig build test`.
 
     // Browser video geometry (`video/web.zig`) plus the fit-rect math it shares
     // (`video/fit.zig`): pure Zig, host-run. The EM_JS externs are never
@@ -926,6 +1078,12 @@ pub fn build(b: *std.Build) void {
     // test itself SKIPS (`error.SkipZigTest`) when no `ffmpeg` is on PATH — CI
     // installs one and asserts the run does not skip, so "green" cannot mean
     // "skipped everywhere".
+    //
+    // `desktop.zig` imports `labelle_android.video.{yuv,planes}` (#149 phase
+    // 1d), so this host-pinned root needs a HOST-resolved instance of the
+    // package (the main `labelle_android_mod` is resolved for the build
+    // target; mixing them into one root would be two module instances).
+    const labelle_android_host_dep = b.dependency("labelle_android", .{ .target = host_target, .optimize = optimize });
     const desktop_video_run = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/video/desktop.zig"),
@@ -934,8 +1092,23 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    desktop_video_run.root_module.addImport("labelle_android", labelle_android_host_dep.module("labelle_android"));
     const desktop_video_run_step = b.addRunArtifact(desktop_video_run);
     test_step.dependOn(&desktop_video_run_step.step);
+
+    // GPU-YUV matrix selection (`video/yuv_uniform.zig`, labelle-bgfx#155):
+    // pure ColorSpace → `fs_yuv` uniform math, host-run against the same
+    // host-resolved `labelle_android` instance. Its own root because the
+    // player/gfx re-exports never collect this file's tests.
+    const yuv_uniform_run = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/video/yuv_uniform.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    yuv_uniform_run.root_module.addImport("labelle_android", labelle_android_host_dep.module("labelle_android"));
+    test_step.dependOn(&b.addRunArtifact(yuv_uniform_run).step);
     // Standalone step so CI can run JUST this and assert on its summary
     // (passed, not skipped) without reading the whole suite's totals.
     b.step(
@@ -1044,7 +1217,7 @@ pub fn build(b: *std.Build) void {
     // for the eventual link, but we depend on the *compile* step (object
     // emission), never a run/link step that would demand those libs be
     // present on the host.
-    if (ndk) |n| {
+    if (ndk != null) {
         const android_app_mod = b.addModule("android_app", .{
             .root_source_file = b.path("src/android_app.zig"),
             .target = target,
@@ -1055,14 +1228,17 @@ pub fn build(b: *std.Build) void {
         android_app_mod.addImport("window", window_mod);
         android_app_mod.addImport("input", input_mod);
         android_app_mod.addImport("zbgfx", zbgfx_mod);
+        // Intent extras → env, `isDebuggable`, window relayout (#149).
+        android_app_mod.addImport("labelle_android", labelle_android_mod);
 
         // Vendor the NDK's native_app_glue: its include dir (for
         // <android_native_app_glue.h>) and its single C TU. The glue needs
         // the Bionic headers (android/native_window.h, looper.h, input.h),
         // which the NDK sysroot supplies — apply the same sysroot wiring
-        // bgfx/bx/bimg use.
-        applyNdkSysroot(android_app_mod, n.inc_common, n.inc_arch, n.lib_path, n.android_api);
-        const glue_dir = androidNativeAppGlueDir(b) orelse
+        // bgfx/bx/bimg use. The glue dir is resolved from the SAME NDK the
+        // sysroot came from (both go through the package's NDK root).
+        _ = labelle_android.addAndroidSysroot(b, android_app_mod, target);
+        const glue_dir = labelle_android.nativeAppGlueDir(b) orelse
             @panic("Could not find native_app_glue in the NDK (sources/android/native_app_glue).");
         android_app_mod.addIncludePath(.{ .cwd_relative = glue_dir });
         android_app_mod.addCSourceFile(.{
@@ -1070,25 +1246,10 @@ pub fn build(b: *std.Build) void {
             .flags = &.{ "-std=c11", "-Wall" },
         });
 
-        // JNI helper for `android_app.isDebuggable()` (labelle-assembler#737):
-        // `activity.getApplicationInfo().flags & FLAG_DEBUGGABLE`, which gates
-        // the device knob-file channel on the RUNNING apk rather than on
-        // whatever `run-as` allowed at the time the file was written. In C
-        // because <jni.h> already declares the JNI vtables; the NDK sysroot is
-        // wired onto this module just above. `#ifdef __ANDROID__`-gated, so it
-        // emits an empty object off Android (same convention as
-        // `android_gamepad_jni.c`).
-        android_app_mod.addCSourceFile(.{
-            .file = b.path("src/android_debuggable.c"),
-            .flags = &.{ "-std=c11", "-Wall" },
-        });
-        // Forces a relayout when a restored window comes back 1x1 and
-        // never receives its resize (labelle-bgfx#127). Same JNI-in-C
-        // rationale and `__ANDROID__` gate as android_debuggable.c.
-        android_app_mod.addCSourceFile(.{
-            .file = b.path("src/android_window_relayout.c"),
-            .flags = &.{ "-std=c11", "-Wall" },
-        });
+        // The JNI helpers this shell used to compile here — the debuggable
+        // query (labelle-assembler#737), the #127 window relayout and the
+        // #139 intent-extras read — live in labelle-android now (#149), which
+        // compiles them into `labelle_android_mod` against its own sysroot.
 
         // Declare the android libs the shell references for the eventual
         // (phase-4) link. These are recorded on the module's link inputs;
@@ -1147,6 +1308,8 @@ pub fn build(b: *std.Build) void {
     // host target so the run-test executes natively).
     const labelle_audio_host_dep = b.dependency("labelle_audio", .{ .target = host_target, .optimize = optimize });
     audio_test_mod.addImport("labelle-audio", labelle_audio_host_dep.module("labelle-audio"));
+    // No `labelle_android` import here: `audio.zig` names it only inside its
+    // dead `is_android` comptime branch, which Sema never reaches on the host.
     wireMiniaudio(b, audio_test_mod, host_target.result.os.tag);
     const audio_tests = b.addTest(.{ .root_module = audio_test_mod });
     test_step.dependOn(&b.addRunArtifact(audio_tests).step);
@@ -1159,7 +1322,8 @@ pub fn build(b: *std.Build) void {
 ///   * emsdk sysroot plumbed into the C compile so `stb_image_impl.c` finds
 ///     `<stdlib.h>`/`<stdio.h>` — Zig ships no libc headers for
 ///     wasm32-emscripten; they live in emsdk's sysroot (mirrors labelle-sokol's
-///     build.zig). Defaults to the Homebrew emscripten sysroot; override with
+///     build.zig). Taken from a valid `EMSDK` when one is set, else from the
+///     `emsdk` Zig package (#159, emsdk_source.zig); override with
 ///     `-Demsdk_sysroot`.
 ///   * no zglfw and no sdl_gamepad (both desktop-only), matching the is_android
 ///     carve-outs in `build()`.
@@ -1168,8 +1332,8 @@ pub fn build(b: *std.Build) void {
 /// bgfx WebGL2 context init — is handled by the apotema/zbgfx fork: bgfx creates
 /// its own WebGL2 context on `#canvas`, runs single-threaded, and drives the
 /// frame from `emscripten_set_main_loop`. This branch builds the wasm/WebGL
-/// zbgfx, compiles the Zig side to a static lib, and links it with `emcc` (the
-/// system `emcc` on PATH — matching the sysroot above — or an activated emsdk)
+/// zbgfx, compiles the Zig side to a static lib, and links it with the `emcc`
+/// of the same emsdk the sysroot came from
 /// into `zig-out/web/wasm_demo.{html,js,wasm}` (`zig build wasm-example`). The
 /// assembler-generated app takes the same shape via templates/wasm.txt +
 /// backend.hook.zig's emcc arm.
@@ -1177,50 +1341,95 @@ pub fn build(b: *std.Build) void {
 /// Known caveats (not build blockers): video traps on wasm (labelle-bgfx#13)
 /// and the main-loop rAF integration (labelle-bgfx#14).
 fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    // ── emscripten sysroot (sourced from the emsdk PACKAGE) ──────────
+    // ── emscripten sysroot + tools: external EMSDK, else the emsdk PACKAGE ──
     // bgfx/bx/bimg (C++) and stb_image (C) need emscripten's libc/libc++/EGL/GLES
     // headers, which the Zig toolchain does NOT ship for wasm32-emscripten. The
     // proven spike recipe threads a `-Demsdk_sysroot` path into zbgfx (which
     // `addSystemIncludePath`s it onto bx/bimg/bgfx) and reuses it for our own
     // stb C compile.
     //
-    // Portability (labelle-bgfx#... ubuntu deploy fix): the sysroot MUST come
-    // from the `emsdk` package — NOT a hardcoded Homebrew path — so the wasm
-    // build works on any host (macOS / Linux CI / Windows) without a
-    // pre-installed local emscripten. Mirror the labelle-imgui bgfx bridge:
-    //   1. resolve the `emsdk` dependency,
-    //   2. default the sysroot to its packaged
-    //      `upstream/emscripten/cache/sysroot/include` (LazyPath),
-    //   3. run a one-time `emSdkSetupStep` (`emsdk install/activate latest`)
-    //      and make every C/C++ compile DEPEND on it, so the package sysroot is
-    //      populated before bx/bimg/bgfx + stb_image compile.
-    // `-Demsdk_sysroot` remains an explicit override for unusual setups.
-    const emsdk_dep = b.lazyDependency("emsdk", .{}) orelse
-        @panic("emsdk dependency unavailable for wasm build");
-
-    // One-time emsdk setup (install + activate). Populates/activates the
-    // package sysroot; a no-op (returns null) when the `.emscripten` marker is
-    // already present (shared package cache already activated). C/C++ compiles
-    // below depend on it so `-isystem .../sysroot/include` resolves to a
-    // populated path by the time bx/stb_image compile.
-    const emsdk_setup = emSdkSetupStep(b, emsdk_dep) catch @panic("emsdk setup failed");
-
+    // Source (labelle-bgfx#159, see emsdk_source.zig):
+    //   * `EMSDK` set and valid (has `upstream/emscripten` + `.emscripten`, as
+    //     labelle-web 0.3's provider exports it): sysroot + emcc come from it,
+    //     and the `emsdk` package is never fetched or run. Before #159 the
+    //     package was activated anyway, a second ~1.5 GB download per runner.
+    //   * otherwise: the `emsdk` Zig package, activated on first use by
+    //     `emSdkSetupStep` (`emsdk install/activate latest`), with every C/C++
+    //     compile depending on it so the sysroot is populated first.
+    // `-Demsdk_sysroot` remains an explicit sysroot override for unusual setups.
+    // `-Demsdk_expect=external|package` fails the build unless that source was
+    // chosen, so CI can assert the mechanism, not just a green build.
+    const emsdk_expect = b.option(
+        emsdk_source.Expect,
+        "emsdk_expect",
+        "Fail unless the wasm build takes emscripten from this source (external = a valid EMSDK, package = the emsdk Zig package)",
+    );
     const emsdk_sysroot_override = b.option(
         []const u8,
         "emsdk_sysroot",
-        "Path to the emscripten sysroot 'include' dir for the wasm C/C++ compiles (defaults to the emsdk package)",
+        "Path to the emscripten sysroot 'include' dir for the wasm C/C++ compiles (defaults to EMSDK's, else the emsdk package's)",
     );
+    const emcc_name = if (builtin.os.tag == .windows) "emcc.bat" else "emcc";
+
+    const BuildFs = struct {
+        b: *std.Build,
+        pub fn exists(self: @This(), path: []const u8) bool {
+            std.Io.Dir.cwd().access(self.b.graph.io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return false,
+                // Anything else (permissions, I/O) is not "missing": report it
+                // rather than silently falling back to installing the package.
+                else => std.debug.panic("emsdk: cannot check EMSDK path '{s}': {s}", .{ path, @errorName(err) }),
+            };
+            return true;
+        }
+    };
+    const source = emsdk_source.resolve(b.allocator, b.graph.environ_map.get("EMSDK"), .{
+        .emcc_name = emcc_name,
+        // With `-Demsdk_sysroot` the default sysroot dir is not needed.
+        .need_sysroot = emsdk_sysroot_override == null,
+    }, BuildFs{ .b = b });
+    if (emsdk_source.mismatch(source, emsdk_expect)) |msg| std.debug.panic("emsdk: {s}", .{msg});
+
+    // The default sysroot (LazyPath), the emcc to link with plus the EM_CONFIG
+    // it must run under (the SAME emsdk's `.emscripten`, so an inherited
+    // EM_CONFIG naming another SDK can't redirect its tool paths), and the
+    // one-time setup step every C/C++ compile + the link wait on (null =
+    // nothing to run).
+    var default_sysroot: std.Build.LazyPath = undefined;
+    var emcc_exe: []const u8 = undefined;
+    var em_config: []const u8 = undefined;
+    var emsdk_setup: ?*std.Build.Step.Run = null;
+    // The emsdk package, only when it is the source (never fetched otherwise).
+    var package_emsdk: ?*std.Build.Dependency = null;
+    switch (source) {
+        .external => |root| {
+            default_sysroot = .{ .cwd_relative = emsdk_source.sysrootInclude(b.allocator, root) catch @panic("OOM") };
+            emcc_exe = emsdk_source.toolPath(b.allocator, root, emcc_name) catch @panic("OOM");
+            em_config = b.pathJoin(&.{ root, ".emscripten" });
+        },
+        .package => {
+            // Lazy: only fetched when no valid EMSDK is set. On the first
+            // configure it may be missing; the build runner fetches it and
+            // re-runs build().
+            const emsdk_dep = b.lazyDependency("emsdk", .{}) orelse return;
+            package_emsdk = emsdk_dep;
+            // One-time emsdk setup (install + activate). A no-op (null) when the
+            // `.emscripten` marker is already present (shared package cache
+            // already activated).
+            emsdk_setup = emSdkSetupStep(b, emsdk_dep) catch @panic("emsdk setup failed");
+            default_sysroot = emsdk_dep.path("upstream/emscripten/cache/sysroot/include");
+            emcc_exe = emsdk_dep.path(b.fmt("upstream/emscripten/{s}", .{emcc_name})).getPath(b);
+            em_config = emsdk_dep.path(".emscripten").getPath(b);
+        },
+    }
 
     // String form (zbgfx's `.emsdk_sysroot` option) + LazyPath form
-    // (`addSystemIncludePath`). Both resolve to the emsdk PACKAGE by default —
-    // portable, unlike the old Homebrew constant — unless `-Demsdk_sysroot`
-    // explicitly overrides them.
-    const packaged_sysroot = emsdk_dep.path("upstream/emscripten/cache/sysroot/include");
-    const emsdk_sysroot_str: []const u8 = emsdk_sysroot_override orelse packaged_sysroot.getPath(b);
+    // (`addSystemIncludePath`), unless `-Demsdk_sysroot` overrides both.
+    const emsdk_sysroot_str: []const u8 = emsdk_sysroot_override orelse default_sysroot.getPath(b);
     const emsdk_sysroot_lp: std.Build.LazyPath = if (emsdk_sysroot_override) |p|
         .{ .cwd_relative = p }
     else
-        packaged_sysroot;
+        default_sysroot;
 
     // ── wasm/WebGL-capable zbgfx (apotema/zbgfx fork, #8) ────────────
     // Force `with_shaderc = false` (the host codegen tool can't build for wasm)
@@ -1271,6 +1480,11 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     });
     gfx_mod.addImport("zbgfx", zbgfx_mod);
     gfx_mod.addImport("labelle-core", core_mod);
+    // labelle-android (#149 phase 1d): gfx.zig's video aliases are `struct {}`
+    // on wasm, so the import is never analyzed here — wired anyway so the
+    // module graph is uniform with the desktop/Android `build()` above.
+    const android_dep = b.dependency("labelle_android", .{ .target = target, .optimize = optimize });
+    gfx_mod.addImport("labelle_android", android_dep.module("labelle_android"));
     gfx_mod.addIncludePath(b.path("src"));
     // Package (or overridden) emscripten sysroot for stb_image's `<stdlib.h>` etc.
     gfx_mod.addSystemIncludePath(emsdk_sysroot_lp);
@@ -1285,6 +1499,10 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // Browser fullscreen (`window.zig` wasm `setFullscreen`/`isFullscreen`,
     // labelle-bgfx#99): the EM_JS half driving the DOM Fullscreen API.
     gfx_mod.addCSourceFile(.{ .file = b.path("src/web_fullscreen.c"), .flags = &.{} });
+    if (b.lazyDependency("labelle_web", .{ .target = target, .optimize = optimize })) |web_storage| {
+        gfx_mod.addImport("persistent_storage", web_storage.module("storage"));
+        gfx_mod.addCSourceFile(.{ .file = web_storage.path("src/web_storage.c"), .flags = &.{} });
+    }
 
     // ── Input backend module ────────────────────────────────────────
     // No zglfw / no sdl_gamepad (both desktop-only) — src/input.zig comptime-gates
@@ -1378,17 +1596,14 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // Re-export the bgfx artifact (parity with the desktop/android installs).
     b.installArtifact(bgfx_artifact);
 
-    // emcc link step. Use the PACKAGED emcc (from the same emsdk dep whose sysroot
-    // the C/C++ TUs above include), so the example links on any host — no local
-    // Emscripten install, and no risk of a PATH `emcc` mismatching the packaged
-    // sysroot. bgfx creates its own WebGL2 context on `#canvas`, so — unlike
+    // emcc link step. Use the emcc from the SAME emsdk whose sysroot the C/C++
+    // TUs above include (external EMSDK or the package, `emcc_exe` above), so
+    // the example links on any host with no risk of a PATH `emcc` mismatching
+    // the sysroot. bgfx creates its own WebGL2 context on `#canvas`, so — unlike
     // raylib — there is NO GLFW emulation and NO asyncify; the frame is driven by
     // emscripten_set_main_loop.
-    const emcc_exe = if (builtin.os.tag == .windows)
-        emsdk_dep.path("upstream/emscripten/emcc.bat").getPath(b)
-    else
-        emsdk_dep.path("upstream/emscripten/emcc").getPath(b);
     const emcc = b.addSystemCommand(&.{emcc_exe});
+    emcc.setEnvironmentVariable("EM_CONFIG", em_config);
     if (emsdk_setup) |setup| emcc.step.dependOn(&setup.step);
     if (optimize == .Debug) {
         emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1", "-sASSERTIONS=1" });
@@ -1432,10 +1647,68 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const wasm_step = b.step("wasm-example", "Build the bgfx WebGL/wasm smoke example (emcc → zig-out/web/wasm_demo.html)");
     wasm_step.dependOn(&install_web.step);
 
+    // The same example, linked by `backend.hook.zig`'s `emLinkStep` (the code a
+    // generated game's `post_wire` runs) instead of the emcc step above. Lets CI
+    // assert the hook's own emsdk handling: the EM_CONFIG pin (#161) and, on
+    // the dependency fallback, its activate step (#163). Installs to the same
+    // `web/` dir as `wasm_demo_hook.{html,js,wasm}`.
+    //
+    // The hook links `lib_main`'s transitive libs, the way a game's lib_main
+    // reaches bgfx through the assembler's `linkLibrary(bgfx)`. `example_lib`
+    // doesn't link bgfx (the emcc step above adds bgfx's libs itself), so the
+    // hook gets its own lib (and module, so `example_lib` stays as it was) that does.
+    const hook_example_mod = b.createModule(.{
+        .root_source_file = b.path("example/wasm_demo.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    hook_example_mod.addImport("window", window_mod);
+    hook_example_mod.addImport("backend_gfx", gfx_mod);
+    const hook_example_lib = b.addLibrary(.{
+        .name = "wasm_demo_hook",
+        .linkage = .static,
+        .root_module = hook_example_mod,
+    });
+    if (emsdk_setup) |setup| hook_example_lib.step.dependOn(&setup.step);
+    hook_example_lib.root_module.linkLibrary(bgfx_artifact);
+    const hook_install = build_hook.emLinkStep(b, .{
+        .optimize = optimize,
+        .lib_main = hook_example_lib,
+        .lib_backend = bgfx_artifact,
+        // Null on the external path: the package is not fetched there.
+        .emsdk = package_emsdk,
+        // The same EMSDK test emsdk_source.resolve applied above, so the hook
+        // never picks a different emsdk than the C compiles (and never falls
+        // back to a package that wasn't fetched).
+        .need_sysroot = emsdk_sysroot_override == null,
+    });
+    const wasm_hook_step = b.step("wasm-example-hook", "Build the wasm example, linked by backend.hook.zig's emLinkStep (same code as a generated game)");
+    wasm_hook_step.dependOn(&hook_install.step);
+
     // A `test` step is expected by CI even on wasm; wire a no-op so `zig build
     // test -Dtarget=wasm32-emscripten` succeeds (the real unit tests run on the
     // host target in the desktop/android graph).
-    _ = b.step("test", "(wasm target: unit tests run on the host graph)");
+    // The heap guard is the one host test that also runs here: it exists
+    // for the wasm build (page_allocator corrupts emscripten's heap).
+    const test_step = b.step("test", "(wasm target: unit tests run on the host graph; the heap guard runs here too)");
+    addHeapGuard(b, test_step, optimize);
+}
+
+/// Guard: no direct page_allocator in production code. On wasm it corrupts
+/// emscripten's malloc heap (see src/gfx/heap.zig). The test walks src/, so
+/// it always runs on the HOST, from the repo root, in both build graphs.
+fn addHeapGuard(b: *std.Build, test_step: *std.Build.Step, optimize: std.builtin.OptimizeMode) void {
+    const heap_guard_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/heap_guard_test.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const heap_guard_run = b.addRunArtifact(heap_guard_tests);
+    heap_guard_run.setCwd(b.path("."));
+    test_step.dependOn(&heap_guard_run.step);
 }
 
 /// Attach miniaudio's implementation TU + include path, and link the
@@ -1469,163 +1742,6 @@ fn wireMiniaudio(b: *std.Build, mod: *std.Build.Module, os_tag: std.Target.Os.Ta
         },
         else => {},
     }
-}
-
-/// Add the Android NDK sysroot system-include paths, the arch/API
-/// library path, and `__ANDROID_API__` to a single C/C++ module so its
-/// translation units resolve the Bionic `<stdlib.h>` etc. that Zig's
-/// bundled libc++ headers pull from the global namespace.
-fn applyNdkSysroot(
-    mod: *std.Build.Module,
-    inc_common: []const u8,
-    inc_arch: []const u8,
-    lib_path: []const u8,
-    android_api: []const u8,
-) void {
-    mod.addSystemIncludePath(.{ .cwd_relative = inc_common });
-    mod.addSystemIncludePath(.{ .cwd_relative = inc_arch });
-    mod.addLibraryPath(.{ .cwd_relative = lib_path });
-    // bgfx + Bionic both gate Android-version behavior on __ANDROID_API__.
-    mod.addCMacro("__ANDROID_API__", android_api);
-    // Android .so consumers need PIC in every archived .o (see #147).
-    mod.pic = true;
-}
-
-/// Resolved Android NDK sysroot include/library paths + API level for a
-/// given target. Computed once in `build()` and threaded through
-/// `applyNdkSysroot` for each C/C++ module that needs the Bionic headers.
-const NdkPaths = struct {
-    inc_common: []const u8,
-    inc_arch: []const u8,
-    lib_path: []const u8,
-    android_api: []const u8,
-};
-
-/// Resolve the NDK sysroot paths for an Android `target`. Panics with an
-/// actionable message if the NDK can't be found or the arch is
-/// unsupported — the caller only invokes this when `is_android` is true.
-fn resolveNdkPaths(b: *std.Build, target: std.Build.ResolvedTarget) NdkPaths {
-    const ndk_sysroot = getAndroidNdkSysroot(b) orelse
-        @panic("Could not find Android NDK. Set ANDROID_NDK_HOME or ANDROID_HOME.");
-    const ndk_arch_triple: []const u8 = switch (target.result.cpu.arch) {
-        .aarch64 => "aarch64-linux-android",
-        .x86_64 => "x86_64-linux-android",
-        .arm, .thumb => "arm-linux-androideabi",
-        .x86 => "i686-linux-android",
-        else => @panic("unsupported Android arch for bgfx"),
-    };
-    // Match the toolkit's default Android min_sdk (28, see
-    // `src/config.zig`). Must be >= 23: bx's `file.cpp` references
-    // `stdout`/`stderr`, which Bionic exposes as real symbols only from
-    // API 23 (below that they alias `__sF[]`, marked `__REMOVED_IN(23)`
-    // and rejected by clang availability).
-    const android_api = "28";
-    return .{
-        .inc_common = b.pathJoin(&.{ ndk_sysroot, "usr/include" }),
-        .inc_arch = b.pathJoin(&.{ ndk_sysroot, "usr/include", ndk_arch_triple }),
-        .lib_path = b.pathJoin(&.{ ndk_sysroot, "usr/lib", ndk_arch_triple, android_api }),
-        .android_api = android_api,
-    };
-}
-
-/// Locate the Android NDK sysroot, mirroring the sokol-Android path in
-/// `src/templates/build_zig.txt`. Checks `ANDROID_NDK_HOME` first, then
-/// `ANDROID_HOME/ndk/<latest>`. Returns null if neither resolves to an
-/// existing sysroot.
-///
-/// Env lookups go through `b.graph.environ_map.get` and filesystem
-/// checks through `std.Io.Dir.cwd().access(io, ...)` — Zig 0.16 removed
-/// `std.process.getEnvVarOwned`, `std.posix.getenv`, and `std.fs.cwd()`.
-fn getAndroidNdkSysroot(b: *std.Build) ?[]const u8 {
-    const io = b.graph.io;
-    // 1. ANDROID_NDK_HOME env var
-    if (b.graph.environ_map.get("ANDROID_NDK_HOME")) |ndk_home| {
-        const sysroot = b.pathJoin(&.{ ndk_home, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
-        if (std.Io.Dir.cwd().access(io, sysroot, .{})) |_| {
-            return sysroot;
-        } else |_| {}
-    }
-    // 2. ANDROID_HOME/ndk/<latest>/
-    if (b.graph.environ_map.get("ANDROID_HOME")) |home| {
-        const ndk_dir = b.pathJoin(&.{ home, "ndk" });
-        var dir = std.Io.Dir.cwd().openDir(io, ndk_dir, .{ .iterate = true }) catch return null;
-        defer dir.close(io);
-        var latest: ?[]const u8 = null;
-        var iter = dir.iterate();
-        while (iter.next(io) catch null) |entry| {
-            if (entry.kind == .directory) {
-                if (latest) |prev| {
-                    if (std.mem.order(u8, entry.name, prev) == .gt) {
-                        b.allocator.free(prev);
-                        latest = b.allocator.dupe(u8, entry.name) catch null;
-                    }
-                } else {
-                    latest = b.allocator.dupe(u8, entry.name) catch null;
-                }
-            }
-        }
-        if (latest) |version| {
-            defer b.allocator.free(version);
-            const sysroot = b.pathJoin(&.{ ndk_dir, version, "toolchains", "llvm", "prebuilt", ndkHostTag(), "sysroot" });
-            if (std.Io.Dir.cwd().access(io, sysroot, .{})) |_| {
-                return sysroot;
-            } else |_| {}
-        }
-    }
-    return null;
-}
-
-/// Locate the NDK's `android_native_app_glue` source directory
-/// (`<ndk>/sources/android/native_app_glue`), which ships
-/// `android_native_app_glue.c` + `.h`. Resolves the NDK root the same way
-/// `getAndroidNdkSysroot` does (ANDROID_NDK_HOME, then
-/// ANDROID_HOME/ndk/<latest>) but returns the glue dir rather than the
-/// sysroot. Returns null if it can't be found.
-fn androidNativeAppGlueDir(b: *std.Build) ?[]const u8 {
-    const io = b.graph.io;
-    const rel = &.{ "sources", "android", "native_app_glue" };
-
-    // 1. ANDROID_NDK_HOME
-    if (b.graph.environ_map.get("ANDROID_NDK_HOME")) |ndk_home| {
-        const dir = b.pathJoin(&.{ ndk_home, rel[0], rel[1], rel[2] });
-        if (std.Io.Dir.cwd().access(io, dir, .{})) |_| return dir else |_| {}
-    }
-
-    // 2. ANDROID_HOME/ndk/<latest>
-    if (b.graph.environ_map.get("ANDROID_HOME")) |home| {
-        const ndk_dir = b.pathJoin(&.{ home, "ndk" });
-        var dir = std.Io.Dir.cwd().openDir(io, ndk_dir, .{ .iterate = true }) catch return null;
-        defer dir.close(io);
-        var latest: ?[]const u8 = null;
-        var iter = dir.iterate();
-        while (iter.next(io) catch null) |entry| {
-            if (entry.kind == .directory) {
-                if (latest) |prev| {
-                    if (std.mem.order(u8, entry.name, prev) == .gt) {
-                        b.allocator.free(prev);
-                        latest = b.allocator.dupe(u8, entry.name) catch null;
-                    }
-                } else {
-                    latest = b.allocator.dupe(u8, entry.name) catch null;
-                }
-            }
-        }
-        if (latest) |version| {
-            defer b.allocator.free(version);
-            const glue = b.pathJoin(&.{ ndk_dir, version, rel[0], rel[1], rel[2] });
-            if (std.Io.Dir.cwd().access(io, glue, .{})) |_| return glue else |_| {}
-        }
-    }
-    return null;
-}
-
-fn ndkHostTag() []const u8 {
-    return switch (builtin.os.tag) {
-        .linux => "linux-x86_64",
-        .macos => "darwin-x86_64",
-        .windows => "windows-x86_64",
-        else => "linux-x86_64",
-    };
 }
 
 // ── emsdk one-time setup (ported from sokol-zig) ───────────────────────
@@ -1662,8 +1778,12 @@ fn emSdkSetupStep(b: *std.Build, emsdk: *std.Build.Dependency) !?*std.Build.Step
     if (!dot_emsc_exists) {
         const emsdk_install = createEmsdkStep(b, emsdk);
         emsdk_install.addArgs(&.{ "install", "latest" });
+        // Named so `--summary all` shows it: CI greps for these names to
+        // assert a build with a valid EMSDK never ran them (#159).
+        emsdk_install.setName("emsdk install latest (zig-pkg emsdk)");
         const emsdk_activate = createEmsdkStep(b, emsdk);
         emsdk_activate.addArgs(&.{ "activate", "latest" });
+        emsdk_activate.setName("emsdk activate latest (zig-pkg emsdk)");
         emsdk_activate.step.dependOn(&emsdk_install.step);
         return emsdk_activate;
     } else {

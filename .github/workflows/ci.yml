@@ -10,6 +10,44 @@ permissions:
   contents: read
 
 jobs:
+  # Missing-SDL2 message (labelle-cli#471 S2). On Windows, Zig has no default
+  # SDL2 search path, so a desktop build with the gamepad source wired used
+  # to die with a multi-line linker error when SDL2 was absent. The script
+  # forces that case through the real wiring (`zig build sdl2-link-check`)
+  # and asserts the ONE-line message, that `-Dgamepad_enabled=false` still
+  # builds, and that a provisioned SDL2 (laid out like ~/.labelle/sdl2:
+  # static archives hidden, SDL2.dll in lib/) links.
+  sdl2-missing-windows:
+    name: missing-SDL2 message (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      SDL2_VERSION: 2.30.11
+      SDL2_SHA256: 0590db0a47b564aab92499ed03eaa75db9aee17c371080caa3b05df9d49d9ff9
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Provision SDL2 (MinGW devel) for the "present" scenario
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o sdl2.tar.gz "https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-devel-${SDL2_VERSION}-mingw.tar.gz"
+          echo "${SDL2_SHA256}  sdl2.tar.gz" | sha256sum -c -
+          tar xzf sdl2.tar.gz
+          lib="$RUNNER_TEMP/SDL2-${SDL2_VERSION}/x86_64-w64-mingw32/lib"
+          mv "$lib/libSDL2.a" "$lib/libSDL2.a.static-hidden"
+          cp "$lib/../bin/SDL2.dll" "$lib/"
+          echo "SDL2_PRESENT_LIB=$(cygpath -w "$lib")" >> "$GITHUB_ENV"
+      - name: sdl2-link-check scenarios
+        run: bash .github/scripts/sdl2-link-check.sh
+
   build-test:
     name: bgfx backend build + test (macOS)
     runs-on: macos-latest
@@ -80,6 +118,12 @@ jobs:
       # Fixed-scene goldens do not exercise arena exhaustion or Windows links.
       - name: Transient exhaustion (flat, textured and all material effects)
         run: zig build transient-exhaustion-probe
+      - name: Rotated filled rectangles fill (#98)
+        run: zig build rotated-rect-probe
+      - name: Post-fx keeps the scene's shape off the design size (#120)
+        run: zig build postfx-fit-probe
+      - name: compressedSupported agrees with uploadCompressed (#134)
+        run: zig build compressed-support-probe
       # This renderer probe does not exercise gamepads. Use the supported
       # GLFW fallback so cross-linking does not require a Windows SDL2 SDK;
       # the native build above retains the default SDL gamepad integration.
@@ -353,6 +397,91 @@ jobs:
           nm -D "$so" | grep -q 'android_main' || { echo "FAIL: android_main not exported"; exit 1; }
           nm -D "$so" | grep -q 'ANativeActivity_onCreate' || { echo "FAIL: ANativeActivity_onCreate not exported"; exit 1; }
 
+      # ── labelle-cli#405 D11: the `android` provider next to bgfx ──────
+      # A project that lists the provider plugin (labelle-android) gets that
+      # package twice: the assembler wires the plugin as a `.path` dep, bgfx
+      # pins it by url+hash, and Zig never merges the two, even at the same
+      # release. Both copies compile the JNI C, so the `libgame.so` link fails
+      # on `duplicate symbol: labelle_android_*` unless bgfx's build hook
+      # (`backend.hook.zig` `unifyLabelleAndroid`) points bgfx's imports at
+      # the plugin's module. test/android-provider is that project.
+      #
+      # Generated with a RELEASED assembler binary, not the pinned CLI: CLIs
+      # before v2.0.0 reserve the `android` namespace and reject the provider,
+      # and the job's pinned assembler (v0.109.0) cannot read its manifest-v2
+      # plugin.labelle. The binary is checked against the release's SHA256SUMS.
+      - name: D11 — provider plugin + bgfx link ONE labelle_android (cli#405)
+        env:
+          D11_ASSEMBLER_TAG: v0.116.0
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/labelle-toolkit/labelle-assembler/releases/download/$D11_ASSEMBLER_TAG"
+          mkdir -p "$RUNNER_TEMP/d11-assembler"
+          cd "$RUNNER_TEMP/d11-assembler"
+          curl -fsSLO "$base/labelle-assembler-linux-x86_64"
+          curl -fsSLO "$base/SHA256SUMS"
+          grep ' labelle-assembler-linux-x86_64$' SHA256SUMS | sha256sum -c -
+          chmod +x labelle-assembler-linux-x86_64
+          asm="$PWD/labelle-assembler-linux-x86_64"
+
+          # The bare assembler does not fetch packages: `generate` links them
+          # from ~/.labelle/packages and fails on a clean runner. Stage every
+          # package the fixture pins, in the layout the CLI/assembler cache
+          # writes (the tag's source archive, top-level dir stripped):
+          #   <kind>/<version> for core/gfx/engine,
+          #   plugins/<repo>/<version> for a plugin. Keep in step with
+          #   test/android-provider/project.labelle.
+          pkgs="$HOME/.labelle/packages"
+          stage() {  # <cache slot> <owner/repo> <tag>
+            dst="$pkgs/$1"
+            rm -rf "$dst"
+            mkdir -p "$dst"
+            curl -fsSL "https://github.com/$2/archive/$3.tar.gz" -o "$RUNNER_TEMP/d11-stage.tar.gz"
+            tar -xzf "$RUNNER_TEMP/d11-stage.tar.gz" -C "$dst" --strip-components=1
+            if [ ! -f "$dst/build.zig.zon" ]; then echo "FAIL: $dst has no build.zig.zon"; exit 1; fi
+            echo "staged $1 <- $2@$3"
+          }
+          stage core/2.1.0 labelle-toolkit/labelle-core v2.1.0
+          stage gfx/2.2.0 labelle-toolkit/labelle-gfx v2.2.0
+          stage engine/3.4.1 labelle-toolkit/labelle-engine v3.4.1
+          stage plugins/github.com/labelle-toolkit/labelle-android/0.2.0 labelle-toolkit/labelle-android v0.2.0
+
+          cd "$GITHUB_WORKSPACE/labelle-bgfx/test/android-provider"
+          # Capture, then check: a missing package is only a WARNING to
+          # `generate` ("could not link dep"), and must fail this step.
+          "$asm" generate --project-root . --platform android 2>&1 | tee "$RUNNER_TEMP/d11-generate.log"
+          if grep -q 'could not link dep' "$RUNNER_TEMP/d11-generate.log"; then
+            echo "FAIL: generate could not link a package; stage it above"; exit 1
+          fi
+          # The link IS the check: duplicate JNI C fails it.
+          (cd .labelle/bgfx_android && zig build)
+
+          so=$(find .labelle/bgfx_android/zig-out -name 'libgame.so' | head -1)
+          if [ -z "$so" ]; then echo "FAIL: libgame.so not found"; exit 1; fi
+          fail=0
+          defined=$(nm -D --defined-only "$so" | awk '$3 ~ /^labelle_android_/ { print $3 }' | sort)
+          for sym in labelle_android_acquire_env labelle_android_read_intent_extras \
+                     labelle_android_app_is_debuggable labelle_android_force_window_relayout; do
+            n=$(printf '%s\n' "$defined" | grep -cx "$sym" || true)
+            if [ "$n" -ne 1 ]; then echo "FAIL: $sym defined $n times (want 1)"; fail=1; else echo "ok    $sym x1"; fi
+          done
+          dups=$(printf '%s\n' "$defined" | uniq -d)
+          if [ -n "$dups" ]; then echo "FAIL: duplicated: $dups"; fail=1; fi
+          # The mechanism, not just the count: the JNI C in the .so is the
+          # PLUGIN's copy (.labelle/deps/labelle-android), and bgfx's
+          # hash-fetched copy (zig-pkg/labelle_android-<ver>-<hash>) is absent.
+          # Into a file first: `strings | grep -q` under pipefail fails on the
+          # SIGPIPE when grep stops reading early.
+          strings -a "$so" > "$RUNNER_TEMP/d11-strings.txt"
+          if ! grep -q 'deps/labelle-android/src/jni/intent_extras\.c' "$RUNNER_TEMP/d11-strings.txt"; then
+            echo "FAIL: the JNI C is not the provider plugin's copy"; fail=1
+          fi
+          if grep -q 'labelle_android-[0-9][0-9.]*-[A-Za-z0-9_-]*/src/jni' "$RUNNER_TEMP/d11-strings.txt"; then
+            echo "FAIL: bgfx's own labelle_android copy reached the .so"; fail=1
+          fi
+          exit "$fail"
+
       # ── The gap this job had (labelle-bgfx#104) ──────────────────────
       # Everything above only CROSS-COMPILES. An .so that aborts in `gameInit`
       # is byte-for-byte as convincing as one that renders perfectly, which is
@@ -477,8 +606,13 @@ jobs:
           key: bgfx-wasm-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
             bgfx-wasm-${{ runner.os }}-
+      # EMSDK unset: this job pins the FALLBACK (the emsdk Zig package).
+      # `-Demsdk_expect=package` fails the configure if any other source was
+      # chosen (#159); the external-EMSDK path has its own job below.
       - name: Build the wasm/WebGL example
-        run: zig build -Dtarget=wasm32-emscripten wasm-example --summary all
+        env:
+          EMSDK: ''
+        run: zig build -Dtarget=wasm32-emscripten -Demsdk_expect=package wasm-example --summary all
       # A green emcc step that emitted nothing would be the same kind of empty
       # evidence this PR is about. Assert the three real artifacts exist and
       # that the .wasm is not a stub.
@@ -493,6 +627,185 @@ jobs:
           [ "$size" -gt 100000 ] || { echo "FAIL: wasm_demo.wasm is only $size bytes"; exit 1; }
           # `tr -s ' '` normalizes od's column padding, which differs between
           # GNU (single space) and BSD (double) od.
+          head -c 4 zig-out/web/wasm_demo.wasm | od -An -tx1 | tr -s ' ' | grep -q '00 61 73 6d' \
+            || { echo "FAIL: wasm_demo.wasm has no wasm magic"; exit 1; }
+      # labelle-bgfx#163: the hook's emcc link (`backend.hook.zig` emLinkStep,
+      # the code a generated game runs) must activate the emsdk DEPENDENCY
+      # when it falls back to it and it is installed but not activated. The
+      # build above installed + activated the package, so remove only its
+      # `.emscripten` (activation is cheap, nothing is downloaded) and link via
+      # the hook. Asserts the hook's own activate step RAN, the marker is back,
+      # and the module is real.
+      - name: Hook link activates an unactivated dependency emsdk (#163)
+        env:
+          EMSDK: ''
+        run: |
+          set -uo pipefail
+          # The emsdk this build.zig.zon pins (a restored cache can also hold
+          # an older pin's package, so never pick by glob order).
+          hash=$(python3 -c "import re;t=open('build.zig.zon').read();print(re.search(r'\.emsdk\s*=\s*\.\{.*?\.hash\s*=\s*\"([^\"]+)\"',t,re.S).group(1))")
+          pkg="zig-pkg/$hash/"
+          [ -d "$pkg/upstream/emscripten" ] || { echo "FAIL: the pinned emsdk package $pkg is not installed"; exit 1; }
+          rm -f "$pkg/.emscripten"
+          zig build -Dtarget=wasm32-emscripten -Demsdk_expect=package wasm-example-hook --summary all > hook.log 2>&1
+          status=$?
+          cat hook.log
+          [ "$status" -eq 0 ] || { echo "FAIL: hook build exited $status"; exit 1; }
+          grep -E "hook: emsdk activate latest \(zig-pkg emsdk\) success" hook.log \
+            || { echo "FAIL: the hook's dependency activate step did not run"; exit 1; }
+          [ -f "$pkg/.emscripten" ] || { echo "FAIL: $pkg.emscripten was not recreated"; exit 1; }
+          head -c 4 zig-out/web/wasm_demo_hook.wasm | od -An -tx1 | tr -s ' ' | grep -q '00 61 73 6d' \
+            || { echo "FAIL: wasm_demo_hook.wasm has no wasm magic"; exit 1; }
+      - name: Hook link on an activated dependency adds no activate step (#163)
+        env:
+          EMSDK: ''
+        run: |
+          set -uo pipefail
+          zig build -Dtarget=wasm32-emscripten -Demsdk_expect=package wasm-example-hook --summary all > hook2.log 2>&1
+          status=$?
+          cat hook2.log
+          [ "$status" -eq 0 ] || { echo "FAIL: hook build exited $status"; exit 1; }
+          if grep -F "hook: emsdk activate" hook2.log; then
+            echo "FAIL: the hook added an activate step for an already-activated emsdk"
+            exit 1
+          fi
+
+  # A valid EMSDK is honoured and the emsdk Zig package is never activated
+  # (labelle-bgfx#159). labelle-web 0.3's provider installs its own emsdk and
+  # exports EMSDK, EM_CONFIG and PATH into the build; before #159 this build
+  # still ran `emsdk install/activate latest` on the package copy, a second
+  # ~1.5 GB download per cold runner. This job sets up the same env contract
+  # and asserts the MECHANISM, not only a green build:
+  #   1. `-Demsdk_expect=external` fails the configure unless build.zig chose
+  #      the external EMSDK, and `-Demsdk_expect=package` must FAIL here (so
+  #      the gate is not vacuous);
+  #   2. the build summary shows no `emsdk install/activate (zig-pkg emsdk)`
+  #      step;
+  #   3. no emsdk package under zig-pkg/ was installed or activated (no
+  #      `upstream/`, no `.emscripten`). zig-pkg is NOT cached in this job, so
+  #      a restored cache cannot fake or mask that.
+  wasm-example-external-emsdk:
+    name: wasm example with an external EMSDK (no zig-pkg emsdk install)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      EXT_EMSDK_VERSION: 4.0.9
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Cache the external emsdk
+        id: ext-emsdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/ext-emsdk
+          key: ext-emsdk-${{ runner.os }}-${{ env.EXT_EMSDK_VERSION }}
+      # A plain emsdk checkout, installed + activated: the layout labelle-web's
+      # provider hands the build (`upstream/emscripten` + `.emscripten`).
+      - name: Install the external emsdk
+        if: steps.ext-emsdk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$EXT_EMSDK_VERSION" https://github.com/emscripten-core/emsdk ~/ext-emsdk
+          cd ~/ext-emsdk
+          ./emsdk install "$EXT_EMSDK_VERSION"
+          ./emsdk activate "$EXT_EMSDK_VERSION"
+      # labelle-web 0.3's env contract: EMSDK, EM_CONFIG, PATH += upstream/emscripten.
+      - name: Export EMSDK, EM_CONFIG and PATH
+        run: |
+          set -euo pipefail
+          root="$HOME/ext-emsdk"
+          test -d "$root/upstream/emscripten"
+          test -f "$root/.emscripten"
+          echo "EMSDK=$root" >> "$GITHUB_ENV"
+          echo "EM_CONFIG=$root/.emscripten" >> "$GITHUB_ENV"
+          echo "$root/upstream/emscripten" >> "$GITHUB_PATH"
+      - name: Cache Zig artifacts (not zig-pkg)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: bgfx-wasm-ext-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            bgfx-wasm-ext-${{ runner.os }}-
+      - name: The source gate is not vacuous (expect=package must fail)
+        run: |
+          set -uo pipefail
+          if zig build -Dtarget=wasm32-emscripten -Demsdk_expect=package --help > gate.log 2>&1; then
+            cat gate.log
+            echo "FAIL: -Demsdk_expect=package passed with a valid EMSDK set"
+            exit 1
+          fi
+          grep -F "a valid EMSDK was found and used" gate.log \
+            || { cat gate.log; echo "FAIL: expect=package failed for another reason"; exit 1; }
+      - name: Build the wasm/WebGL example from the external EMSDK
+        run: |
+          set -uo pipefail
+          zig build -Dtarget=wasm32-emscripten -Demsdk_expect=external wasm-example --summary all > build.log 2>&1
+          status=$?
+          cat build.log
+          [ "$status" -eq 0 ] || { echo "FAIL: build exited $status"; exit 1; }
+      # The hook's link (what a generated game runs) under an inherited
+      # EM_CONFIG that names ANOTHER, broken SDK (#161): it must pin EM_CONFIG
+      # to EMSDK's own `.emscripten` and never activate the package (#163).
+      - name: Hook link ignores an inherited EM_CONFIG naming another SDK (#161, #163)
+        run: |
+          set -uo pipefail
+          bogus="$RUNNER_TEMP/other-sdk.emscripten"
+          printf '%s\n' "LLVM_ROOT = '/nonexistent-other-sdk/upstream/bin'" \
+            "BINARYEN_ROOT = '/nonexistent-other-sdk/upstream'" \
+            "NODE_JS = '/nonexistent-other-sdk/node/bin/node'" > "$bogus"
+          # Control: the same emcc under that config really fails, so a green
+          # hook link below proves the pin, not luck. EM_CACHE is redirected:
+          # emcc clears its cache when the config changes.
+          echo 'int main(void){return 0;}' > "$RUNNER_TEMP/t.c"
+          if EM_CONFIG="$bogus" EM_CACHE="$RUNNER_TEMP/bogus-cache" emcc -c "$RUNNER_TEMP/t.c" -o "$RUNNER_TEMP/t.o" > control.log 2>&1; then
+            cat control.log; echo "FAIL: control: emcc worked under the other SDK's config"; exit 1
+          fi
+          grep -F "nonexistent-other-sdk" control.log || { cat control.log; echo "FAIL: control failed for another reason"; exit 1; }
+          # A fresh cache dir so the emcc link really runs (not a cache hit).
+          EM_CONFIG="$bogus" zig build -Dtarget=wasm32-emscripten -Demsdk_expect=external wasm-example-hook \
+            --cache-dir "$RUNNER_TEMP/hook-cache" --summary all > hook.log 2>&1
+          status=$?
+          cat hook.log
+          [ "$status" -eq 0 ] || { echo "FAIL: hook link exited $status under the inherited EM_CONFIG"; exit 1; }
+          grep -E "emcc \(wasm_demo_hook\.html\) success" hook.log \
+            || { echo "FAIL: the hook's emcc link did not run"; exit 1; }
+          if grep -F "(zig-pkg emsdk)" hook.log; then
+            echo "FAIL: the hook ran emsdk install/activate on the zig-pkg emsdk"; exit 1
+          fi
+          head -c 4 zig-out/web/wasm_demo_hook.wasm | od -An -tx1 | tr -s ' ' | grep -q '00 61 73 6d' \
+            || { echo "FAIL: wasm_demo_hook.wasm has no wasm magic"; exit 1; }
+      - name: Assert no zig-pkg emsdk install/activate ran
+        run: |
+          set -euo pipefail
+          if grep -F "(zig-pkg emsdk)" build.log; then
+            echo "FAIL: the build ran emsdk install/activate on the zig-pkg emsdk"
+            exit 1
+          fi
+          fail=0
+          for dir in zig-pkg/*/; do
+            [ -f "$dir/emsdk.py" ] || continue
+            echo "emsdk package present (fetched, not necessarily used): $dir"
+            for marker in upstream .emscripten; do
+              if [ -e "$dir/$marker" ]; then
+                echo "FAIL: $dir$marker exists: the package emsdk was installed/activated"
+                fail=1
+              fi
+            done
+          done
+          exit $fail
+      - name: Verify the emitted wasm artifacts
+        run: |
+          set -euo pipefail
+          for f in zig-out/web/wasm_demo.html zig-out/web/wasm_demo.js zig-out/web/wasm_demo.wasm; do
+            [ -s "$f" ] || { echo "FAIL: missing or empty $f"; exit 1; }
+            ls -l "$f"
+          done
           head -c 4 zig-out/web/wasm_demo.wasm | od -An -tx1 | tr -s ' ' | grep -q '00 61 73 6d' \
             || { echo "FAIL: wasm_demo.wasm has no wasm magic"; exit 1; }
 
@@ -560,7 +873,7 @@ jobs:
           set +e
           set -uo pipefail
           fail=0
-          for step in headless-probe mirror-probe screenshot-probe surfaceless-scale-probe; do
+          for step in headless-probe mirror-probe screenshot-probe surfaceless-scale-probe rotated-rect-probe postfx-fit-probe compressed-support-probe; do
             echo "::group::$step"
             # `set +e` above, so a non-zero build/run doesn't abort the loop — but
             # capture the exit code and FOLD it into `fail` (a probe that printed
@@ -569,7 +882,8 @@ jobs:
             out=$(zig build "$step" 2>&1); rc=$?
             echo "$out"
             if [ "$rc" -ne 0 ]; then echo "FAIL: $step exited non-zero ($rc)"; fail=1; fi
-            echo "$out" | grep -qE 'HEADLESS_OFFSCREEN_READBACK_OK|HEADLESS_MIRROR_OK|SCREENSHOT_TGA_OK|SURFACELESS_SCALE_OK' \
+            # A here-string avoids producer SIGPIPE when grep exits early.
+            grep -qE 'HEADLESS_OFFSCREEN_READBACK_OK|HEADLESS_MIRROR_OK|SCREENSHOT_TGA_OK|SURFACELESS_SCALE_OK|ROTATED_RECT_FILLED|POSTFX_FIT_OK|COMPRESSED_SUPPORT_AGREES' <<< "$out" \
               || { echo "FAIL: $step did not report OK"; fail=1; }
             echo "::endgroup::"
           done

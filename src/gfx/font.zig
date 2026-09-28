@@ -25,6 +25,7 @@
 /// what opts this backend in to the font traits (the contract
 /// `@hasDecl`-guards every one of them).
 const std = @import("std");
+const heap = @import("heap.zig");
 const builtin = @import("builtin");
 const bgfx = @import("zbgfx").bgfx;
 const types = @import("types.zig");
@@ -799,9 +800,9 @@ pub const MAX_CATALOG_FONTS = 64;
 
 /// Allocator for the retained metric copies. A `var` purely so the
 /// tests can substitute a leak-checking allocator; production always
-/// uses `page_allocator`, the same one `texture.zig` retains its
-/// decoded pixels with.
-pub var metrics_allocator: std.mem.Allocator = std.heap.page_allocator;
+/// uses the backend allocator (`heap.zig`: libc malloc on wasm,
+/// page_allocator elsewhere), the same one `texture.zig` uses.
+pub var metrics_allocator: std.mem.Allocator = heap.allocator;
 
 /// One retained face. `handle` is null between the upload and the
 /// registration — and stays null forever for a caller that never

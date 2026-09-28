@@ -16,8 +16,10 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const yuv = @import("yuv.zig");
-const planes = @import("planes.zig");
+// Shared with the Android decoder via the labelle-android package (#149
+// phase 1d, D2): one copy of the YUV->RGBA and plane-tighten helpers.
+const yuv = @import("labelle_android").video.yuv;
+const planes = @import("labelle_android").video.planes;
 
 extern "c" fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *anyopaque) usize;
 extern "c" fn system(command: [*:0]const u8) c_int;
@@ -204,7 +206,7 @@ pub const VideoDecoder = struct {
     /// (interleaved) via ffmpeg — the format `audio.loadMusicFromPcm` wants.
     /// Returns null if the clip has no audio track or ffmpeg fails. Caller owns
     /// the returned slice. (Android decodes the track in-process with
-    /// AMediaCodec instead — see video/android_audio.zig.)
+    /// AMediaCodec instead — see `labelle_android.video.decodeTrack`.)
     pub fn decodeAudioPcm(allocator: std.mem.Allocator, path: []const u8) ?[]i16 {
         const qpath = shellQuote(allocator, path) catch return null;
         defer allocator.free(qpath);

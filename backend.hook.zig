@@ -27,6 +27,14 @@
 //! wasm32-emscripten when handed `-Demsdk_sysroot`), and emcc is given bgfx's full
 //! transitive lib set (bgfx + bx + bimg).
 //!
+//! emsdk contract (labelle-bgfx#161/#163): a valid, activated `EMSDK` wins and
+//! the emsdk dependency is never activated or installed. On the dependency
+//! fallback, INSTALLING the toolchain is the generated build.zig's job (the
+//! `ensureEmsdkActivated` preflight, labelle-assembler#492, stops the configure
+//! with the exact command); this hook only ACTIVATES an installed-but-inactive
+//! dependency before emcc runs (`needsDepActivation`). Either way emcc runs
+//! with `EM_CONFIG` pinned to the chosen emsdk's `.emscripten`.
+//!
 //! ANDROID exercises BOTH hook phases:
 //!
 //!   * `resolve_target` — runs BEFORE any `b.dependency` and produces the android
@@ -45,6 +53,18 @@
 //!     `linkLibrary(bgfx)`, `linkSystemLibrary(...)`, `link_libc`, root-module
 //!     `.pic` — are emitted declaratively by the assembler from the manifest, NOT
 //!     here.
+//!
+//!     NDK DETECTION IS DUPLICATED HERE ON PURPOSE (labelle-bgfx#149 phase 1e).
+//!     bgfx's `build.zig` takes `resolveNdk` / `addAndroidSysroot` from the
+//!     `labelle_android` package; this hook keeps its own
+//!     `getAndroidNdkSysroot` / `selectGreatestValidNdk` / `libcTxt` because it
+//!     is std-only BY CONTRACT (see the first paragraph: the assembler imports
+//!     it into the generated root package, where no `labelle_android` module is
+//!     resolvable). Both copies apply the same selection rule — `ANDROID_NDK_HOME`,
+//!     else the greatest `ANDROID_HOME/ndk/<version>` that HAS a sysroot — so the
+//!     .so link and the C compile agree on the NDK. The copy leaves with
+//!     labelle-cli#406, when APK packaging (and with it this residual) moves into
+//!     labelle-android.
 //!
 //! The generated v2 android build.zig `@import`s this file (as a sibling
 //! `backend_build_hook.zig`) and calls both phases; that import is the design's
@@ -355,41 +375,142 @@ pub const EmLinkOptions = struct {
     /// wasm32-emscripten by the apotema/zbgfx fork). Retained for callers/context;
     /// its subtree is already covered by walking `lib_main`'s graph.
     lib_backend: *std.Build.Step.Compile,
-    /// The emsdk dependency, resolved by the caller via `b.dependency("emsdk", .{})`.
-    emsdk: *std.Build.Dependency,
+    /// The emsdk dependency, resolved by the caller via `b.dependency("emsdk", .{})`
+    /// (`post_wire` always passes it). Null only when the caller already knows a
+    /// valid EMSDK is set (build.zig's `wasm-example-hook` on the external path,
+    /// which never fetches the package); falling back to the dependency without
+    /// one is a configure-time panic.
+    emsdk: ?*std.Build.Dependency,
     /// Editor-preview build: add the `editor_*` export args (see
     /// `wasm_editor_exported_functions_arg`). Threaded from
     /// `HookContext.editor_preview` by `post_wire`.
     editor_preview: bool = false,
+    /// Whether an external EMSDK must also have the default sysroot include dir
+    /// to be used. False only when the caller's C compiles take the sysroot
+    /// from elsewhere (build.zig's `-Demsdk_sysroot`), so the link and
+    /// `emsdk_source.resolve` accept the same EMSDKs.
+    need_sysroot: bool = true,
 };
 
 /// Where `emTool` resolves an emscripten tool from.
 const EmToolResolution = union(enum) {
     /// An external `EMSDK` is set AND the tool exists on disk under it — use this
     /// ABSOLUTE tool path directly (a `cwd_relative`/absolute LazyPath, since it
-    /// lives OUTSIDE the build graph). Caller owns the returned slice.
-    managed: []const u8,
-    /// No usable `EMSDK` override — fall back to the emsdk build dependency.
+    /// lives OUTSIDE the build graph), run under THAT emsdk's `.emscripten`.
+    /// Caller owns both slices (`deinit`).
+    managed: Managed,
+    /// No usable `EMSDK` override — fall back to the emsdk build dependency (its
+    /// tool, run under its `.emscripten`).
     dep,
+
+    const Managed = struct {
+        /// `<EMSDK>/upstream/emscripten/<tool>`.
+        tool: []const u8,
+        /// `<EMSDK>/.emscripten` (exists: `emToolPath` requires an activated
+        /// EMSDK): the EM_CONFIG the tool must run under (labelle-bgfx#161).
+        /// Pinned so an inherited EM_CONFIG naming ANOTHER SDK can't redirect
+        /// this emcc's LLVM/binaryen/node.
+        em_config: []const u8,
+
+        fn deinit(self: Managed, gpa: std.mem.Allocator) void {
+            gpa.free(self.tool);
+            gpa.free(self.em_config);
+        }
+    };
 };
 
 /// Pure decision behind `emTool`: prefer an external `EMSDK` (the studio's
 /// managed emsdk, `~/.labelle/emsdk/<ver>/`, layout from cli#283) when it is set
-/// AND the tool actually exists at `<EMSDK>/upstream/emscripten/<tool>` on disk;
+/// AND the tool actually exists at `<EMSDK>/upstream/emscripten/<tool>` on disk
+/// AND the emsdk is activated (`<EMSDK>/.emscripten` exists, #161)
+/// AND it has `upstream/emscripten/cache/sysroot/include` (#163) — the same
+/// test as build.zig's `emsdk_source.resolve` without `-Demsdk_sysroot`;
 /// otherwise fall back to the emsdk build dependency. EMSDK-unset (or an empty
 /// value, or a missing file) yields `.dep` — byte-identical to the pre-#535
-/// behavior for everyone who doesn't set EMSDK. `fs` is any value exposing
-/// `exists(path) bool`, so the branch is testable without a live `*std.Build`.
-fn emToolPath(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, tool: []const u8, fs: anytype) EmToolResolution {
+/// behavior for everyone who doesn't set EMSDK. `need_sysroot` is false only
+/// when the caller supplies the sysroot itself (build.zig's `-Demsdk_sysroot`),
+/// exactly as `emsdk_source.resolve`'s `Options.need_sysroot`. `fs` is any value
+/// exposing `exists(path) bool`, so the branch is testable without a live
+/// `*std.Build`.
+fn emToolPath(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, tool: []const u8, need_sysroot: bool, fs: anytype) EmToolResolution {
     const root = env_emsdk orelse return .dep;
     if (root.len == 0) return .dep;
     // The managed layout (cli#283) mirrors the zig-pkg dep EXACTLY — only the
     // root differs — so the sub-path is the same `upstream/emscripten/<tool>`.
     // Native-separator join (host path, used as an absolute LazyPath below).
     const abs = std.fs.path.join(gpa, &.{ root, "upstream", "emscripten", tool }) catch return .dep;
-    if (fs.exists(abs)) return .{ .managed = abs };
-    gpa.free(abs);
-    return .dep;
+    if (!fs.exists(abs)) {
+        gpa.free(abs);
+        return .dep;
+    }
+    // Activated too (#161): the tool runs under `<root>/.emscripten`, so an
+    // installed-but-not-activated EMSDK is not usable here — same rule as
+    // `emsdk_source.resolve` in build.zig.
+    const em_config = std.fs.path.join(gpa, &.{ root, ".emscripten" }) catch {
+        gpa.free(abs);
+        return .dep;
+    };
+    // And the sysroot, like `emsdk_source.resolve`'s default (#163): build.zig
+    // compiles bgfx against the package emsdk when EMSDK lacks it, so the link
+    // must fall back too, or the compile and the link would use two SDKs.
+    const sysroot = std.fs.path.join(gpa, &.{ root, "upstream", "emscripten", "cache", "sysroot", "include" }) catch {
+        gpa.free(abs);
+        gpa.free(em_config);
+        return .dep;
+    };
+    defer gpa.free(sysroot);
+    if (!fs.exists(em_config) or (need_sysroot and !fs.exists(sysroot))) {
+        gpa.free(abs);
+        gpa.free(em_config);
+        return .dep;
+    }
+    return .{ .managed = .{ .tool = abs, .em_config = em_config } };
+}
+
+/// An emscripten tool plus the EM_CONFIG it must run under — both from the SAME
+/// emsdk (labelle-bgfx#161, same rule as build.zig's link since #160).
+const EmTool = struct {
+    exe: std.Build.LazyPath,
+    /// Absolute path to that emsdk's `.emscripten`.
+    em_config: []const u8,
+    /// `emsdk activate latest` on the emsdk DEPENDENCY, when the link falls back
+    /// to it and it is not activated yet (#163); the emcc step must wait on it.
+    /// Always null on the external-EMSDK path. See `needsDepActivation`.
+    activate: ?*std.Build.Step.Run = null,
+};
+
+/// Which emsdk the link uses, for `needsDepActivation`.
+const EmSource = enum { managed, dep };
+
+/// Whether the emcc link must first run `emsdk activate latest` on the emsdk
+/// dependency (labelle-bgfx#163). Only on the dependency fallback, and only while
+/// it has no `.emscripten`. Never on the external-EMSDK path, so a valid EMSDK
+/// never touches the package.
+///
+/// The hook ACTIVATES but never INSTALLS: `emsdk activate` only writes the
+/// config for an already-installed toolchain and fails ("tool is not installed")
+/// rather than downloading. Installing the ~1.5 GB toolchain stays with the
+/// assembler contract: the generated build.zig's `ensureEmsdkActivated`
+/// preflight (labelle-assembler#492) stops the configure, with the exact
+/// `emsdk install latest && emsdk activate latest` command, when neither a
+/// usable EMSDK nor an installed dependency emcc exists. So after that
+/// preflight the dependency is installed, and this step only closes the
+/// "installed but not activated" gap, where emcc would otherwise run under a
+/// missing EM_CONFIG.
+fn needsDepActivation(source: EmSource, dep_activated: bool) bool {
+    return source == .dep and !dep_activated;
+}
+
+/// `--summary all` name of the hook's activate step. It contains
+/// "(zig-pkg emsdk)", which the external-EMSDK CI job requires to be absent.
+const dep_activate_step_name = "hook: emsdk activate latest (zig-pkg emsdk)";
+
+/// Pin `run`'s EM_CONFIG to `em_config` (the chosen emsdk's `.emscripten`), so
+/// an EM_CONFIG inherited from the environment can't point this emcc at another
+/// SDK's tools. `run` is a `*std.Build.Step.Run` (or anything with
+/// `setEnvironmentVariable`, so the tests can record the call).
+fn pinEmConfig(run: anytype, em_config: []const u8) void {
+    run.setEnvironmentVariable("EM_CONFIG", em_config);
 }
 
 /// Path to an emscripten tool (e.g. `emcc`). Prefers an external `EMSDK` (the
@@ -398,22 +519,57 @@ fn emToolPath(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, tool: []const u8, 
 /// a forward-slash join (NOT `b.pathJoin`) so the emsdk-relative sub-path stays
 /// portable — mirrors raylib's hook. The dep stays the default source; env is an
 /// override (no HookContext/EmLinkOptions ABI change — the dep is still passed in).
-fn emTool(b: *std.Build, emsdk: *std.Build.Dependency, tool: []const u8) std.Build.LazyPath {
+/// Also returns the EM_CONFIG of whichever emsdk was chosen (#161), and on the
+/// dependency fallback the activate step the link must wait on, if any (#163).
+fn emTool(b: *std.Build, emsdk_opt: ?*std.Build.Dependency, tool: []const u8, need_sysroot: bool) EmTool {
     const BuildFs = struct {
         b: *std.Build,
         fn exists(self: @This(), path: []const u8) bool {
             return if (std.Io.Dir.cwd().access(self.b.graph.io, path, .{})) |_| true else |_| false;
         }
     };
+    const fs: BuildFs = .{ .b = b };
     // Windows can't execute the extensionless wrapper — emscripten ships `emcc.bat`
     // there. Match the `.bat` suffix build.zig already appends, and use the SAME
     // resolved name for BOTH the managed probe and the dep fallback so they agree.
     const actual_tool = if (builtin.os.tag == .windows) b.fmt("{s}.bat", .{tool}) else tool;
-    switch (emToolPath(b.allocator, b.graph.environ_map.get("EMSDK"), actual_tool, BuildFs{ .b = b })) {
-        // `b.allocator` is the build arena, so the absolute slice outlives config.
-        .managed => |abs| return .{ .cwd_relative = abs },
-        .dep => return emsdk.path(b.fmt("upstream/emscripten/{s}", .{actual_tool})),
+    switch (emToolPath(b.allocator, b.graph.environ_map.get("EMSDK"), actual_tool, need_sysroot, fs)) {
+        // `b.allocator` is the build arena, so the absolute slices outlive config.
+        .managed => |m| return .{ .exe = .{ .cwd_relative = m.tool }, .em_config = m.em_config },
+        .dep => {
+            const emsdk = emsdk_opt orelse std.debug.panic(
+                "emsdk: no valid EMSDK (needs upstream/emscripten/{s}, .emscripten{s}) and no emsdk dependency was passed to emLinkStep",
+                .{ actual_tool, if (need_sysroot) " and upstream/emscripten/cache/sysroot/include" else "" },
+            );
+            // An env var needs a string now. A dependency's root is known at
+            // configure time (it is fetched before build() runs), so this
+            // resolves to the same path the lazy `exe` does at run time.
+            const em_config = emsdk.path(".emscripten").getPath(b);
+            return .{
+                .exe = emsdk.path(b.fmt("upstream/emscripten/{s}", .{actual_tool})),
+                .em_config = em_config,
+                .activate = if (needsDepActivation(.dep, fs.exists(em_config)))
+                    depActivateStep(b, emsdk)
+                else
+                    null,
+            };
+        },
     }
+}
+
+/// `emsdk activate latest` on the emsdk dependency (never `install`; see
+/// `needsDepActivation`). Windows runs `emsdk.bat`; elsewhere `bash emsdk`.
+fn depActivateStep(b: *std.Build, emsdk: *std.Build.Dependency) *std.Build.Step.Run {
+    const run = if (builtin.os.tag == .windows)
+        b.addSystemCommand(&.{emsdk.path("emsdk.bat").getPath(b)})
+    else blk: {
+        const r = b.addSystemCommand(&.{"bash"});
+        r.addArg(emsdk.path("emsdk").getPath(b));
+        break :blk r;
+    };
+    run.addArgs(&.{ "activate", "latest" });
+    run.setName(dep_activate_step_name);
+    return run;
 }
 
 /// Reconstruction of the emcc link step using only `std.Build` + the emsdk
@@ -427,7 +583,20 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
     // + `addFileArg` is the lazy-safe form; the step name "emcc" also hides the
     // resolved path in the log. Mirrors raylib's hook.
     const emcc = std.Build.Step.Run.create(b, "emcc");
-    emcc.addFileArg(emTool(b, options.emsdk, "emcc"));
+    const em = emTool(b, options.emsdk, "emcc", options.need_sysroot);
+    emcc.addFileArg(em.exe);
+    // Run under the SAME emsdk's `.emscripten` (#161): an inherited EM_CONFIG
+    // naming another SDK would otherwise redirect this emcc's tools.
+    pinEmConfig(emcc, em.em_config);
+    // Dependency fallback, not yet activated (#163): activate it before emcc runs.
+    // The activate step itself waits for `lib_main`, so it runs after every
+    // compile the game needs, including any other package's own emsdk
+    // install/activate on the same emsdk package (e.g. labelle-imgui's bgfx
+    // bridge), instead of racing them.
+    if (em.activate) |activate| {
+        activate.step.dependOn(&options.lib_main.step);
+        emcc.step.dependOn(&activate.step);
+    }
     if (options.optimize == .Debug) {
         emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1" });
     } else {
@@ -487,6 +656,85 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
     return install;
 }
 
+// ── One `labelle_android` per game (labelle-cli#405 D11) ───────────────────
+//
+// bgfx depends on labelle-android by url+hash. A project that also lists the
+// `android` provider plugin gets that package a second time: the assembler
+// wires every plugin as a `.path` dependency (`.labelle/deps/labelle-android`),
+// and Zig only reuses a dependency when the build root AND the options match.
+// A `.path` root never equals the hash-fetched root, even when both are the
+// same labelle-android release, so the build graph holds two `labelle_android`
+// modules. Each compiles the package's JNI C (`src/jni/*.c`), and the Android
+// `libgame.so` link fails with `duplicate symbol: labelle_android_*`.
+//
+// `post_wire` runs after the plugin's module is wired into the game, so the
+// android arm fixes the graph here: when the game root imports the `android`
+// plugin, every `labelle_android` import is pointed at the plugin's module.
+// bgfx's own copy is then unreachable from the `.so`, and its C never
+// compiles. The project's plugin pin decides the runtime version; it must stay
+// API-compatible with the labelle-android release this bgfx pins.
+
+/// The root-module import the assembler gives the provider plugin: a plugin's
+/// root alias is its `plugin.labelle` name (`build_files/build_zig.zig`,
+/// `.{ .name = "<plugin>", .module = plugin_<plugin>_mod }`), and
+/// labelle-android's plugin is named `android`.
+pub const android_plugin_alias = "android";
+
+/// A module is a `labelle_android` instance when its owning package exports it
+/// under that name (labelle-android's `build.zig`:
+/// `b.addModule("labelle_android", …)`). Identity, not a file-path match.
+fn isLabelleAndroidModule(m: *std.Build.Module) bool {
+    const exported = m.owner.modules.get("labelle_android") orelse return false;
+    return exported == m;
+}
+
+/// PURE graph rewrite behind `unifyLabelleAndroid`, generic over the module
+/// type so it is unit-testable without a `*std.Build` (`M` needs an
+/// `import_table: std.StringArrayHashMapUnmanaged(*M)`). The target is chosen
+/// explicitly: `root`'s import named `plugin_alias`, and only when that module
+/// is an instance. Every instance import reachable from `root` is then
+/// redirected to it. Returns the target, or null with the graph untouched when
+/// `root` has no such import (no provider plugin): an instance some other
+/// dependency happens to export never becomes the target. Only existing keys
+/// are rewritten: no import is added or removed.
+pub fn unifyOntoPluginInstance(
+    comptime M: type,
+    gpa: std.mem.Allocator,
+    root: *M,
+    plugin_alias: []const u8,
+    isInstance: *const fn (*M) bool,
+) ?*M {
+    const one = root.import_table.get(plugin_alias) orelse return null;
+    if (!isInstance(one)) return null;
+
+    var order: std.ArrayListUnmanaged(*M) = .empty;
+    defer order.deinit(gpa);
+    var seen: std.AutoHashMapUnmanaged(*M, void) = .empty;
+    defer seen.deinit(gpa);
+
+    seen.put(gpa, root, {}) catch @panic("OOM");
+    order.append(gpa, root) catch @panic("OOM");
+    var i: usize = 0;
+    while (i < order.items.len) : (i += 1) {
+        for (order.items[i].import_table.values()) |dep| {
+            const gop = seen.getOrPut(gpa, dep) catch @panic("OOM");
+            if (!gop.found_existing) order.append(gpa, dep) catch @panic("OOM");
+        }
+    }
+    for (order.items) |m| {
+        for (m.import_table.values()) |*dep| {
+            if (dep.* != one and isInstance(dep.*)) dep.* = one;
+        }
+    }
+    return one;
+}
+
+/// The android arm of `post_wire`: see the section comment above. Without the
+/// `android` plugin on the `.so` root nothing changes.
+pub fn unifyLabelleAndroid(b: *std.Build, ctx: HookContext) void {
+    _ = unifyOntoPluginInstance(std.Build.Module, b.allocator, ctx.root_module, android_plugin_alias, &isLabelleAndroidModule);
+}
+
 /// Runs AFTER the generic module/artifact/system-lib wiring, to supply the residual
 /// the manifest cannot express statically (design §2 residual (a) — the bgfx-Android
 /// NDK ordering). DESKTOP is empty (fully declarative — no residual). ANDROID adds
@@ -544,6 +792,10 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
             const libc_content = libcTxt(b.allocator, include_dir, sys_include_dir, crt_dir) catch @panic("OOM");
             const android_libc = b.addWriteFiles();
             ctx.root_artifact.setLibCFile(android_libc.add("android-libc.txt", libc_content));
+
+            // One JNI C copy in the `.so` when the project also lists the
+            // `android` provider plugin (labelle-cli#405 D11).
+            unifyLabelleAndroid(b, ctx);
         },
         .ios => @panic("bgfx backend has no ios platform"),
     }
@@ -560,6 +812,15 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
 // ============================================================================
 
 const testing = std.testing;
+
+test "emLinkStep typechecks against std.Build" {
+    // Zig analyzes a function body only when something references it; nothing
+    // in this file's tests referenced `emLinkStep`, so an API slip in the wasm
+    // link step (e.g. the #161 EM_CONFIG pin) compiled only in a generated game.
+    // Taking its address forces full analysis here. (`post_wire` can't be
+    // referenced: its `b.dependency` needs the build runner as the root.)
+    _ = &emLinkStep;
+}
 
 test "HOOK_ABI_VERSION is 2 (matches manifest_v2)" {
     try testing.expectEqual(@as(u8, 2), HOOK_ABI_VERSION);
@@ -703,10 +964,10 @@ test "emToolPath: EMSDK unset → emsdk dependency (behavior byte-identical to p
             return true; // even if "everything exists", a null env must NOT go managed
         }
     };
-    switch (emToolPath(testing.allocator, null, "emcc", Fs{})) {
+    switch (emToolPath(testing.allocator, null, "emcc", true, Fs{})) {
         .dep => {}, // no allocation happens on this path — nothing to free
         .managed => |p| {
-            testing.allocator.free(p);
+            p.deinit(testing.allocator);
             return error.TestUnexpectedManaged;
         },
     }
@@ -718,34 +979,36 @@ test "emToolPath: empty EMSDK → emsdk dependency (treated as unset)" {
             return true;
         }
     };
-    switch (emToolPath(testing.allocator, "", "emcc", Fs{})) {
+    switch (emToolPath(testing.allocator, "", "emcc", true, Fs{})) {
         .dep => {},
         .managed => |p| {
-            testing.allocator.free(p);
+            p.deinit(testing.allocator);
             return error.TestUnexpectedManaged;
         },
     }
 }
 
 test "emToolPath: EMSDK set + tool present on disk → managed absolute path" {
-    // Fake fs where only the managed emcc under the studio root exists — mirrors
-    // the cli#283 layout `<EMSDK>/upstream/emscripten/emcc`.
+    // Fake fs where only the managed emcc under the studio root (and its
+    // activation marker) exist — mirrors the cli#283 layout
+    // `<EMSDK>/upstream/emscripten/emcc` + `<EMSDK>/.emscripten`.
     const Fs = struct {
         fn exists(_: @This(), path: []const u8) bool {
-            return std.mem.endsWith(u8, path, "emcc") and
-                std.mem.indexOf(u8, path, "upstream") != null;
+            return (std.mem.endsWith(u8, path, "emcc") and
+                std.mem.indexOf(u8, path, "upstream") != null) or
+                std.mem.endsWith(u8, path, ".emscripten") or std.mem.endsWith(u8, path, "include");
         }
     };
     const root = "/home/u/.labelle/emsdk/4.0.0";
-    switch (emToolPath(testing.allocator, root, "emcc", Fs{})) {
+    switch (emToolPath(testing.allocator, root, "emcc", true, Fs{})) {
         .managed => |p| {
-            defer testing.allocator.free(p);
+            defer p.deinit(testing.allocator);
             const expected = try std.fs.path.join(
                 testing.allocator,
                 &.{ root, "upstream", "emscripten", "emcc" },
             );
             defer testing.allocator.free(expected);
-            try testing.expectEqualStrings(expected, p);
+            try testing.expectEqualStrings(expected, p.tool);
         },
         .dep => return error.TestExpectedManaged,
     }
@@ -756,14 +1019,15 @@ test "emToolPath: Windows tool name (emcc.bat) flows through → managed abs pat
     // probe/return that exact name (Windows can't exec the extensionless wrapper).
     const Fs = struct {
         fn exists(_: @This(), path: []const u8) bool {
-            return std.mem.endsWith(u8, path, "emcc.bat");
+            return std.mem.endsWith(u8, path, "emcc.bat") or
+                std.mem.endsWith(u8, path, ".emscripten") or std.mem.endsWith(u8, path, "include");
         }
     };
     const root = "C:/Users/u/.labelle/emsdk/4.0.0";
-    switch (emToolPath(testing.allocator, root, "emcc.bat", Fs{})) {
+    switch (emToolPath(testing.allocator, root, "emcc.bat", true, Fs{})) {
         .managed => |p| {
-            defer testing.allocator.free(p);
-            try testing.expect(std.mem.endsWith(u8, p, "emcc.bat"));
+            defer p.deinit(testing.allocator);
+            try testing.expect(std.mem.endsWith(u8, p.tool, "emcc.bat"));
         },
         .dep => return error.TestExpectedManaged,
     }
@@ -777,13 +1041,127 @@ test "emToolPath: EMSDK set but tool missing on disk → falls back to dep" {
             return false;
         }
     };
-    switch (emToolPath(testing.allocator, "/nonexistent/emsdk", "emcc", Fs{})) {
+    switch (emToolPath(testing.allocator, "/nonexistent/emsdk", "emcc", true, Fs{})) {
         .dep => {}, // helper frees the constructed path internally
         .managed => |p| {
-            testing.allocator.free(p);
+            p.deinit(testing.allocator);
             return error.TestUnexpectedManaged;
         },
     }
+}
+
+test "emToolPath: managed emcc runs under THAT emsdk's .emscripten (#161)" {
+    // An activated external emsdk. The EM_CONFIG must name the same root's
+    // `.emscripten`, never some other SDK's (e.g. an inherited EM_CONFIG).
+    const Fs = struct {
+        fn exists(_: @This(), path: []const u8) bool {
+            return std.mem.endsWith(u8, path, "emcc") or std.mem.endsWith(u8, path, ".emscripten") or
+                std.mem.endsWith(u8, path, "include");
+        }
+    };
+    const root = "/home/u/.cache/labelle-web/emsdk/v1/x86_64-linux/4.0.9-tag";
+    switch (emToolPath(testing.allocator, root, "emcc", true, Fs{})) {
+        .managed => |p| {
+            defer p.deinit(testing.allocator);
+            const expected = try std.fs.path.join(testing.allocator, &.{ root, ".emscripten" });
+            defer testing.allocator.free(expected);
+            try testing.expectEqualStrings(expected, p.em_config);
+            // Same emsdk for both: the config sits at the root of the emcc's emsdk.
+            try testing.expect(std.mem.startsWith(u8, p.tool, root));
+        },
+        .dep => return error.TestExpectedManaged,
+    }
+}
+
+test "emToolPath: emcc present but EMSDK not activated (no .emscripten) → dep (#161)" {
+    // Installed but not activated: pinning EM_CONFIG to a missing file would run
+    // emcc without its config, so this EMSDK is not usable (same rule as
+    // build.zig's emsdk_source.resolve).
+    const Fs = struct {
+        fn exists(_: @This(), path: []const u8) bool {
+            return std.mem.endsWith(u8, path, "emcc");
+        }
+    };
+    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", true, Fs{})) {
+        .dep => {}, // both constructed paths are freed internally
+        .managed => |p| {
+            p.deinit(testing.allocator);
+            return error.TestUnexpectedManaged;
+        },
+    }
+}
+
+test "emToolPath: emcc + .emscripten but no sysroot → dep, like build.zig (#163)" {
+    // build.zig compiles bgfx against the package emsdk for this EMSDK, so the
+    // link must not pick the external emcc (two SDKs in one module).
+    const Fs = struct {
+        fn exists(_: @This(), path: []const u8) bool {
+            return std.mem.endsWith(u8, path, "emcc") or std.mem.endsWith(u8, path, ".emscripten");
+        }
+    };
+    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", true, Fs{})) {
+        .dep => {},
+        .managed => |p| {
+            p.deinit(testing.allocator);
+            return error.TestUnexpectedManaged;
+        },
+    }
+}
+
+test "emToolPath: with the sysroot supplied elsewhere, emcc + .emscripten is enough (#163)" {
+    // build.zig's `-Demsdk_sysroot` makes emsdk_source.resolve accept an EMSDK
+    // without the default sysroot; the link must accept the same EMSDK.
+    const Fs = struct {
+        fn exists(_: @This(), path: []const u8) bool {
+            return std.mem.endsWith(u8, path, "emcc") or std.mem.endsWith(u8, path, ".emscripten");
+        }
+    };
+    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", false, Fs{})) {
+        .managed => |p| p.deinit(testing.allocator),
+        .dep => return error.TestExpectedManaged,
+    }
+}
+
+test "needsDepActivation: a valid EMSDK never activates (or downloads) the package (#163)" {
+    // The whole point of #159/#161: with a usable external EMSDK the package is
+    // never touched, whether or not it happens to be activated.
+    try testing.expect(!needsDepActivation(.managed, false));
+    try testing.expect(!needsDepActivation(.managed, true));
+}
+
+test "needsDepActivation: the dependency fallback activates only while unactivated (#163)" {
+    try testing.expect(needsDepActivation(.dep, false));
+    // Already activated (the assembler preflight's instructions were followed,
+    // or a cached package): no step, no extra work.
+    try testing.expect(!needsDepActivation(.dep, true));
+}
+
+test "the hook's activate step is named for the external-EMSDK CI gate (#163)" {
+    // CI's external job fails on any "(zig-pkg emsdk)" step, and the fallback
+    // job requires this exact name to have run. Keep both in sync.
+    try testing.expect(std.mem.indexOf(u8, dep_activate_step_name, "(zig-pkg emsdk)") != null);
+    try testing.expect(std.mem.indexOf(u8, dep_activate_step_name, "activate") != null);
+    try testing.expect(std.mem.indexOf(u8, dep_activate_step_name, "install") == null);
+}
+
+test "pinEmConfig: sets EM_CONFIG (and only it) on the emcc step (#161)" {
+    // Records what emLinkStep's Run step receives, so the test asserts the
+    // mechanism (the env var name + value), not only the path decision above.
+    const Recorder = struct {
+        calls: usize = 0,
+        key: []const u8 = "",
+        value: []const u8 = "",
+        pub fn setEnvironmentVariable(self: *@This(), key: []const u8, value: []const u8) void {
+            self.calls += 1;
+            self.key = key;
+            self.value = value;
+        }
+    };
+    var rec: Recorder = .{};
+    pinEmConfig(&rec, "/ext/emsdk/.emscripten");
+    try testing.expectEqual(@as(usize, 1), rec.calls);
+    try testing.expectEqualStrings("EM_CONFIG", rec.key);
+    try testing.expectEqualStrings("/ext/emsdk/.emscripten", rec.value);
 }
 
 test "selectGreatestValidNdk: a stray dir doesn't shadow a valid older NDK" {
@@ -794,4 +1172,127 @@ test "selectGreatestValidNdk: a stray dir doesn't shadow a valid older NDK" {
     };
     try testing.expectEqualStrings("26.1.10909125", selectGreatestValidNdk(&c1).?);
     try testing.expectEqual(@as(?[]const u8, null), selectGreatestValidNdk(&.{}));
+}
+
+// ── unifyOntoPluginInstance (labelle-cli#405 D11) ──────────────────────────
+
+const FakeMod = struct {
+    import_table: std.StringArrayHashMapUnmanaged(*FakeMod) = .empty,
+    is_instance: bool = false,
+
+    fn isInstance(m: *FakeMod) bool {
+        return m.is_instance;
+    }
+
+    fn import(m: *FakeMod, name: []const u8, dep: *FakeMod) !void {
+        try m.import_table.put(testing.allocator, name, dep);
+    }
+
+    fn deinit(m: *FakeMod) void {
+        m.import_table.deinit(testing.allocator);
+    }
+};
+
+fn unifyFake(root: *FakeMod) ?*FakeMod {
+    return unifyOntoPluginInstance(FakeMod, testing.allocator, root, android_plugin_alias, &FakeMod.isInstance);
+}
+
+test "unifyOntoPluginInstance: the root's `android` plugin replaces the backend's copy everywhere" {
+    // The generated android `.so`: root imports the plugin under its plugin
+    // name and the backend modules; bgfx's gfx/audio/android_app import bgfx's
+    // own `labelle_android`, one of them through a nested module.
+    var own: FakeMod = .{ .is_instance = true };
+    var plugin: FakeMod = .{ .is_instance = true };
+    var gfx: FakeMod = .{};
+    var audio: FakeMod = .{};
+    var app: FakeMod = .{};
+    var nested: FakeMod = .{};
+    var root: FakeMod = .{};
+    defer for ([_]*FakeMod{ &own, &plugin, &gfx, &audio, &app, &nested, &root }) |m| m.deinit();
+
+    try root.import("backend_gfx", &gfx);
+    try root.import("backend_audio", &audio);
+    try root.import("backend_app", &app);
+    try root.import("android", &plugin);
+    try gfx.import("labelle_android", &own);
+    try audio.import("labelle_android", &own);
+    try app.import("shell", &nested);
+    try nested.import("labelle_android", &own);
+
+    try testing.expectEqualStrings("android", android_plugin_alias);
+    try testing.expectEqual(@as(?*FakeMod, &plugin), unifyFake(&root));
+    try testing.expectEqual(&plugin, gfx.import_table.get("labelle_android").?);
+    try testing.expectEqual(&plugin, audio.import_table.get("labelle_android").?);
+    try testing.expectEqual(&plugin, nested.import_table.get("labelle_android").?);
+    try testing.expectEqual(&plugin, root.import_table.get("android").?);
+    // Rewrites only: no import added or dropped.
+    try testing.expectEqual(@as(usize, 4), root.import_table.count());
+    try testing.expectEqual(@as(usize, 1), gfx.import_table.count());
+}
+
+test "unifyOntoPluginInstance: no plugin on root → graph untouched" {
+    var own: FakeMod = .{ .is_instance = true };
+    var gfx: FakeMod = .{};
+    var root: FakeMod = .{};
+    defer for ([_]*FakeMod{ &own, &gfx, &root }) |m| m.deinit();
+
+    try root.import("backend_gfx", &gfx);
+    try gfx.import("labelle_android", &own);
+
+    try testing.expectEqual(@as(?*FakeMod, null), unifyFake(&root));
+    try testing.expectEqual(&own, gfx.import_table.get("labelle_android").?);
+}
+
+test "unifyOntoPluginInstance: an unrelated labelle_android elsewhere, no plugin import on root → no-op" {
+    // Another dependency exports its own labelle_android copy, reachable from
+    // the root, but the root does not import the `android` plugin. Neither
+    // copy may become the target.
+    var own: FakeMod = .{ .is_instance = true };
+    var other: FakeMod = .{ .is_instance = true };
+    var gfx: FakeMod = .{};
+    var some_plugin: FakeMod = .{};
+    var root: FakeMod = .{};
+    defer for ([_]*FakeMod{ &own, &other, &gfx, &some_plugin, &root }) |m| m.deinit();
+
+    try root.import("backend_gfx", &gfx);
+    try root.import("some_plugin", &some_plugin);
+    try gfx.import("labelle_android", &own);
+    try some_plugin.import("labelle_android", &other);
+
+    try testing.expectEqual(@as(?*FakeMod, null), unifyFake(&root));
+    try testing.expectEqual(&own, gfx.import_table.get("labelle_android").?);
+    try testing.expectEqual(&other, some_plugin.import_table.get("labelle_android").?);
+}
+
+test "unifyOntoPluginInstance: a root `android` import that is not an instance → no-op" {
+    var own: FakeMod = .{ .is_instance = true };
+    var not_la: FakeMod = .{};
+    var gfx: FakeMod = .{};
+    var root: FakeMod = .{};
+    defer for ([_]*FakeMod{ &own, &not_la, &gfx, &root }) |m| m.deinit();
+
+    try root.import("backend_gfx", &gfx);
+    try root.import("android", &not_la);
+    try gfx.import("labelle_android", &own);
+
+    try testing.expectEqual(@as(?*FakeMod, null), unifyFake(&root));
+    try testing.expectEqual(&own, gfx.import_table.get("labelle_android").?);
+}
+
+test "unifyOntoPluginInstance: a cyclic graph terminates" {
+    var own: FakeMod = .{ .is_instance = true };
+    var plugin: FakeMod = .{ .is_instance = true };
+    var a: FakeMod = .{};
+    var b: FakeMod = .{};
+    var root: FakeMod = .{};
+    defer for ([_]*FakeMod{ &own, &plugin, &a, &b, &root }) |m| m.deinit();
+
+    try root.import("a", &a);
+    try root.import("android", &plugin);
+    try a.import("b", &b);
+    try b.import("a", &a);
+    try b.import("labelle_android", &own);
+
+    try testing.expectEqual(@as(?*FakeMod, &plugin), unifyFake(&root));
+    try testing.expectEqual(&plugin, b.import_table.get("labelle_android").?);
 }

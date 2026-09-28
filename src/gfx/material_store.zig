@@ -7,7 +7,10 @@ const sm = core.shader_material;
 pub fn Store(comptime Driver: type) type {
     return struct {
         const Self = @This();
-        pub const capacity = 256;
+        /// Live material instances at once. Games attach one per lit room or
+        /// object, so a large colony needs thousands; a slot is 16 bytes and
+        /// an instance is only allocated while in use.
+        pub const capacity = 4096;
         pub const Parameter = struct {
             name: [sm.MAX_NAME + 1:0]u8 = @splat(0),
             len: usize = 0,

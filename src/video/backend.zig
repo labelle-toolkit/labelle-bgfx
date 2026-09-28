@@ -18,14 +18,19 @@
 //! AAudio path is already proven in the example + bgfx-Android app.
 
 const std = @import("std");
+const heap = @import("../gfx/heap.zig");
 const builtin = @import("builtin");
 const types = @import("../gfx/types.zig");
 const state = @import("../gfx/state.zig");
 const fit = @import("fit.zig");
 const player_mod = @import("player.zig");
 const desktop = @import("desktop.zig");
-const android = @import("android.zig");
-const android_audio = @import("android_audio.zig");
+// MediaCodec video + audio-track decode live in the labelle-android package
+// (#149 phase 1d): `android.VideoDecoder.openFd` / `android_audio.decodeTrack`
+// call sites are unchanged. The AAssetManager open below (fd from the apk)
+// stays here until the phase-2 "asset access" service.
+const android = @import("labelle_android").video;
+const android_audio = android;
 
 const is_android = builtin.abi == .android or builtin.abi == .androideabi;
 const Decoder = if (is_android) android.VideoDecoder else desktop.VideoDecoder;
@@ -56,7 +61,7 @@ pub const VideoBackend = struct {
     };
 
     var slots: [MAX]Slot = [_]Slot{.{}} ** MAX;
-    const alloc = std.heap.page_allocator;
+    const alloc = heap.allocator;
 
     fn freeSlot() ?usize {
         for (&slots, 0..) |*s, i| if (!s.used) return i;

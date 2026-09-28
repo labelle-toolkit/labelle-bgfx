@@ -1,9 +1,16 @@
 .{
     .fingerprint = 0x9cd73c2cb5d6d1eb,
     .name = .labelle_bgfx,
-    .version = "0.25.1",
+    .version = "0.30.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        // Browser persistent storage (IndexedDB bridge), wasm-only (lazy).
+        // Pinned to the labelle-web v0.1.0 release tag.
+        .labelle_web = .{
+            .url = "https://github.com/labelle-toolkit/labelle-web/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "labelle_web-0.1.0-rzifm04rAAANjWLNPm7v1g2i2zV8NOs5UJ-CXZIKyR0p",
+            .lazy = true,
+        },
         // Pinned to specific commits — same class of fix as #146.
         // Bumping either dep requires `zig fetch <new-url>` to get
         // the new hash, then updating the url and hash together.
@@ -30,15 +37,17 @@
         // `-Dvideo` (default off, so no VideoToolbox/CoreMedia/CoreVideo dependency), and
         // raises the x86 CPU baseline to SSE4.2 because bx's simd_t.h now
         // requires it. The screen_shot vtable fix below is still IN this commit.
-        // Pinned to ba2786f, the merge of labelle-toolkit/zbgfx#1 (reviewed).
+        // Pinned to eb71fd4 (labelle-toolkit/zbgfx#2): the zbgfx#1 API 161 vendor
+        // plus the web ASTC fix: the emscripten format table lists the full
+        // LDR set, so 8x8 samples natively on WebGL (#147).
         //
         // Host note: the fork previously lived at `codeberg.org/apotema/zbgfx`
         // (commit 0b229b7). It moved to the labelle-toolkit org on GitHub so it
         // sits with the rest of the toolkit and so upstreaming is a normal PR;
         // the Codeberg copy is stale and should not be repinned.
         .zbgfx = .{
-            .url = "https://github.com/labelle-toolkit/zbgfx/archive/ba2786f11b8042afc2f90e10b2a6432bd24befae.tar.gz",
-            .hash = "zbgfx-0.12.0-Sm4IxMnIDAdzAesVbziV41cUrt0j8cBIG8xGe7UL1fpY",
+            .url = "https://github.com/labelle-toolkit/zbgfx/archive/eb71fd4b0339cbad09c755eea52091c3105ac719.tar.gz",
+            .hash = "zbgfx-0.12.0-Sm4IxN_KDAf834PtToJwIjR0-zzWnYOjJWZAtPUwhAHZ",
         },
         .zglfw = .{
             .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",
@@ -53,6 +62,35 @@
         .labelle_android_gamepad = .{
             .url = "https://github.com/labelle-toolkit/labelle-android-gamepad/archive/refs/tags/v0.1.0.tar.gz",
             .hash = "labelle_android_gamepad-0.1.0-aniuyr7OAADukHTeqRqavrEvsUDAutllmC2KJDek0Ox9",
+        },
+        // Shared Android platform services (labelle-bgfx#149 phase 1): the
+        // launch-intent extras → env mapping, the `android:debuggable` query,
+        // the stuck-window relayout (JNI C compiled INSIDE the package — it
+        // owns the NDK sysroot helper), the AAudio output device (#306; the
+        // package links `libaaudio`) and the MediaCodec video + audio-track
+        // decoders with the shared `yuv`/`planes` helpers (FP#549; links
+        // `libmediandk`). One named module, `labelle_android`, imported by
+        // `gfx`, `audio` and `android_app`. Eager (not lazy): `build.zig`
+        // `@import`s its build helpers (`resolveNdk` / `addAndroidSysroot` /
+        // `nativeAppGlueDir`, phase 1e) at the top level, which resolves the
+        // package on every build — desktop and wasm included.
+        // Pinned to the labelle-android v0.2.0 release tag: the release that
+        // also ships the `android` CLI provider (labelle-cli#405). `src/` and
+        // the build helpers above are unchanged from v0.1.1; v0.2.0 only adds
+        // the provider host tool (`tools/`, `install-provider`). NEVER a
+        // committed `.path`: `.labelle/deps/labelle-bgfx` is a copy, so a
+        // relative path would not resolve from an assembled game.
+        //
+        // A project that lists the `android` provider plugin gets the same
+        // package a second time, as a `.path` plugin dep. Zig does not merge a
+        // `.path` dep with this url+hash dep, even at the same release, so two
+        // copies of the JNI C would reach `libgame.so` (labelle-cli#405 D11).
+        // `backend.hook.zig` `unifyLabelleAndroid` points this backend's
+        // `labelle_android` imports at the plugin's module; CI's
+        // test/android-provider fixture checks the link.
+        .labelle_android = .{
+            .url = "https://github.com/labelle-toolkit/labelle-android/archive/refs/tags/v0.2.0.tar.gz",
+            .hash = "labelle_android-0.2.0-sErgQhOvDgDBEqwMU4h1VZY1tTVpsUnnw1qXaabKT438",
         },
         // Shared windowless-SDL desktop gamepad source (core#28). In-tree
         // sub-package shared with the raylib and sokol desktop backends via a
@@ -78,23 +116,17 @@
         // (`window_contract.zig` - width/height/frameDuration/requestQuit), the
         // unification target for the beginDrawing->beginFrame / getScreenWidth->
         // width / windowShouldClose->shouldQuit renames in this backend.
-        // FLOOR IS NOW the game-owned shader-material contract: `shader_material.zig`
-        // (Descriptor/Parameter/TextureBinding/Id + the validation helpers) and
-        // `backend_contract.Material.shader`, which `src/gfx/shader_material.zig`,
+        // FLOOR IS v2.1.0: the game-owned shader-material contract
+        // (`shader_material.zig`: Descriptor/Parameter/TextureBinding/Id and the
+        // validation helpers, `backend_contract.Material.shader`) that
         // `src/gfx/material_store.zig`, `src/gfx/shader_binary.zig` and
-        // `texture.drawTextureProMaterial` all require. v1.32.0 has neither and
-        // will not compile.
-        //
-        // is not released yet. This is a real, hash-verified pin (same shape as
-        // the zbgfx pin above), NOT a path override, so CI resolves it; but it
-        // MUST be replaced with the release tag once core#79 merges and ships:
-        //   .url  = ".../labelle-core/archive/refs/tags/v1.33.0.tar.gz"
-        // Merge order for this stack is core#79 → gfx#361 → engine#882 → this PR.
-        // For local integration against a working copy of core, prefer
+        // `texture.drawTextureProMaterial` require, plus `Blend.modulate2x`,
+        // which `programs.materialBlendState` switches on. Older cores do not
+        // compile. For local integration against a working copy of core, prefer
         // `-Dcore-source=/path/to/labelle-core/src/root.zig`.
         .labelle_core = .{
-            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v2.0.0.tar.gz",
-            .hash = "labelle_core-2.0.0-OauRcPGlBwCXfrDJneAcTZoHhXiFnsO3pCCBA3L0_Nup",
+            .url = "https://github.com/labelle-toolkit/labelle-core/archive/refs/tags/v2.1.0.tar.gz",
+            .hash = "labelle_core-2.1.0-OauRcEmpBwB-EUz284qa13cc2A5eu3u1L1avd_FDF0JF",
         },
         // Shared audio engine (pluggable-backends RFC, Phase 2). The bgfx
         // backend's `src/audio.zig` collapses its duplicated WAV decode + PCM
@@ -114,10 +146,13 @@
         // libc headers for wasm32-emscripten). Same pin the sokol + raylib
         // backends use — copied verbatim from labelle-raylib's build.zig.zon so
         // all three web backends resolve one shared emsdk. Only fetched on a wasm
-        // build (`b.lazyDependency`); desktop/android never pull it.
+        // build (`b.lazyDependency`); desktop/android never pull it, and nor
+        // does a wasm build with a valid `EMSDK` set (labelle-bgfx#159, see
+        // emsdk_source.zig): that build takes the sysroot + emcc from EMSDK.
         .emsdk = .{
             .url = "git+https://github.com/emscripten-core/emsdk?ref=4.0.9#3bcf1dcd01f040f370e10fe673a092d9ed79ebb5",
             .hash = "N-V-__8AAJl1DwBezhYo_VE6f53mPVm00R-Fk28NPW7P14EQ",
+            .lazy = true,
         },
         .labelle_gfx = .{
             .url = "https://github.com/labelle-toolkit/labelle-gfx/archive/refs/tags/v1.29.2.tar.gz",
@@ -134,6 +169,10 @@
         // stages the hook it names; both must ship with the package.
         "backend.manifest.v2.zon",
         "backend.hook.zig",
+        // Imported by build.zig: which emsdk a wasm build uses (#159).
+        "emsdk_source.zig",
+        // Imported by build.zig: SDL2 link + missing-SDL2 message (cli#471 S2).
+        "sdl2_link.zig",
         "build_fragments",
         "templates",
         // Build inputs:

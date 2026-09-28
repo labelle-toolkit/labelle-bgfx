@@ -51,6 +51,26 @@ pub const STATE_BLEND_ADD: u64 = stateBlendFuncSeparate(
     bgfx.StateFlags_BlendInvSrcAlpha,
 );
 
+/// Modulate 2x (colour `DstColor, SrcColor`): dst * 2 * src per channel, for
+/// shader-material overlays that darken AND brighten what is under them (a
+/// src of 0.5 leaves the pixel unchanged). Alpha `Zero, One` keeps the
+/// destination's coverage, so an overlay never changes it.
+pub const STATE_BLEND_MODULATE2X: u64 = stateBlendFuncSeparate(
+    bgfx.StateFlags_BlendDstColor,
+    bgfx.StateFlags_BlendSrcColor,
+    bgfx.StateFlags_BlendZero,
+    bgfx.StateFlags_BlendOne,
+);
+
+/// The blend state a shader material's `blend` asks for.
+pub fn materialBlendState(blend: anytype) u64 {
+    return switch (blend) {
+        .alpha => STATE_BLEND_ALPHA,
+        .additive => STATE_BLEND_ADD,
+        .modulate2x => STATE_BLEND_MODULATE2X,
+    };
+}
+
 // ── Premultiplied-alpha blend states for `drawMesh` (labelle-gfx#290) ──
 // Spine's default export uses a premultiplied-alpha (PMA) atlas, so the four
 // Spine blend modes map to PMA blend funcs (src factor is ONE / DST_COLOR, not
@@ -127,6 +147,11 @@ var yuv_program: bgfx.ProgramHandle = .{ .idx = std.math.maxInt(u16) };
 var s_texY_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var s_texU_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var s_texV_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+/// `fs_yuv`'s colour-matrix uniforms (labelle-bgfx#155): `(Y offset, Y gain,
+/// chroma offset, 0)` and `(V->R, U->G, V->G, U->B)`, set per draw from the
+/// stream's colour metadata (`video/yuv_uniform.zig`).
+var u_yuvOffsetGain_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
+var u_yuvCoeffs_uniform: bgfx.UniformHandle = .{ .idx = std.math.maxInt(u16) };
 var yuv_initialized: bool = false;
 /// Set when `initYuvProgram` has tried and failed (e.g. `fs_yuv` won't link on
 /// this driver). Latches the failure so `ensureYuvProgram` gives up after ONE
@@ -299,10 +324,13 @@ fn initYuvProgram() void {
     s_texY_uniform = bgfx.createUniform("s_texY", .Sampler, 1);
     s_texU_uniform = bgfx.createUniform("s_texU", .Sampler, 1);
     s_texV_uniform = bgfx.createUniform("s_texV", .Sampler, 1);
+    u_yuvOffsetGain_uniform = bgfx.createUniform("u_yuvOffsetGain", .Vec4, 1);
+    u_yuvCoeffs_uniform = bgfx.createUniform("u_yuvCoeffs", .Vec4, 1);
     if (!isValidHandle(s_texY_uniform.idx) or !isValidHandle(s_texU_uniform.idx) or
-        !isValidHandle(s_texV_uniform.idx))
+        !isValidHandle(s_texV_uniform.idx) or !isValidHandle(u_yuvOffsetGain_uniform.idx) or
+        !isValidHandle(u_yuvCoeffs_uniform.idx))
     {
-        std.log.err("bgfx: failed to create YUV sampler uniforms; falling back to CPU YUV path", .{});
+        std.log.err("bgfx: failed to create YUV sampler/matrix uniforms; falling back to CPU YUV path", .{});
         // Tear down the whole group so we never cache a half-initialized program
         // (and never leak the program / the uniforms that DID create). Latch
         // yuv_failed like the other failure paths so we don't retry every frame.
@@ -311,9 +339,13 @@ fn initYuvProgram() void {
         if (isValidHandle(s_texY_uniform.idx)) bgfx.destroyUniform(s_texY_uniform);
         if (isValidHandle(s_texU_uniform.idx)) bgfx.destroyUniform(s_texU_uniform);
         if (isValidHandle(s_texV_uniform.idx)) bgfx.destroyUniform(s_texV_uniform);
+        if (isValidHandle(u_yuvOffsetGain_uniform.idx)) bgfx.destroyUniform(u_yuvOffsetGain_uniform);
+        if (isValidHandle(u_yuvCoeffs_uniform.idx)) bgfx.destroyUniform(u_yuvCoeffs_uniform);
         s_texY_uniform = .{ .idx = std.math.maxInt(u16) };
         s_texU_uniform = .{ .idx = std.math.maxInt(u16) };
         s_texV_uniform = .{ .idx = std.math.maxInt(u16) };
+        u_yuvOffsetGain_uniform = .{ .idx = std.math.maxInt(u16) };
+        u_yuvCoeffs_uniform = .{ .idx = std.math.maxInt(u16) };
         yuv_failed = true;
         return;
     }
@@ -332,7 +364,8 @@ pub fn ensureYuvProgram() bool {
         initYuvProgram();
     }
     return yuv_initialized and isValidProgram(yuv_program) and
-        isValidHandle(s_texY_uniform.idx) and isValidHandle(s_texU_uniform.idx) and isValidHandle(s_texV_uniform.idx);
+        isValidHandle(s_texY_uniform.idx) and isValidHandle(s_texU_uniform.idx) and isValidHandle(s_texV_uniform.idx) and
+        isValidHandle(u_yuvOffsetGain_uniform.idx) and isValidHandle(u_yuvCoeffs_uniform.idx);
 }
 
 // ── Material programs (curated per-draw effects, labelle-gfx#305) ──────────────
@@ -813,6 +846,18 @@ fn fullscreenQuad(flip_v: bool) [6]PosTexColorVertex {
 // negative-height flip. Compile-checked in the `gfx_mod` test graph. (Only the
 // Metal, top-left, `flip_v == false` path is golden-covered on CI — there is no
 // display-GL runner — so this pins the flip's INTENT alongside the code comment.)
+test "modulate2x multiplies colour by 2*src and keeps destination alpha" {
+    const field = STATE_BLEND_MODULATE2X >> bgfx.StateFlags_BlendShift;
+    const rgb = (bgfx.StateFlags_BlendDstColor | (bgfx.StateFlags_BlendSrcColor << 4)) >> bgfx.StateFlags_BlendShift;
+    const alpha = (bgfx.StateFlags_BlendZero | (bgfx.StateFlags_BlendOne << 4)) >> bgfx.StateFlags_BlendShift;
+    try std.testing.expectEqual(rgb, field & 0xff);
+    try std.testing.expectEqual(alpha, (field >> 8) & 0xff);
+    const Blend = enum { alpha, additive, modulate2x };
+    try std.testing.expectEqual(STATE_BLEND_ALPHA, materialBlendState(Blend.alpha));
+    try std.testing.expectEqual(STATE_BLEND_ADD, materialBlendState(Blend.additive));
+    try std.testing.expectEqual(STATE_BLEND_MODULATE2X, materialBlendState(Blend.modulate2x));
+}
+
 test "straight-alpha states composite alpha as coverage, not srcA² (web canvas stays opaque)" {
     // Alpha factors live in bits 8..15 of the blend-func field: src | dst << 4.
     const alpha_bits = struct {
@@ -994,6 +1039,14 @@ pub fn shutdownPrograms() void {
     if (isValidHandle(s_texV_uniform.idx)) {
         bgfx.destroyUniform(s_texV_uniform);
         s_texV_uniform = .{ .idx = std.math.maxInt(u16) };
+    }
+    if (isValidHandle(u_yuvOffsetGain_uniform.idx)) {
+        bgfx.destroyUniform(u_yuvOffsetGain_uniform);
+        u_yuvOffsetGain_uniform = .{ .idx = std.math.maxInt(u16) };
+    }
+    if (isValidHandle(u_yuvCoeffs_uniform.idx)) {
+        bgfx.destroyUniform(u_yuvCoeffs_uniform);
+        u_yuvCoeffs_uniform = .{ .idx = std.math.maxInt(u16) };
     }
     yuv_initialized = false;
     // Give the program one honest re-create attempt after a surface cycle.
@@ -1263,6 +1316,10 @@ pub fn submitYuvTriangles(
     y_handle: bgfx.TextureHandle,
     u_handle: bgfx.TextureHandle,
     v_handle: bgfx.TextureHandle,
+    /// `fs_yuv`'s matrix: `[0]` = u_yuvOffsetGain, `[1]` = u_yuvCoeffs
+    /// (`video/yuv_uniform.Params`; BT.601 limited unless the stream says
+    /// otherwise, labelle-bgfx#155).
+    yuv_params: *const [2][4]f32,
 ) void {
     if (!ensureYuvProgram()) return;
     ensureLayouts();
@@ -1292,6 +1349,8 @@ pub fn submitYuvTriangles(
     bgfx.setTexture(0, s_texY_uniform, y_handle, 0);
     bgfx.setTexture(1, s_texU_uniform, u_handle, 0);
     bgfx.setTexture(2, s_texV_uniform, v_handle, 0);
+    bgfx.setUniform(u_yuvOffsetGain_uniform, &yuv_params[0], 1);
+    bgfx.setUniform(u_yuvCoeffs_uniform, &yuv_params[1], 1);
     bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | STATE_BLEND_ALPHA, 0);
     submitProgram(active_view, yuv_program);
 }
@@ -1315,8 +1374,7 @@ pub fn submitShaderMaterialTriangles(vertices: []const PosTexColorVertex, textur
     bgfx.setViewTransform(active_view, &identity, &identity);
     bgfx.setTransientVertexBuffer(0, &tvb, 0, num);
     materials.bind(instance, texture_handle, rect);
-    const blend = if (instance.blend == .alpha) STATE_BLEND_ALPHA else STATE_BLEND_ADD;
-    bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | blend, 0);
+    bgfx.setState(bgfx.StateFlags_WriteRgb | bgfx.StateFlags_WriteA | materialBlendState(instance.blend), 0);
     submitProgram(active_view, .{ .idx = instance.program.handle });
     return true;
 }

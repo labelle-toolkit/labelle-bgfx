@@ -26,6 +26,7 @@
 /// `is_android` switch as before, so `miniaudio.h` is never seen on Android and
 /// the AAudio externs are never seen on desktop.
 const std = @import("std");
+const heap = @import("audio_heap.zig");
 const builtin = @import("builtin");
 const labelle_audio = @import("labelle-audio");
 
@@ -38,17 +39,27 @@ const is_android = builtin.target.os.tag == .linux and
 const is_wasm = builtin.target.cpu.arch.isWasm();
 
 // Output device, selected per target — the shared `DeviceSink` the mixer
-// drives. On Android it's the AAudio device (#306); on desktop it's the
-// miniaudio device. Both expose `ensureStarted`/`stop`/`framesMixed`, so they
-// satisfy `labelle_audio.DeviceSink`. `if (is_android)` is comptime, so only
-// the taken branch is analyzed — the desktop miniaudio `@cImport` is never seen
-// on Android, and the AAudio externs are never seen on desktop.
+// drives. On Android it's labelle-android's AAudio device (#306, moved there
+// in #149 phase 1c); on desktop it's the miniaudio device. Both expose
+// `ensureStarted`/`stop`/`framesMixed`, so they satisfy
+// `labelle_audio.DeviceSink`. `if (is_android)` is comptime, so only the taken
+// branch is analyzed — the desktop miniaudio `@cImport` is never seen on
+// Android, and the `labelle_android` import (and its AAudio externs) is never
+// seen on desktop — the same pattern as `zglfw` in `window.zig`.
 const device_backend = if (is_android)
-    @import("audio_device_android.zig")
+    @import("labelle_android").aaudio
 else if (is_wasm)
     labelle_audio.NullSink
 else
     @import("audio_device.zig");
+
+// labelle-android declares the device's `MixCallback` structurally (it has no
+// labelle-audio dependency). Function-pointer types are structural in Zig, so
+// the two are one type — assert it, so a drift in either package is a compile
+// error at the `Mixer(...)` instantiation site rather than a silent mismatch.
+comptime {
+    if (is_android) std.debug.assert(@import("labelle_android").aaudio.MixCallback == labelle_audio.MixCallback);
+}
 
 /// The shared PCM mixer, parameterized by bgfx's OS device as the `DeviceSink`.
 /// Owns WAV decode + slot arrays + the spinlock + the full AudioInterface
@@ -108,7 +119,7 @@ extern "c" fn ftell(stream: *std.c.FILE) c_long;
 /// null on any IO error or short read (a short `fread` can occur on EOF
 /// mid-read without setting an error flag, so we compare against the full
 /// requested size, see PR #227). Caller owns the returned slice and frees it
-/// via `std.heap.page_allocator`.
+/// via `heap.allocator`.
 fn readFileBytes(path: [:0]const u8) ?[]u8 {
     const file = std.c.fopen(path.ptr, "rb") orelse return null;
     defer _ = std.c.fclose(file);
@@ -119,7 +130,7 @@ fn readFileBytes(path: [:0]const u8) ?[]u8 {
     if (fseek(file, 0, SEEK_SET) != 0) return null;
     const file_size: usize = @intCast(file_size_signed);
 
-    const allocator = std.heap.page_allocator;
+    const allocator = heap.allocator;
     const data = allocator.alloc(u8, file_size) catch return null;
 
     const bytes_read = std.c.fread(data.ptr, 1, file_size, file);
@@ -138,7 +149,7 @@ fn readFileBytes(path: [:0]const u8) ?[]u8 {
 /// decode + the PCM). Returns the sound id, or 0 on failure.
 pub fn loadSound(path: [:0]const u8) u32 {
     const bytes = readFileBytes(path) orelse return 0;
-    defer std.heap.page_allocator.free(bytes);
+    defer heap.allocator.free(bytes);
     return Audio.loadSoundFromMemory(bytes);
 }
 
@@ -168,12 +179,12 @@ pub fn setSoundVolume(id: u32, volume: f32) void {
 /// libc file-read shim as `loadSound`. Returns the music id, or 0 on failure.
 pub fn loadMusic(path: [:0]const u8) u32 {
     const bytes = readFileBytes(path) orelse return 0;
-    defer std.heap.page_allocator.free(bytes);
+    defer heap.allocator.free(bytes);
     return Audio.loadMusicFromMemory(bytes);
 }
 
 /// Register an already-decoded interleaved PCM_16 buffer as a looping music
-/// stream. Used by the Android audio-track decoder (`video/android_audio.zig`)
+/// stream. Used by the Android audio-track decoder (`labelle_android.video.decodeTrack`)
 /// to feed decoded video audio into the mixer. `sample_rate` should be the
 /// device rate (48000): the mixer does not resample. Public signature keeps the
 /// `u16` channels arg bgfx exposed; the shared mixer takes `u8`, so we narrow.

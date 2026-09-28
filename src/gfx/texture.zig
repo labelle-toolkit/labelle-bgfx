@@ -5,6 +5,7 @@
 /// `destroyAllTextures` here on teardown so the bgfx handles get released
 /// in the same pass as the shader uniforms.
 const std = @import("std");
+const heap = @import("heap.zig");
 const bgfx = @import("zbgfx").bgfx;
 const core = @import("labelle-core");
 const types = @import("types.zig");
@@ -127,7 +128,7 @@ pub fn destroyAllTextures() void {
             texture_handles[i] = .{ .idx = std.math.maxInt(u16) };
         }
         if (texture_pixel_data[i]) |px| {
-            std.heap.page_allocator.free(px);
+            heap.allocator.free(px);
             texture_pixel_data[i] = null;
         }
     }
@@ -160,7 +161,7 @@ pub fn loadTexture(path: [:0]const u8) !Texture {
     if (fseek(file, 0, SEEK_SET) != 0) return error.LoadFailed;
     const file_size: usize = @intCast(file_size_signed);
 
-    const allocator = std.heap.page_allocator;
+    const allocator = heap.allocator;
     const data = allocator.alloc(u8, file_size) catch return error.LoadFailed;
     defer allocator.free(data);
 
@@ -362,7 +363,28 @@ fn astcFormat(block_x: u8, block_y: u8) ?bgfx.TextureFormat {
 }
 
 /// Everything needed to upload a validated 2D ASTC blob.
-const AstcUpload = struct { fmt: bgfx.TextureFormat, width: u16, height: u16, blocks: []const u8 };
+const AstcUpload = struct { fmt: bgfx.TextureFormat, block_x: u8, block_y: u8, width: u16, height: u16, blocks: []const u8 };
+
+comptime {
+    // astc.zig keeps bgfx's caps bits as plain constants so its decision is
+    // host-testable; fail the build if they ever drift from the binding.
+    std.debug.assert(astc.caps_texture_2d == bgfx.CapsFormatFlags_Texture2D);
+    std.debug.assert(astc.caps_texture_2d_emulated == bgfx.CapsFormatFlags_Texture2DEmulated);
+}
+
+/// Can the running renderer sample this ASTC format natively? Reads bgfx's
+/// caps, so it is only meaningful on the render thread after `bgfx.init`
+/// (before that there are no caps, and the answer is `.none`).
+/// ASTC formats already reported as refused (bit = `TextureFormat` value).
+var refused_formats: u128 = 0;
+
+fn runtimeSupport(fmt: bgfx.TextureFormat) astc.Support {
+    const raw = bgfx.getCaps();
+    if (raw == null) return .none;
+    const caps: *const bgfx.Caps = @ptrCast(raw);
+    const index: usize = @intCast(@intFromEnum(fmt));
+    return astc.support(caps.formats[index]);
+}
 
 /// Validate an ASTC blob for a 2D bgfx upload, or null if we can't take it
 /// as-is: not ASTC, malformed/truncated, 3D, an unsupported block size, or
@@ -374,7 +396,20 @@ fn validateAstc(data: []const u8) ?AstcUpload {
     const fmt = astcFormat(hdr.block_x, hdr.block_y) orelse return null;
     const w = std.math.cast(u16, hdr.width) orelse return null;
     const h = std.math.cast(u16, hdr.height) orelse return null;
-    return .{ .fmt = fmt, .width = w, .height = h, .blocks = hdr.blocks };
+    return .{ .fmt = fmt, .block_x = hdr.block_x, .block_y = hdr.block_y, .width = w, .height = h, .blocks = hdr.blocks };
+}
+
+/// True if `data` is an ASTC blob the RUNNING renderer samples natively, so
+/// `uploadCompressed` will accept it (labelle-bgfx#134). Generated code uses
+/// this to choose between an atlas's `.astc` and its `.png` fallback on web,
+/// where ASTC support depends on the browser and GPU.
+///
+/// Reads bgfx's caps, so it is only meaningful after `bgfx.init` (it returns
+/// false before, which picks the safe PNG). `isCompressed` is the other
+/// question: "is this ASTC at all", which is answerable on any thread.
+pub fn compressedSupported(data: []const u8) bool {
+    const info = validateAstc(data) orelse return false;
+    return runtimeSupport(info.fmt) == .native;
 }
 
 /// True if `data` is a GPU-compressed blob this backend can upload as-is.
@@ -395,6 +430,35 @@ pub fn compressedDims(data: []const u8) ?struct { width: u32, height: u32 } {
 /// buffer can be freed immediately after this returns.
 pub fn uploadCompressed(data: []const u8) !Texture {
     const info = validateAstc(data) orelse return error.LoadFailed;
+    // #76: `createTexture2D` accepts a format the GPU can't sample and never
+    // fails, so check first. Refusing here marks the asset failed, with the
+    // reason in the log, instead of drawing a checkerboard (or, on wasm,
+    // crashing in bgfx's CPU conversion). Checked at upload, not in
+    // `validateAstc`: `isCompressed`/`compressedDims` also run on the asset
+    // worker, where bgfx's caps may not exist yet.
+    switch (runtimeSupport(info.fmt)) {
+        .native => {},
+        .emulated_only, .none => |why| {
+            // Once per format: callers retry failed loads (a loading scene
+            // re-requests every frame), and the reason never changes.
+            const bit = @as(u128, 1) << @intCast(@intFromEnum(info.fmt));
+            if (refused_formats & bit == 0) {
+                // No ASTC at all (a desktop GPU, or a browser without
+                // WEBGL_compressed_texture_astc) needs a different fix than
+                // one unsupported block size.
+                const hint = if (runtimeSupport(.ASTC4x4) == .native)
+                    "Re-encode it at 4x4, which this renderer samples natively"
+                else
+                    "This renderer has no native ASTC support at all: ship PNG for this platform (`asset_compression`)";
+                std.log.err("bgfx: ASTC {d}x{d} texture ({d}x{d}) refused: the {s} renderer can't sample this block size natively ({s}). {s} (labelle-bgfx#76).", .{
+                    info.block_x,                     info.block_y,  info.width, info.height,
+                    @tagName(bgfx.getRendererType()), @tagName(why), hint,
+                });
+            }
+            refused_formats |= bit;
+            return error.LoadFailed;
+        },
+    }
     const id = findFreeTextureSlot() orelse return error.LoadFailed;
 
     const mem = bgfx.copy(info.blocks.ptr, @intCast(info.blocks.len));
@@ -427,7 +491,7 @@ pub fn unloadTexture(texture: Texture) void {
             texture_handles[texture.id.toInt()] = .{ .idx = std.math.maxInt(u16) };
         }
         if (texture_pixel_data[texture.id.toInt()]) |px| {
-            std.heap.page_allocator.free(px);
+            heap.allocator.free(px);
             texture_pixel_data[texture.id.toInt()] = null;
         }
     }
@@ -818,7 +882,9 @@ pub fn unloadPlaneTextures(pt: PlaneTextures) void {
 /// Draw the YUV video frame: same quad geometry as `drawTexturePro`, but binds
 /// the three plane textures to the `s_texY/U/V` samplers and submits with the
 /// `yuv_program` (GPU YUV→RGB). `source` is in luma (full-res) pixels.
-pub fn drawPlanesPro(pt: PlaneTextures, source: Rectangle, dest: Rectangle, origin: Vector2, rotation: f32, tint: Color) void {
+/// `yuv_params` is the stream's colour matrix as `fs_yuv` uniforms
+/// (`video/yuv_uniform.Params`, labelle-bgfx#155).
+pub fn drawPlanesPro(pt: PlaneTextures, source: Rectangle, dest: Rectangle, origin: Vector2, rotation: f32, tint: Color, yuv_params: *const [2][4]f32) void {
     if (pt.y.id.toInt() >= MAX_TEXTURES or pt.u.id.toInt() >= MAX_TEXTURES or pt.v.id.toInt() >= MAX_TEXTURES) return;
     const yh = texture_handles[pt.y.id.toInt()];
     const uh = texture_handles[pt.u.id.toInt()];
@@ -826,7 +892,7 @@ pub fn drawPlanesPro(pt: PlaneTextures, source: Rectangle, dest: Rectangle, orig
     if (yh.idx == std.math.maxInt(u16) or uh.idx == std.math.maxInt(u16) or vh.idx == std.math.maxInt(u16)) return;
 
     const vertices = buildQuadVertices(pt.width, pt.height, source, dest, origin, rotation, tint.toAbgr());
-    programs.submitYuvTriangles(&vertices, yh, uh, vh);
+    programs.submitYuvTriangles(&vertices, yh, uh, vh, yuv_params);
 }
 
 // ── Image decoding helpers ─────────────────────────────────────────────

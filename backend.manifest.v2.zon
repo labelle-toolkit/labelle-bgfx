@@ -187,7 +187,17 @@
             // (design §3 merge contract) — matching the enum `backend_bgfx_android`,
             // which forwards only `gui_enabled` (no gamepad flags on android).
             .dep_options = .{},
-            .package = .{ .apk = .{ .manifest = "src/video/apk/AndroidManifest.xml" } },
+            // The apk manifest string is parsed by the assembler but never read:
+            // APK packaging (and the real `AndroidManifest.xml`) belongs to the
+            // `android` provider in labelle-android (labelle-cli#405). The value
+            // matches the assembler's own fixture; this package ships no such file.
+            //
+            // KEPT for older assemblers: through v0.115.0 the schema requires
+            // `.apk` to carry `.manifest`. labelle-assembler#764 (v0.116.0)
+            // retires the generated `zig build package` step and accepts
+            // `.apk = .{}`; once bgfx can require assembler >= v0.116.0, this
+            // becomes `.package = .{ .apk = .{} }`.
+            .package = .{ .apk = .{ .manifest = "AndroidManifest.xml.tmpl" } },
         },
         // WASM/Emscripten/WebGL2 (bgfx-wasm epic labelle-bgfx#8, shipped in
         // 0.4.x, browser-verified) — mirrors the proven raylib wasm PlatformEntry

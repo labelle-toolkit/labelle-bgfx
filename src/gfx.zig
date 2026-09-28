@@ -89,6 +89,7 @@ pub const availTransientVertices = programs.availTransientVertices;
 // ── Draw primitives (Backend contract) ─────────────────────────────────
 
 pub const drawRectangleRec = draw.drawRectangleRec;
+pub const drawRectanglePro = draw.drawRectanglePro;
 pub const drawCircle = draw.drawCircle;
 pub const drawLine = draw.drawLine;
 pub const drawTriangle = draw.drawTriangle;
@@ -229,6 +230,13 @@ pub const uploadCompressed = texture.uploadCompressed;
 // splits worker-thread decode from main-thread upload and so can't use the
 // synchronous seam — it reads dims here to set DecodedImage before upload.
 pub const compressedDims = texture.compressedDims;
+// Runtime-support query for the web ASTC/PNG choice (#134): true only for
+// an ASTC blob this renderer samples natively. Needs bgfx initialised.
+pub const compressedSupported = texture.compressedSupported;
+
+// The backend's own allocator: libc malloc on wasm, page_allocator elsewhere.
+// Other backend modules that depend on gfx (window) allocate through this.
+pub const heap = @import("gfx/heap.zig");
 
 // ── Offscreen render targets (labelle-bgfx#36 + transport mirror) ──────
 // Render the scene into a texture instead of the screen. Two features build on
@@ -389,7 +397,9 @@ pub const PostPassUniforms = core.backend_contract.PostPassUniforms;
 // ── In-engine video (#549 Path A) ──────────────────────────────────────
 // VideoPlayer wires a decoder → dynamic texture → drawTexturePro. Generic over
 // the decoder so the same player drives ffmpeg (desktop) or AMediaCodec
-// (Android). The Android decoder is hardware-verified (see video/apk/).
+// (Android). The Android decoder (and the pure `yuv`/`planes` helpers the
+// desktop decoder shares) comes from the `labelle_android` package (#149
+// phase 1d); it is verified on-device through a game's intro clip.
 // The NATIVE decoders are desktop/Android-only: the desktop decoder shells out
 // to ffmpeg and the CPU YUV path uses `std.Thread.spawn`, neither of which is
 // available (or wanted) on wasm32-emscripten (single-threaded WebGL, no
@@ -400,7 +410,7 @@ pub const PostPassUniforms = core.backend_contract.PostPassUniforms;
 const is_wasm = @import("builtin").target.cpu.arch.isWasm();
 pub const VideoPlayer = if (is_wasm) struct {} else @import("video/player.zig").Player;
 pub const DesktopVideoDecoder = if (is_wasm) struct {} else @import("video/desktop.zig").VideoDecoder;
-pub const AndroidVideoDecoder = if (is_wasm) struct {} else @import("video/android.zig").VideoDecoder;
+pub const AndroidVideoDecoder = if (is_wasm) struct {} else @import("labelle_android").video.VideoDecoder;
 // VideoBackend satisfies core.VideoInterface: a name → player handle pool the
 // assembler wires into the engine's VideoImpl slot, so a game plays a clip with
 // just its asset name (#549).
@@ -710,3 +720,6 @@ test "the physical surface is reachable from the module root" {
         }
     }
 }
+
+/// Optional persistent storage bindings; native file storage is engine-owned.
+pub const PersistentStorage = if (is_wasm) @import("persistent_storage") else struct {};
