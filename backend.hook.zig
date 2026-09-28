@@ -538,8 +538,8 @@ fn emTool(b: *std.Build, emsdk_opt: ?*std.Build.Dependency, tool: []const u8, ne
         .managed => |m| return .{ .exe = .{ .cwd_relative = m.tool }, .em_config = m.em_config },
         .dep => {
             const emsdk = emsdk_opt orelse std.debug.panic(
-                "emsdk: no valid EMSDK (needs upstream/emscripten/{s} and .emscripten) and no emsdk dependency was passed to emLinkStep",
-                .{actual_tool},
+                "emsdk: no valid EMSDK (needs upstream/emscripten/{s}, .emscripten{s}) and no emsdk dependency was passed to emLinkStep",
+                .{ actual_tool, if (need_sysroot) " and upstream/emscripten/cache/sysroot/include" else "" },
             );
             // An env var needs a string now. A dependency's root is known at
             // configure time (it is fetched before build() runs), so this
