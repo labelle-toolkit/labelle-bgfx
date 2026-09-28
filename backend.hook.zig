@@ -379,10 +379,28 @@ pub const EmLinkOptions = struct {
 const EmToolResolution = union(enum) {
     /// An external `EMSDK` is set AND the tool exists on disk under it — use this
     /// ABSOLUTE tool path directly (a `cwd_relative`/absolute LazyPath, since it
-    /// lives OUTSIDE the build graph). Caller owns the returned slice.
-    managed: []const u8,
-    /// No usable `EMSDK` override — fall back to the emsdk build dependency.
+    /// lives OUTSIDE the build graph), run under THAT emsdk's `.emscripten`.
+    /// Caller owns both slices (`deinit`).
+    managed: Managed,
+    /// No usable `EMSDK` override — fall back to the emsdk build dependency (its
+    /// tool, run under its `.emscripten`).
     dep,
+
+    const Managed = struct {
+        /// `<EMSDK>/upstream/emscripten/<tool>`.
+        tool: []const u8,
+        /// `<EMSDK>/.emscripten`: the EM_CONFIG the tool must run under
+        /// (labelle-bgfx#161), whether or not it exists yet. Pinned so an
+        /// inherited EM_CONFIG naming ANOTHER SDK can't redirect this emcc's
+        /// LLVM/binaryen/node; a missing file makes emcc use its defaults, not
+        /// another SDK's config.
+        em_config: []const u8,
+
+        fn deinit(self: Managed, gpa: std.mem.Allocator) void {
+            gpa.free(self.tool);
+            gpa.free(self.em_config);
+        }
+    };
 };
 
 /// Pure decision behind `emTool`: prefer an external `EMSDK` (the studio's
@@ -399,9 +417,31 @@ fn emToolPath(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, tool: []const u8, 
     // root differs — so the sub-path is the same `upstream/emscripten/<tool>`.
     // Native-separator join (host path, used as an absolute LazyPath below).
     const abs = std.fs.path.join(gpa, &.{ root, "upstream", "emscripten", tool }) catch return .dep;
-    if (fs.exists(abs)) return .{ .managed = abs };
-    gpa.free(abs);
-    return .dep;
+    if (!fs.exists(abs)) {
+        gpa.free(abs);
+        return .dep;
+    }
+    const em_config = std.fs.path.join(gpa, &.{ root, ".emscripten" }) catch {
+        gpa.free(abs);
+        return .dep;
+    };
+    return .{ .managed = .{ .tool = abs, .em_config = em_config } };
+}
+
+/// An emscripten tool plus the EM_CONFIG it must run under — both from the SAME
+/// emsdk (labelle-bgfx#161, same rule as build.zig's link since #160).
+const EmTool = struct {
+    exe: std.Build.LazyPath,
+    /// Absolute path to that emsdk's `.emscripten`.
+    em_config: []const u8,
+};
+
+/// Pin `run`'s EM_CONFIG to `em_config` (the chosen emsdk's `.emscripten`), so
+/// an EM_CONFIG inherited from the environment can't point this emcc at another
+/// SDK's tools. `run` is a `*std.Build.Step.Run` (or anything with
+/// `setEnvironmentVariable`, so the tests can record the call).
+fn pinEmConfig(run: anytype, em_config: []const u8) void {
+    run.setEnvironmentVariable("EM_CONFIG", em_config);
 }
 
 /// Path to an emscripten tool (e.g. `emcc`). Prefers an external `EMSDK` (the
@@ -410,7 +450,8 @@ fn emToolPath(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, tool: []const u8, 
 /// a forward-slash join (NOT `b.pathJoin`) so the emsdk-relative sub-path stays
 /// portable — mirrors raylib's hook. The dep stays the default source; env is an
 /// override (no HookContext/EmLinkOptions ABI change — the dep is still passed in).
-fn emTool(b: *std.Build, emsdk: *std.Build.Dependency, tool: []const u8) std.Build.LazyPath {
+/// Also returns the EM_CONFIG of whichever emsdk was chosen (#161).
+fn emTool(b: *std.Build, emsdk: *std.Build.Dependency, tool: []const u8) EmTool {
     const BuildFs = struct {
         b: *std.Build,
         fn exists(self: @This(), path: []const u8) bool {
@@ -422,9 +463,15 @@ fn emTool(b: *std.Build, emsdk: *std.Build.Dependency, tool: []const u8) std.Bui
     // resolved name for BOTH the managed probe and the dep fallback so they agree.
     const actual_tool = if (builtin.os.tag == .windows) b.fmt("{s}.bat", .{tool}) else tool;
     switch (emToolPath(b.allocator, b.graph.environ_map.get("EMSDK"), actual_tool, BuildFs{ .b = b })) {
-        // `b.allocator` is the build arena, so the absolute slice outlives config.
-        .managed => |abs| return .{ .cwd_relative = abs },
-        .dep => return emsdk.path(b.fmt("upstream/emscripten/{s}", .{actual_tool})),
+        // `b.allocator` is the build arena, so the absolute slices outlive config.
+        .managed => |m| return .{ .exe = .{ .cwd_relative = m.tool }, .em_config = m.em_config },
+        .dep => return .{
+            .exe = emsdk.path(b.fmt("upstream/emscripten/{s}", .{actual_tool})),
+            // An env var needs a string now. A dependency's root is known at
+            // configure time (it is fetched before build() runs), so this
+            // resolves to the same path the lazy `exe` does at run time.
+            .em_config = emsdk.path(".emscripten").getPath(b),
+        },
     }
 }
 
@@ -439,7 +486,11 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
     // + `addFileArg` is the lazy-safe form; the step name "emcc" also hides the
     // resolved path in the log. Mirrors raylib's hook.
     const emcc = std.Build.Step.Run.create(b, "emcc");
-    emcc.addFileArg(emTool(b, options.emsdk, "emcc"));
+    const em = emTool(b, options.emsdk, "emcc");
+    emcc.addFileArg(em.exe);
+    // Run under the SAME emsdk's `.emscripten` (#161): an inherited EM_CONFIG
+    // naming another SDK would otherwise redirect this emcc's tools.
+    pinEmConfig(emcc, em.em_config);
     if (options.optimize == .Debug) {
         emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1" });
     } else {
@@ -656,6 +707,15 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
 
 const testing = std.testing;
 
+test "emLinkStep typechecks against std.Build" {
+    // Zig analyzes a function body only when something references it; nothing
+    // in this file's tests referenced `emLinkStep`, so an API slip in the wasm
+    // link step (e.g. the #161 EM_CONFIG pin) compiled only in a generated game.
+    // Taking its address forces full analysis here. (`post_wire` can't be
+    // referenced: its `b.dependency` needs the build runner as the root.)
+    _ = &emLinkStep;
+}
+
 test "HOOK_ABI_VERSION is 2 (matches manifest_v2)" {
     try testing.expectEqual(@as(u8, 2), HOOK_ABI_VERSION);
 }
@@ -801,7 +861,7 @@ test "emToolPath: EMSDK unset → emsdk dependency (behavior byte-identical to p
     switch (emToolPath(testing.allocator, null, "emcc", Fs{})) {
         .dep => {}, // no allocation happens on this path — nothing to free
         .managed => |p| {
-            testing.allocator.free(p);
+            p.deinit(testing.allocator);
             return error.TestUnexpectedManaged;
         },
     }
@@ -816,7 +876,7 @@ test "emToolPath: empty EMSDK → emsdk dependency (treated as unset)" {
     switch (emToolPath(testing.allocator, "", "emcc", Fs{})) {
         .dep => {},
         .managed => |p| {
-            testing.allocator.free(p);
+            p.deinit(testing.allocator);
             return error.TestUnexpectedManaged;
         },
     }
@@ -834,13 +894,13 @@ test "emToolPath: EMSDK set + tool present on disk → managed absolute path" {
     const root = "/home/u/.labelle/emsdk/4.0.0";
     switch (emToolPath(testing.allocator, root, "emcc", Fs{})) {
         .managed => |p| {
-            defer testing.allocator.free(p);
+            defer p.deinit(testing.allocator);
             const expected = try std.fs.path.join(
                 testing.allocator,
                 &.{ root, "upstream", "emscripten", "emcc" },
             );
             defer testing.allocator.free(expected);
-            try testing.expectEqualStrings(expected, p);
+            try testing.expectEqualStrings(expected, p.tool);
         },
         .dep => return error.TestExpectedManaged,
     }
@@ -857,8 +917,8 @@ test "emToolPath: Windows tool name (emcc.bat) flows through → managed abs pat
     const root = "C:/Users/u/.labelle/emsdk/4.0.0";
     switch (emToolPath(testing.allocator, root, "emcc.bat", Fs{})) {
         .managed => |p| {
-            defer testing.allocator.free(p);
-            try testing.expect(std.mem.endsWith(u8, p, "emcc.bat"));
+            defer p.deinit(testing.allocator);
+            try testing.expect(std.mem.endsWith(u8, p.tool, "emcc.bat"));
         },
         .dep => return error.TestExpectedManaged,
     }
@@ -875,10 +935,52 @@ test "emToolPath: EMSDK set but tool missing on disk → falls back to dep" {
     switch (emToolPath(testing.allocator, "/nonexistent/emsdk", "emcc", Fs{})) {
         .dep => {}, // helper frees the constructed path internally
         .managed => |p| {
-            testing.allocator.free(p);
+            p.deinit(testing.allocator);
             return error.TestUnexpectedManaged;
         },
     }
+}
+
+test "emToolPath: managed emcc runs under THAT emsdk's .emscripten (#161)" {
+    // Only the external emcc exists. The EM_CONFIG must name the same root's
+    // `.emscripten`, never some other SDK's (e.g. an inherited EM_CONFIG).
+    const Fs = struct {
+        fn exists(_: @This(), path: []const u8) bool {
+            return std.mem.endsWith(u8, path, "emcc");
+        }
+    };
+    const root = "/home/u/.cache/labelle-web/emsdk/v1/x86_64-linux/4.0.9-tag";
+    switch (emToolPath(testing.allocator, root, "emcc", Fs{})) {
+        .managed => |p| {
+            defer p.deinit(testing.allocator);
+            const expected = try std.fs.path.join(testing.allocator, &.{ root, ".emscripten" });
+            defer testing.allocator.free(expected);
+            try testing.expectEqualStrings(expected, p.em_config);
+            // Same emsdk for both: the config sits at the root of the emcc's emsdk.
+            try testing.expect(std.mem.startsWith(u8, p.tool, root));
+        },
+        .dep => return error.TestExpectedManaged,
+    }
+}
+
+test "pinEmConfig: sets EM_CONFIG (and only it) on the emcc step (#161)" {
+    // Records what emLinkStep's Run step receives, so the test asserts the
+    // mechanism (the env var name + value), not only the path decision above.
+    const Recorder = struct {
+        calls: usize = 0,
+        key: []const u8 = "",
+        value: []const u8 = "",
+        pub fn setEnvironmentVariable(self: *@This(), key: []const u8, value: []const u8) void {
+            self.calls += 1;
+            self.key = key;
+            self.value = value;
+        }
+    };
+    var rec: Recorder = .{};
+    pinEmConfig(&rec, "/ext/emsdk/.emscripten");
+    try testing.expectEqual(@as(usize, 1), rec.calls);
+    try testing.expectEqualStrings("EM_CONFIG", rec.key);
+    try testing.expectEqualStrings("/ext/emsdk/.emscripten", rec.value);
 }
 
 test "selectGreatestValidNdk: a stray dir doesn't shadow a valid older NDK" {
