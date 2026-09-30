@@ -521,12 +521,14 @@ pub fn initWindow(w: i32, h: i32, title: [:0]const u8) void {
 /// off, so `bgfx.init` + `bgfx.frame` run in-thread and the render frame is driven
 /// synchronously from the `emscripten_set_main_loop` callback — no `renderFrame`
 /// pump is needed. `RendererType.Count` auto-selects OpenGLES (WebGL) on
-/// emscripten.
+/// emscripten. `LABELLE_BGFX_RENDERER` is honoured here too (RFC #172 D1), like
+/// every other init path; emscripten's environment is empty unless the page sets
+/// it, so unset keeps `.Count`.
 fn initWindowWasm(w: i32, h: i32) void {
     var init: bgfx.Init = undefined;
     bgfx.initCtor(&init);
 
-    init.type = .Count; // auto-select renderer (OpenGLES/WebGL on emscripten)
+    init.type = requestedRenderer(.Count); // unset → auto (OpenGLES/WebGL on emscripten)
     init.swapChain.width = @intCast(w);
     init.swapChain.height = @intCast(h);
     init.reset = current_reset;
