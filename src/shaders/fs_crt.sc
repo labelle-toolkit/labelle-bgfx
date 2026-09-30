@@ -42,8 +42,15 @@ void main()
 	float lines = 0.5 + 0.5 * abs(sin(warp.y * u_postfx_texel.w * 3.14159265));
 	float scan = mix(1.0, lines, clamp(u_postfx_params.y, 0.0, 1.0));
 
-	// Shadow mask: a soft 3-pixel RGB column stripe by `mask`.
-	float stripe = 0.6 + 0.4 * step(0.5, fract(warp.x * u_postfx_texel.z / 3.0));
+	// Shadow mask: a soft 3-pixel RGB column stripe by `mask` — source column
+	// 0 of every 3 dimmed, columns 1 and 2 full. Selected from the INTEGER
+	// source column, never a step on `fract(x / 3.0)`: near the centre `warp` is
+	// ~identity, so every third pixel centre (x = 3k + 1.5) sat exactly on that
+	// step's edge and ESSL vs SPIR-V rounding picked different sides
+	// (labelle-bgfx#179). `floor` of a pixel centre is 0.5 px from any edge, and
+	// `cell` is 0.5/1.5/2.5 — 0.5 from the step at 1.0. Same stripe pattern.
+	float cell = mod(floor(warp.x * u_postfx_texel.z) + 0.5, 3.0);
+	float stripe = 0.6 + 0.4 * step(1.0, cell);
 	float m = mix(1.0, stripe, clamp(u_postfx_params.z, 0.0, 1.0));
 
 	gl_FragColor = vec4(col * scan * m, srcA);
