@@ -122,7 +122,8 @@ pub fn targetSize() ?[2]i32 {
     return target_size;
 }
 
-/// Aspect-preserving fit of the design canvas into a `w`x`h` surface.
+/// Aspect-preserving fit of the design canvas into a `w`x`h` surface, with
+/// the fitted rectangle's edges snapped to whole surface pixels.
 fn fitInto(w: i32, h: i32) [2]f32 {
     const sw: f32 = @floatFromInt(w);
     const sh: f32 = @floatFromInt(h);
@@ -130,7 +131,21 @@ fn fitInto(w: i32, h: i32) [2]f32 {
     const dh: f32 = @floatFromInt(design_h);
     if (sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0) return .{ 1.0, 1.0 };
     const s = @min(sw / dw, sh / dh);
-    return .{ s * dw / sw, s * dh / sh };
+    return .{ snapExtent(s * dw, sw) / sw, snapExtent(s * dh, sh) / sh };
+}
+
+/// Snap a centred `extent` inside `surface` pixels so both of its edges land
+/// on whole pixels (labelle-bgfx#179). The unsnapped fit can put an edge on a
+/// pixel CENTRE — an 800x600 design in a 964x768 surface fits to 723 rows at
+/// y 22.5..745.5 — and a pixel centre exactly on an edge is a coverage tie
+/// that GLES and Vulkan break differently, so the whole row came out black on
+/// one renderer and the clear colour on the other. Rounding the bar (not the
+/// extent) keeps the rect centred and moves each edge by at most half a pixel,
+/// so the aspect is off by at most 1 px. A degenerate result keeps the exact fit.
+fn snapExtent(extent: f32, surface: f32) f32 {
+    const bar = @round((surface - extent) * 0.5);
+    const snapped = surface - 2.0 * @max(bar, 0.0);
+    return if (snapped >= 1.0) snapped else extent;
 }
 
 fn recomputeFitScale() void {
@@ -533,6 +548,45 @@ test "screen_fill maps the design canvas onto the FULL framebuffer (#42)" {
     setApplyFit(true);
     try std.testing.expectApproxEqAbs(@as(f32, -0.75), toNdcX(0), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), toNdcX(1024), 0.0001);
+}
+
+test "the fitted canvas edges land on whole pixels, centred (#179)" {
+    // 800x600 into 964x768: the exact fit is 964x723, edges at y 22.5 / 745.5
+    // — pixel centres, which GLES and Vulkan rasterize differently. Snapped,
+    // the canvas is 964x722 at y 23..745: whole-pixel edges, still centred.
+    const t = std.testing;
+    setDesignSize(800, 600);
+    setScreenSize(964, 768);
+    defer setScreenSize(800, 600);
+    const tl = designToPhysical(.{ .x = 0, .y = 0 });
+    const br = designToPhysical(.{ .x = 800, .y = 600 });
+    try t.expectApproxEqAbs(@as(f32, 0), tl.x, 1e-3);
+    try t.expectApproxEqAbs(@as(f32, 964), br.x, 1e-3);
+    try t.expectApproxEqAbs(@as(f32, 23), tl.y, 1e-3);
+    try t.expectApproxEqAbs(@as(f32, 745), br.y, 1e-3);
+    // The mechanism: the snap moved the edge off the half pixel (an unsnapped
+    // fit would put it at 22.5), by at most half a pixel.
+    try t.expectApproxEqAbs(@as(f32, 722.0 / 768.0), fitScaleY(), 1e-6);
+    // Round-trip stays exact: pointer input uses the same snapped fit.
+    const c = screenToDesign(482, 384);
+    try t.expectApproxEqAbs(@as(f32, 400), c.x, 1e-2);
+    try t.expectApproxEqAbs(@as(f32, 300), c.y, 1e-2);
+
+    // A fit whose edges are already whole pixels is unchanged (800x640 → 960x768).
+    setDesignSize(800, 640);
+    defer setDesignSize(800, 600);
+    try t.expectApproxEqAbs(@as(f32, 960.0 / 964.0), fitScaleX(), 1e-6);
+    try t.expectApproxEqAbs(@as(f32, 1.0), fitScaleY(), 1e-6);
+    // Every surface height from 1 px up gets integer, symmetric edges.
+    setDesignSize(800, 600);
+    var hgt: i32 = 1;
+    while (hgt <= 2000) : (hgt += 1) {
+        setScreenSize(1333, hgt);
+        const a = designToPhysical(.{ .x = 0, .y = 0 });
+        const b = designToPhysical(.{ .x = 800, .y = 600 });
+        for ([_]f32{ a.x, a.y, b.x, b.y }) |e| try t.expectApproxEqAbs(@round(e), e, 2e-3 * @max(1.0, @abs(e) / 1000.0));
+        try t.expectApproxEqAbs(a.y, @as(f32, @floatFromInt(hgt)) - b.y, 2e-3 * @max(1.0, @as(f32, @floatFromInt(hgt)) / 1000.0));
+    }
 }
 
 test "a render-target pass letterboxes into the TARGET, not the framebuffer (#120)" {

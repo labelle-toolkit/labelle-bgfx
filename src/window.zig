@@ -11,6 +11,8 @@ const platform = @import("platform.zig");
 /// `debugBreak()`ing the process with nothing on either stream — the symptom
 /// that made #61 undiagnosable.
 const bgfx_callback = @import("bgfx_callback.zig");
+/// `LABELLE_BGFX_RENDERER` table + D4 requested/actual verdict (labelle-bgfx#176).
+const renderer_select = @import("renderer_select.zig");
 /// labelle-core, for the comptime window-contract conformance gate below.
 const core = @import("labelle-core");
 
@@ -519,12 +521,14 @@ pub fn initWindow(w: i32, h: i32, title: [:0]const u8) void {
 /// off, so `bgfx.init` + `bgfx.frame` run in-thread and the render frame is driven
 /// synchronously from the `emscripten_set_main_loop` callback — no `renderFrame`
 /// pump is needed. `RendererType.Count` auto-selects OpenGLES (WebGL) on
-/// emscripten.
+/// emscripten. `LABELLE_BGFX_RENDERER` is honoured here too (RFC #172 D1), like
+/// every other init path; emscripten's environment is empty unless the page sets
+/// it, so unset keeps `.Count`.
 fn initWindowWasm(w: i32, h: i32) void {
     var init: bgfx.Init = undefined;
     bgfx.initCtor(&init);
 
-    init.type = .Count; // auto-select renderer (OpenGLES/WebGL on emscripten)
+    init.type = requestedRenderer(.Count); // unset → auto (OpenGLES/WebGL on emscripten)
     init.swapChain.width = @intCast(w);
     init.swapChain.height = @intCast(h);
     init.reset = current_reset;
@@ -539,6 +543,7 @@ fn initWindowWasm(w: i32, h: i32) void {
     bgfx_callback.install(&init);
 
     if (!bgfx.init(&init)) return;
+    if (!acceptInitRenderer(init.type)) return;
     gfx.shaderMaterialContextStarted();
 
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
@@ -554,13 +559,15 @@ fn initWindowWasm(w: i32, h: i32) void {
 /// Android init path: no GLFW. The `ANativeWindow*` surface must have
 /// been handed over via `setAndroidNativeWindow` (phase 3); without it
 /// `nwh` is null and bgfx init will fail gracefully — phase 2 only proves
-/// the plumbing compiles. bgfx selects the GLES/Vulkan renderer for
-/// Android from `RendererType.Count` (auto).
+/// the plumbing compiles. The renderer is the generic `requestedRenderer`
+/// (`LABELLE_BGFX_RENDERER`, labelle-bgfx#176) over the `.Count` (auto →
+/// GLES) default; this runs on EVERY `INIT_WINDOW`, surface restores included,
+/// so each re-init re-reads the variable and logs its own D4 line.
 fn initWindowAndroid(w: i32, h: i32) void {
     var init: bgfx.Init = undefined;
     bgfx.initCtor(&init);
 
-    init.type = .Count; // auto-select renderer (GLES/Vulkan on Android)
+    init.type = requestedRenderer(.Count);
     init.swapChain.width = @intCast(w);
     init.swapChain.height = @intCast(h);
     init.reset = current_reset;
@@ -575,14 +582,19 @@ fn initWindowAndroid(w: i32, h: i32) void {
     init.platformData.type = .Default;
     bgfx_callback.install(&init);
 
-    if (!bgfx.init(&init)) return;
+    if (!bgfx.init(&init)) {
+        std.log.err("bgfx: renderer init failed (requested={s})", .{renderer_select.rendererName(init.type)});
+        return;
+    }
+    if (!acceptInitRenderer(init.type)) return;
     gfx.shaderMaterialContextStarted();
 
     bgfx.setViewClear(0, 0x0001 | 0x0002, clear_color, 1.0, 0);
     bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h), 0.0, 1.0);
 }
 
-/// Choose the bgfx renderer type for the desktop init (labelle-bgfx#30).
+/// The platform's DEFAULT renderer for the windowed desktop init
+/// (labelle-bgfx#30), used when `LABELLE_BGFX_RENDERER` is unset/invalid.
 ///
 /// bgfx's `.Count` auto-select resolves to **Direct3D11** on Windows, but this
 /// backend ships NO Direct3D shader variants — `gfx/programs.zig` only has
@@ -592,26 +604,38 @@ fn initWindowAndroid(w: i32, h: i32) void {
 /// Until DXBC variants exist, steer Windows onto a renderer that HAS variants:
 ///   - default: Vulkan (`.spv` sprite/YUV variants exist),
 ///   - fallback: OpenGL (the existing `-p 120` GLSL `else` arm) — see the
-///     init-failure retry in `initWindowDesktop`,
-///   - escape hatch: `LABELLE_BGFX_RENDERER=vulkan|opengl` forces one explicitly.
+///     init-failure retry in `initWindowDesktop`.
 ///
-/// Only Windows is steered. Every other desktop OS keeps `.Count` (auto):
-/// macOS→Metal and Linux→OpenGL/Vulkan already resolve to renderers this backend
-/// has shader variants for.
-fn desktopRendererType() bgfx.RendererType {
-    if (builtin.target.os.tag != .windows) return .Count;
-    if (getenv("LABELLE_BGFX_RENDERER")) |raw| {
-        const val = std.mem.span(raw);
-        if (std.ascii.eqlIgnoreCase(val, "opengl") or std.ascii.eqlIgnoreCase(val, "gl"))
-            return .OpenGL;
-        if (std.ascii.eqlIgnoreCase(val, "vulkan") or std.ascii.eqlIgnoreCase(val, "vk"))
-            return .Vulkan;
-        std.log.warn(
-            "bgfx: ignoring unknown LABELLE_BGFX_RENDERER='{s}' (expected 'vulkan' or 'opengl')",
-            .{val},
-        );
+/// Every other desktop OS keeps `.Count` (auto): macOS→Metal and
+/// Linux→OpenGL/Vulkan already resolve to renderers this backend has shader
+/// variants for. The `LABELLE_BGFX_RENDERER` override (every platform, #176)
+/// is applied on top by `requestedRenderer`.
+fn desktopDefaultRenderer() bgfx.RendererType {
+    return if (builtin.target.os.tag == .windows) .Vulkan else .Count;
+}
+
+/// The renderer to hand `bgfx.init`: `LABELLE_BGFX_RENDERER` when it names one
+/// (table in `renderer_select.zig`), else `default` — the calling init path's
+/// per-platform choice. Generic: every init path (desktop, headless, Android)
+/// goes through this, so a platform's policy is only ever "set the variable
+/// before bgfx starts" (labelle-bgfx#176, RFC #172 D1).
+fn requestedRenderer(default: bgfx.RendererType) bgfx.RendererType {
+    const raw: ?[]const u8 = if (getenv(renderer_select.env_name)) |p| std.mem.span(p) else null;
+    return renderer_select.rendererFromEnv(raw) orelse default;
+}
+
+/// D4 (RFC #172): after a `bgfx.init` that returned true, log
+/// `requested=<X> actual=<Y>` (warning when bgfx's fallback changed it), and
+/// reject `Noop` — bgfx's last-resort fallback that renders nothing. On `Noop`
+/// the context is shut down and `false` returned, so the caller takes its
+/// ordinary init-failure path.
+fn acceptInitRenderer(requested: bgfx.RendererType) bool {
+    const verdict = renderer_select.reportInit(requested, bgfx.getRendererType());
+    if (verdict == .noop) {
+        bgfx.shutdown();
+        return false;
     }
-    return .Vulkan;
+    return true;
 }
 
 /// Desktop init path: GLFW window + bgfx, native handle per OS.
@@ -652,9 +676,10 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     var init: bgfx.Init = undefined;
     bgfx.initCtor(&init);
 
-    // Renderer: `.Count` (auto) on macOS/Linux; a variant-backed renderer on
-    // Windows, since auto → D3D11 there has no shaders (labelle-bgfx#30).
-    init.type = desktopRendererType();
+    // Renderer: `LABELLE_BGFX_RENDERER` if set (#176); else `.Count` (auto) on
+    // macOS/Linux and a variant-backed renderer on Windows, since auto → D3D11
+    // there has no shaders (labelle-bgfx#30).
+    init.type = requestedRenderer(desktopDefaultRenderer());
     init.swapChain.width = @intCast(screen_w);
     init.swapChain.height = @intCast(screen_h);
     init.reset = current_reset;
@@ -690,7 +715,9 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     init.platformData.type = .Default;
     bgfx_callback.install(&init);
 
-    if (!bgfx.init(&init)) {
+    // A `Noop` start counts as a failed init (D4, #176): `acceptInitRenderer`
+    // has already shut it down, so the retry below starts from a clean slate.
+    if (!(bgfx.init(&init) and acceptInitRenderer(init.type))) {
         // The preferred renderer was unavailable. On Windows fall back to OpenGL
         // — the last renderer with valid shader variants (labelle-bgfx#30) — so a
         // box without Vulkan still renders instead of failing init outright.
@@ -701,7 +728,7 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
         if (builtin.target.os.tag == .windows and init.type != .OpenGL) {
             std.log.warn("bgfx: renderer {} init failed; retrying with OpenGL", .{init.type});
             init.type = .OpenGL;
-            initialized = bgfx.init(&init);
+            initialized = bgfx.init(&init) and acceptInitRenderer(init.type);
         }
         // If bgfx is still not up — the OpenGL fallback also failed, or there was
         // no fallback to try (non-Windows, or OpenGL was already the selection) —
@@ -729,10 +756,10 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
 
 /// Renderer for a TRUE surfaceless init: Vulkan (Windows/Linux) or Metal
 /// (macOS/iOS) — the only bgfx desktop backends that init with no surface.
-/// OpenGL has no surfaceless path, so — unlike the windowed `desktopRendererType`
+/// OpenGL has no surfaceless path, so — unlike the windowed `desktopDefaultRenderer`
 /// — there is NO GL fallback here: without a Vulkan/Metal device, `initHeadless`
 /// fails rather than degrading.
-fn headlessRendererType() bgfx.RendererType {
+fn headlessDefaultRenderer() bgfx.RendererType {
     return switch (builtin.target.os.tag) {
         .macos, .ios, .watchos, .tvos => .Metal,
         else => .Vulkan,
@@ -787,9 +814,21 @@ pub fn initHeadless(w: i32, h: i32) bool {
     // bgfx.init and the offscreen framebuffer succeed — so a failed init leaves
     // the window globals untouched for a caller that falls back to windowed init.
 
+    // `LABELLE_BGFX_RENDERER` (#176) applies here too. OpenGL/GLES have no
+    // surfaceless path, so an explicit request for one declines the surfaceless
+    // attempt: the caller's invisible-window fallback then honours it.
+    const requested = requestedRenderer(headlessDefaultRenderer());
+    if (requested == .OpenGL or requested == .OpenGLES) {
+        std.log.info(
+            "bgfx: " ++ renderer_select.env_name ++ " requests {s}, which has no surfaceless path — using the invisible-window headless path",
+            .{@tagName(requested)},
+        );
+        return false;
+    }
+
     var init: bgfx.Init = undefined;
     bgfx.initCtor(&init);
-    init.type = headlessRendererType();
+    init.type = requested;
     // No backbuffer/swapchain exists, so the resolution MUST be 0×0 (bgfx:
     // "resolution of non-existing backbuffer can't be larger than 0x0!"). The
     // real render size lives on the offscreen framebuffer created below.
@@ -807,6 +846,9 @@ pub fn initHeadless(w: i32, h: i32) bool {
         std.log.err("bgfx: headless init failed (no {s} device available?)", .{@tagName(init.type)});
         return false;
     }
+    // D4 (#176): log requested/actual; a `Noop` start is a failed init (the
+    // caller falls back to the invisible window).
+    if (!acceptInitRenderer(init.type)) return false;
 
     // The primary view has no swapchain to present to — bind it to an offscreen
     // RGBA framebuffer instead. Clamp-sampled so the capture path reads a clean
