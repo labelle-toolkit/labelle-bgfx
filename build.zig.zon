@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0x9cd73c2cb5d6d1eb,
     .name = .labelle_bgfx,
-    .version = "0.32.0",
+    .version = "0.32.1",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Browser persistent storage (IndexedDB bridge), wasm-only (lazy).
@@ -37,7 +37,7 @@
         // `-Dvideo` (default off, so no VideoToolbox/CoreMedia/CoreVideo dependency), and
         // raises the x86 CPU baseline to SSE4.2 because bx's simd_t.h now
         // requires it. The screen_shot vtable fix below is still IN this commit.
-        // RFC #172/#175 release: v0.12.0 carries #173/#174/#177/#181, API 161 vendor
+        // RFC #172/#175 release: v0.12.1 carries #173/#174/#177/#178/#181, API 161 vendor
         // plus the web ASTC fix: the emscripten format table lists the full
         // LDR set, so 8x8 samples natively on WebGL (#147).
         //
@@ -46,8 +46,8 @@
         // sits with the rest of the toolkit and so upstreaming is a normal PR;
         // the Codeberg copy is stale and should not be repinned.
         .zbgfx = .{
-            .url = "https://github.com/labelle-toolkit/zbgfx/archive/refs/tags/v0.12.0.tar.gz",
-            .hash = "zbgfx-0.12.0-Sm4IxDDnDAdy4wEOQlNiR2cdlwJtc7kx-MaMgwbCG5C_",
+            .url = "https://github.com/labelle-toolkit/zbgfx/archive/refs/tags/v0.12.1.tar.gz",
+            .hash = "zbgfx-0.12.1-Sm4IxFIADQeGBx-8Buqgluvv5HGD1vqGGPQF-utEsSac",
         },
         .zglfw = .{
             .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",
