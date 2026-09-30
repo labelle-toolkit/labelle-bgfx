@@ -917,7 +917,7 @@ pub fn build(b: *std.Build) void {
     b.step("test-renderer-select", "Test the LABELLE_BGFX_RENDERER table and init diagnostics (#176)").dependOn(&renderer_select_run.step);
 
     // ── Unit tests for the presented-frame counter (#182) ──
-    // `src/frame_counter.zig` is pure Zig (an atomic u64 + its C-ABI export
+    // `src/frame_counter.zig` is pure Zig (an atomic `usize` counter + its C-ABI `u64` export
     // `labelle_bgfx_frames_presented`), so it executes on the host.
     const frame_counter_tests = b.addTest(.{
         .root_module = b.createModule(.{
