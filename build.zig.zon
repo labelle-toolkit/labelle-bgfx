@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0x9cd73c2cb5d6d1eb,
     .name = .labelle_bgfx,
-    .version = "0.31.0",
+    .version = "0.32.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Browser persistent storage (IndexedDB bridge), wasm-only (lazy).
@@ -46,7 +46,7 @@
         // sits with the rest of the toolkit and so upstreaming is a normal PR;
         // the Codeberg copy is stale and should not be repinned.
         .zbgfx = .{
-            .url = "https://github.com/labelle-toolkit/zbgfx/archive/abefdb34eee9810a14407a5e3dada5393e6215ba.tar.gz",
+            .url = "https://github.com/labelle-toolkit/zbgfx/archive/refs/tags/v0.12.0.tar.gz",
             .hash = "zbgfx-0.12.0-Sm4IxDDnDAdy4wEOQlNiR2cdlwJtc7kx-MaMgwbCG5C_",
         },
         .zglfw = .{
