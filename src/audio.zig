@@ -186,12 +186,12 @@ pub fn loadMusic(path: [:0]const u8) u32 {
 /// Load the bundled asset `name` (e.g. `"music/theme.ogg"`) and register it
 /// as a looping music stream. Returns the music id, or 0 on failure.
 ///
-/// On Android the file is read from the APK and decoded by the platform
-/// decoder, `labelle_android.video.decodeTrack` (AMediaExtractor +
-/// AMediaCodec, so MP3, OGG Vorbis, AAC and Opus), which also resamples to
-/// the mixer's 48 kHz stereo — the path the intro video's audio already
-/// takes (`src/video/backend.zig`). The asset must be stored uncompressed in
-/// the APK: `AAsset_openFileDescriptor64` refuses compressed entries.
+/// On Android the file is opened in the APK by `labelle_android.assets.openFd`
+/// and decoded by the platform decoder, `labelle_android.video.decodeTrack`
+/// (AMediaExtractor + AMediaCodec, so MP3, OGG Vorbis, AAC and Opus), which
+/// also resamples to the mixer's 48 kHz stereo — the path the intro video's
+/// audio already takes (`src/video/backend.zig`). The asset must be stored
+/// uncompressed in the APK: the NDK refuses an fd for a compressed entry.
 ///
 /// The decode is synchronous and takes seconds for a long track on a slow
 /// device (a 2-minute MP3 is ~7 s on the MT6750 P42), long enough for an
@@ -268,37 +268,19 @@ fn loadMusicAssetWorker(load: *MusicAssetLoad) void {
     load.result.store(loadMusicAsset(load.name_buf[0..load.name_len]), .release);
 }
 
-// APK asset access for `loadMusicAsset`: the same AAssetManager route the
-// video backend uses for bundled clips. The bgfx Android shell exports the
-// running NativeActivity. Only referenced on Android, so never linked
-// elsewhere.
+// The bgfx Android shell's export of the running NativeActivity (the same
+// symbol `src/android.zig` adapts; the audio module can't import that file).
+// Only referenced on Android, so never linked elsewhere.
 extern fn labelle_bgfx_get_native_activity() ?*anyopaque;
-const AAssetManager = opaque {};
-const AAsset = opaque {};
-extern fn AAssetManager_open(*AAssetManager, [*:0]const u8, c_int) ?*AAsset;
-extern fn AAsset_openFileDescriptor64(*AAsset, *i64, *i64) c_int;
-extern fn AAsset_close(*AAsset) void;
-extern fn close(c_int) c_int;
-const AASSET_MODE_STREAMING: c_int = 2;
 
 fn loadMusicAssetAndroid(name: []const u8) u32 {
-    const act = labelle_bgfx_get_native_activity() orelse return 0;
-    // ANativeActivity field 8 is `assetManager` (callbacks, vm, env, clazz,
-    // internalDataPath, externalDataPath, sdkVersion, instance, assetManager).
-    const fields: [*]const ?*anyopaque = @ptrCast(@alignCast(act));
-    const am: *AAssetManager = @ptrCast(fields[8] orelse return 0);
-    var name_buf: [256]u8 = undefined;
-    const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch return 0;
-    const asset = AAssetManager_open(am, name_z.ptr, AASSET_MODE_STREAMING) orelse return 0;
-    defer AAsset_close(asset);
-    var start: i64 = 0;
-    var len: i64 = 0;
-    // An independent (dup'd) fd, so closing the AAsset above is fine; we own
-    // it, and `decodeTrack` reads it synchronously.
-    const fd = AAsset_openFileDescriptor64(asset, &start, &len);
-    if (fd < 0) return 0;
-    defer _ = close(fd);
-    var pcm = @import("labelle_android").video.decodeTrack(heap.allocator, fd, start, len) catch return 0;
+    const android = @import("labelle_android");
+    // labelle-android opens the asset in the APK (it reads the activity's
+    // asset manager through the NDK header) and hands back a dup'd fd.
+    const asset = android.assets.openFd(labelle_bgfx_get_native_activity(), name) orelse return 0;
+    // `decodeTrack` reads the fd synchronously and leaves it open.
+    defer asset.close();
+    var pcm = android.video.decodeTrack(heap.allocator, asset.fd, asset.start, asset.len) catch return 0;
     defer pcm.deinit(heap.allocator);
     std.log.info("[audio] music asset {s}: {d} frames ({d:.2} s at 48 kHz)", .{ name, pcm.frames, @as(f64, @floatFromInt(pcm.frames)) / 48000.0 });
     // The mixer copies the samples, so the decoded buffer is freed here.
