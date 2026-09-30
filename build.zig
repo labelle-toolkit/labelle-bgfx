@@ -916,6 +916,20 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&renderer_select_run.step);
     b.step("test-renderer-select", "Test the LABELLE_BGFX_RENDERER table and init diagnostics (#176)").dependOn(&renderer_select_run.step);
 
+    // ── Unit tests for the presented-frame counter (#182) ──
+    // `src/frame_counter.zig` is pure Zig (an atomic u64 + its C-ABI export
+    // `labelle_bgfx_frames_presented`), so it executes on the host.
+    const frame_counter_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/frame_counter.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    const frame_counter_run = b.addRunArtifact(frame_counter_tests);
+    test_step.dependOn(&frame_counter_run.step);
+    b.step("test-frame-counter", "Test the labelle_bgfx_frames_presented counter (#182)").dependOn(&frame_counter_run.step);
+
     // ── Unit tests for the window-icon frame builder (labelle-cli#359) ──
     // `src/window_icon.zig` is pure Zig (size table + box downscale, no
     // zglfw/stb/bgfx), so it EXECUTES on the host like platform.zig. The
