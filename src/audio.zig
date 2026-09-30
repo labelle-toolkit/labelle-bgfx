@@ -208,7 +208,9 @@ pub fn loadMusicAsset(name: []const u8) u32 {
 
 /// A music asset being decoded off the calling thread by
 /// `loadMusicAssetAsync`. The caller owns it (e.g. a file-scope `var`) and
-/// keeps it alive until `poll` returns non-null.
+/// keeps it alive until `poll` returns non-null. Call `wait` before `deinit`
+/// if a load may still be running, so the worker can't register its music
+/// into (and restart) a mixer that is shutting down.
 pub const MusicAssetLoad = struct {
     name_buf: [256]u8 = undefined,
     name_len: usize = 0,
@@ -227,14 +229,28 @@ pub const MusicAssetLoad = struct {
         }
         return id;
     }
+
+    /// Block until the decode is done; then the music id, or 0 if the load
+    /// failed or was never started.
+    pub fn wait(self: *MusicAssetLoad) u32 {
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        const id = self.result.load(.acquire);
+        return if (id == pending) 0 else id;
+    }
 };
 
 /// `loadMusicAsset` on a worker thread, so a long decode doesn't freeze the
 /// game. Poll `load.poll()` each frame. Returns false if it couldn't start
-/// (name too long, no thread). Single-threaded targets load synchronously,
-/// so `poll` is ready at once.
+/// (name too long, no thread, or `load` is still decoding a previous asset).
+/// Single-threaded targets load synchronously, so `poll` is ready at once.
 pub fn loadMusicAssetAsync(load: *MusicAssetLoad, name: []const u8) bool {
-    if (name.len > load.name_buf.len) return false;
+    // A running worker reads `name_buf`; don't overwrite it under it.
+    if (load.thread != null and load.poll() == null) return false;
+    // Leave room for the NUL the Android asset path needs.
+    if (name.len >= load.name_buf.len) return false;
     @memcpy(load.name_buf[0..name.len], name);
     load.name_len = name.len;
     // Bring the mixer up here, on the caller's thread, not from the worker.
@@ -415,4 +431,21 @@ test "loadMusicAssetAsync reports a missing asset as 0 once the worker is done" 
 test "loadMusicAssetAsync refuses a name longer than its buffer" {
     var load: MusicAssetLoad = .{};
     try testing.expect(!loadMusicAssetAsync(&load, "m" ** 300));
+    // No room left for the NUL terminator.
+    try testing.expect(!loadMusicAssetAsync(&load, "m" ** 256));
+}
+
+test "MusicAssetLoad.wait joins the worker and returns its result" {
+    var load: MusicAssetLoad = .{};
+    try testing.expect(loadMusicAssetAsync(&load, "music/does_not_exist.ogg"));
+    try testing.expectEqual(@as(u32, 0), load.wait());
+    try testing.expect(load.thread == null);
+    // The finished load can be reused.
+    try testing.expect(loadMusicAssetAsync(&load, "music/does_not_exist.ogg"));
+    try testing.expectEqual(@as(u32, 0), load.wait());
+}
+
+test "MusicAssetLoad.wait on a load that never started returns 0" {
+    var load: MusicAssetLoad = .{};
+    try testing.expectEqual(@as(u32, 0), load.wait());
 }
