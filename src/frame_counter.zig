@@ -12,13 +12,21 @@
 //! enough: readers only need an eventually-visible count, not ordering against
 //! other memory.
 //!
+//! Storage is `usize`, not `u64`: not every target has 64-bit atomics (wasm32
+//! rejects `@atomicLoad`/`@atomicRmw` on u64), and `usize` is atomic
+//! everywhere. It is u64 on 64-bit targets and u32 on 32-bit ones (wasm32,
+//! armv7). The exported C ABI stays `u64`; the value is widened on return. A
+//! 32-bit counter at 60 fps wraps after ~2.2 years of continuous rendering
+//! without a re-init, which is fine for this counter's consumers (a crash guard
+//! asks "≥ N frames since init?").
+//!
 //! Only `window.zig` may import this file: it owns a process-wide global and
 //! an exported symbol, so it must be compiled into exactly one module.
 const std = @import("std");
 
 /// A counter instance. The process-wide one is `global`; tests use their own.
 pub const Counter = struct {
-    value: std.atomic.Value(u64) = .init(0),
+    value: std.atomic.Value(usize) = .init(0),
 
     /// A frame was submitted via `bgfx.frame()`.
     pub fn presented(self: *Counter) void {
@@ -31,8 +39,9 @@ pub const Counter = struct {
         self.value.store(0, .monotonic);
     }
 
+    /// The count, widened to the u64 the C ABI exposes.
     pub fn get(self: *const Counter) u64 {
-        return self.value.load(.monotonic);
+        return @as(u64, self.value.load(.monotonic));
     }
 };
 
@@ -67,6 +76,17 @@ test "reset (init / shutdown) returns the count to zero and counting resumes" {
     try std.testing.expectEqual(@as(u64, 0), c.get());
     c.presented();
     try std.testing.expectEqual(@as(u64, 1), c.get());
+}
+
+test "get widens the usize storage to u64 (max value round-trips)" {
+    var c: Counter = .{};
+    c.value.store(std.math.maxInt(usize), .monotonic);
+    const got = c.get();
+    try std.testing.expectEqual(u64, @TypeOf(got));
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(usize)), got);
+    // Wraps (at the storage width) rather than trapping on overflow.
+    c.presented();
+    try std.testing.expectEqual(@as(u64, 0), c.get());
 }
 
 test "exported symbol reads the global counter" {
