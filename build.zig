@@ -900,6 +900,50 @@ pub fn build(b: *std.Build) void {
 
     test_step.dependOn(&b.addRunArtifact(platform_tests).step);
 
+    // ── Unit tests for the LABELLE_BGFX_RENDERER table + D4 verdict (#176) ──
+    // `src/renderer_select.zig` references only zbgfx's `RendererType` enum
+    // (a pure Zig binding module), so it EXECUTES on the host with no bgfx
+    // library linked, like platform.zig.
+    const renderer_select_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/renderer_select.zig"),
+            .target = host_target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zbgfx", .module = zbgfx_mod }},
+        }),
+    });
+    const renderer_select_run = b.addRunArtifact(renderer_select_tests);
+    test_step.dependOn(&renderer_select_run.step);
+    b.step("test-renderer-select", "Test the LABELLE_BGFX_RENDERER table and init diagnostics (#176)").dependOn(&renderer_select_run.step);
+
+    // ── Unit tests for the presented-frame counter (#182) ──
+    // `src/frame_counter.zig` is pure Zig (an atomic `usize` counter + its C-ABI `u64` export
+    // `labelle_bgfx_frames_presented`), so it executes on the host.
+    const frame_counter_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/frame_counter.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    const frame_counter_run = b.addRunArtifact(frame_counter_tests);
+    test_step.dependOn(&frame_counter_run.step);
+    b.step("test-frame-counter", "Test the labelle_bgfx_frames_presented counter (#182)").dependOn(&frame_counter_run.step);
+
+    // ── Unit tests for browser touch-identifier keys (#187) ──
+    // `src/touch_key.zig` is pure Zig; input.zig only reaches it on wasm, so
+    // test it as its own root on the host rather than through input.zig.
+    const touch_key_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/touch_key.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    const touch_key_run = b.addRunArtifact(touch_key_tests);
+    test_step.dependOn(&touch_key_run.step);
+    b.step("test-touch-key", "Test browser touch-identifier keys, incl. iOS negative ids (#187)").dependOn(&touch_key_run.step);
+
     // ── Unit tests for the window-icon frame builder (labelle-cli#359) ──
     // `src/window_icon.zig` is pure Zig (size table + box downscale, no
     // zglfw/stb/bgfx), so it EXECUTES on the host like platform.zig. The

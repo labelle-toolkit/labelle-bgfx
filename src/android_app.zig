@@ -876,6 +876,18 @@ pub fn run(app: *android_app) void {
         // the activity is in the foreground.
         if (shell.bgfx_ready and shell.is_resumed) {
             if (tick_fn) |cb| cb();
+            // The game quit (`game.quit()` → the generated `gameFrame` →
+            // `window.requestQuit()`, the same seam desktop closes its GLFW
+            // window through). This loop only ends when the activity is
+            // destroyed, so ask labelle-android to finish it; the usual
+            // TERM_WINDOW/DESTROY teardown above then runs (FP#979). Only the
+            // first call does anything. Gated so this builds against a
+            // labelle-android that predates `activity`.
+            if (comptime @hasDecl(labelle_android, "activity")) {
+                if (window.quitRequested()) {
+                    if (app.activity) |activity| _ = labelle_android.activity.finish(@ptrCast(activity));
+                }
+            }
         }
     }
 

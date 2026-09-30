@@ -406,13 +406,45 @@ var material_initialized: bool = false;
 /// pool. Cleared by `shutdownPrograms` for a fresh post-surface-loss attempt.
 var material_failed: bool = false;
 
+/// Shader-variant name bgfx needs for `renderer` — the suffix of the embedded
+/// arrays and the `labelle-core` `ShaderVariants` field (`dx11` for D3D).
+/// Used by the named "no variant" log lines (labelle-bgfx#176).
+pub fn shaderVariantName(renderer: bgfx.RendererType) []const u8 {
+    return switch (renderer) {
+        .Metal => "mtl",
+        .Vulkan => "spv",
+        .OpenGLES => "essl",
+        .OpenGL => "glsl",
+        .Direct3D11, .Direct3D12 => "dx11",
+        .WebGPU => "wgsl",
+        .Agc, .Gnm => "pssl",
+        .Nvn => "nvn",
+        .Noop, .Count => "none",
+    };
+}
+
+/// Log the named line for a material / post-fx pass that has no shader variant
+/// for the active renderer (labelle-bgfx#176). Grep-stable format:
+/// `material '<name>': no <variant> variant for <renderer>`.
+pub fn logMissingVariant(name: []const u8, renderer: bgfx.RendererType) void {
+    std.log.warn("material '{s}': no {s} variant for {s}", .{ name, shaderVariantName(renderer), @tagName(renderer) });
+}
+
 /// Select the renderer-appropriate fragment bytecode for a material shader.
+/// The embedded set covers Metal/Vulkan/OpenGLES/OpenGL; any other renderer
+/// (e.g. Direct3D after a bgfx fallback) gets the named log line and the GLSL
+/// bytes as before, which then fail to build (the effect/pass degrades).
 fn materialFsData(comptime base: []const u8) []const u8 {
-    return switch (bgfx.getRendererType()) {
+    const renderer = bgfx.getRendererType();
+    return switch (renderer) {
         .Metal => &@field(shaders_data, base ++ "_mtl"),
         .Vulkan => &@field(shaders_data, base ++ "_spv"),
         .OpenGLES => &@field(shaders_data, base ++ "_essl"),
-        else => &@field(shaders_data, base ++ "_glsl"),
+        .OpenGL => &@field(shaders_data, base ++ "_glsl"),
+        else => blk: {
+            logMissingVariant(base, renderer);
+            break :blk &@field(shaders_data, base ++ "_glsl");
+        },
     };
 }
 

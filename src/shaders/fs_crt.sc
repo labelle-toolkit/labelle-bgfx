@@ -42,8 +42,19 @@ void main()
 	float lines = 0.5 + 0.5 * abs(sin(warp.y * u_postfx_texel.w * 3.14159265));
 	float scan = mix(1.0, lines, clamp(u_postfx_params.y, 0.0, 1.0));
 
-	// Shadow mask: a soft 3-pixel RGB column stripe by `mask`.
-	float stripe = 0.6 + 0.4 * step(0.5, fract(warp.x * u_postfx_texel.z / 3.0));
+	// Shadow mask: a soft 3-pixel RGB column stripe by `mask` — column 0 of
+	// every 3 dimmed, columns 1 and 2 full. The column is the integer index of
+	// THIS fragment's pixel (the unwarped `v_texcoord0`; the pass writes a
+	// target the size of its source), never a hard step on the WARPED coord
+	// (labelle-bgfx#179). A step on `fract(warp.x * w / 3.0)` has pixels right
+	// on its edge — every third pixel centre near the ~identity centre, and
+	// scattered ones wherever the warp drifts across an edge — and GLES vs
+	// Vulkan interpolation/rounding put those on different sides (1.0 vs 0.88).
+	// A pixel centre is 0.5 px from any `floor` edge and `cell` (0.5/1.5/2.5)
+	// is 0.5 from the step, so every renderer picks the same column. At 3 px
+	// pitch the stripes look the same; they just no longer bend with the warp.
+	float cell = mod(floor(v_texcoord0.x * u_postfx_texel.z) + 0.5, 3.0);
+	float stripe = 0.6 + 0.4 * step(1.0, cell);
 	float m = mix(1.0, stripe, clamp(u_postfx_params.z, 0.0, 1.0));
 
 	gl_FragColor = vec4(col * scan * m, srcA);
