@@ -13,6 +13,10 @@ const platform = @import("platform.zig");
 const bgfx_callback = @import("bgfx_callback.zig");
 /// `LABELLE_BGFX_RENDERER` table + D4 requested/actual verdict (labelle-bgfx#176).
 const renderer_select = @import("renderer_select.zig");
+/// Presented-frame counter behind the exported `labelle_bgfx_frames_presented`
+/// (labelle-bgfx#182). Reset on every successful init and after every
+/// shutdown; bumped after each per-frame `bgfx.frame()` in `endFrame`.
+const frame_counter = @import("frame_counter.zig");
 /// labelle-core, for the comptime window-contract conformance gate below.
 const core = @import("labelle-core");
 
@@ -631,6 +635,11 @@ fn requestedRenderer(default: bgfx.RendererType) bgfx.RendererType {
 /// ordinary init-failure path.
 fn acceptInitRenderer(requested: bgfx.RendererType) bool {
     const verdict = renderer_select.reportInit(requested, bgfx.getRendererType());
+    // Every init path (desktop, headless, wasm, Android incl. surface-restore
+    // re-inits) funnels a successful `bgfx.init` through here, so this is the
+    // single reset point for the presented-frame counter (#182) — on both
+    // outcomes: a fresh context, or a `Noop` one we just shut down.
+    frame_counter.global.reset();
     if (verdict == .noop) {
         bgfx.shutdown();
         return false;
@@ -863,6 +872,7 @@ pub fn initHeadless(w: i32, h: i32) bool {
     if (headless_fb.idx == std.math.maxInt(u16)) {
         std.log.err("bgfx: headless offscreen framebuffer creation failed ({d}x{d})", .{ w, h });
         bgfx.shutdown();
+        frame_counter.global.reset();
         return false;
     }
 
@@ -1109,6 +1119,7 @@ pub fn teardownSurface() void {
         headless_fb = .{ .idx = INVALID_HANDLE };
     }
     bgfx.shutdown();
+    frame_counter.global.reset();
 }
 
 pub fn closeWindow() void {
@@ -1784,6 +1795,10 @@ pub fn endFrame() void {
         has_pending_screenshot = false;
     }
     _ = bgfx.frame(0);
+    // The real per-frame submit (every platform's game loop ends here). The
+    // extra `bgfx.frame` pumps in `captureHeadless` are readback waits, not
+    // presented frames, so they are deliberately not counted (#182).
+    frame_counter.global.presented();
 }
 
 /// Capture the current backbuffer to a file (labelle-cli#227 screenshot
