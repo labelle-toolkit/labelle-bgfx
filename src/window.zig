@@ -1117,11 +1117,38 @@ pub fn shouldQuit() bool {
 /// next `shouldQuit()` exits the loop — the engine keeps `quit()`
 /// backend-agnostic (it only flips `running`), so without this the bgfx loop
 /// only ever exited on the window's own close button and Exit did nothing.
-/// Mirrors the sokol backend's `sapp.requestQuit`. Android shutdown is driven
-/// by the activity lifecycle, not this flag (see `shouldQuit`).
+/// Mirrors the sokol backend's `sapp.requestQuit`.
+///
+/// Every call also records the request (`quitRequested`). That is how the
+/// platform shells without a GLFW window see it: on Android the generated
+/// `gameFrame` forwards `game.quit()` here, and the shell (`android_app.zig`)
+/// polls `quitRequested()` after each frame and asks the platform to close the
+/// app. `shouldQuit` stays false there — the shell's loop ends when the
+/// platform destroys the app, not on this flag (FP#979).
 pub fn requestQuit() void {
+    quit_requested.store(true, .release);
     if (no_glfw) return;
     if (glfw_window) |win| win.setShouldClose(true);
+}
+
+/// Process-wide: once the game has quit it never un-quits (the engine has no
+/// "resume after quit"). Atomic only for safety; the writer (the game's frame)
+/// and the reader (the shell's loop) are the same thread on Android.
+var quit_requested = std.atomic.Value(bool).init(false);
+
+/// Has the game asked to quit (`requestQuit`)? Polled by platform shells that
+/// own the loop but have no GLFW close flag (the Android shell).
+pub fn quitRequested() bool {
+    return quit_requested.load(.acquire);
+}
+
+test "requestQuit records the request for shells without a GLFW window" {
+    // No window exists in the unit test (`glfw_window == null`), so this also
+    // proves the GLFW half is skipped safely.
+    try std.testing.expect(!quitRequested());
+    requestQuit();
+    try std.testing.expect(quitRequested());
+    quit_requested.store(false, .release);
 }
 
 pub fn setTargetFPS(fps: i32) void {
