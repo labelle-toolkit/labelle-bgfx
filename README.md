@@ -252,7 +252,7 @@ implementations, and the generated loop picks the first that works:
 | `LABELLE_HEADLESS_SURFACELESS=0` | Skip the surfaceless attempt and go straight to the invisible window (#61). Also accepts `false` / `no` / `off` / empty. |
 | `LABELLE_BGFX_ASSERT=continue` | Log a failed bgfx debug assert and keep running instead of breaking. Default is to log **and** break — bgfx's own behaviour, minus the silence. |
 | `LABELLE_BGFX_TRACE=1` | Mirror bgfx's internal trace stream to stderr. Very chatty; off by default. **Debug builds only** — bgfx gates `BX_TRACE` on `BGFX_CONFIG_DEBUG`, so it emits nothing to mirror in ReleaseSafe/ReleaseFast. |
-| `LABELLE_BGFX_RENDERER=vulkan\|opengl` | Force the desktop renderer (#30). |
+| `LABELLE_BGFX_RENDERER=vulkan\|vk\|gles\|opengles\|opengl\|gl\|metal` | Request a renderer on every platform, read before each `bgfx.init` (#30, #176). Case-insensitive. Unset/empty keeps the platform default (Windows: Vulkan with an OpenGL retry; elsewhere bgfx auto-select; headless: Metal/Vulkan). An unknown value logs a warning and uses the default. Every init logs `bgfx: renderer requested=<X> actual=<Y>` and warns if bgfx fell back; a `Noop` start is treated as an init failure. `opengl`/`gles` skip the surfaceless headless attempt (no surfaceless GL path). |
 
 ### If a headless run dies with no output
 

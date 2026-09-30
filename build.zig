@@ -900,6 +900,22 @@ pub fn build(b: *std.Build) void {
 
     test_step.dependOn(&b.addRunArtifact(platform_tests).step);
 
+    // ── Unit tests for the LABELLE_BGFX_RENDERER table + D4 verdict (#176) ──
+    // `src/renderer_select.zig` references only zbgfx's `RendererType` enum
+    // (a pure Zig binding module), so it EXECUTES on the host with no bgfx
+    // library linked, like platform.zig.
+    const renderer_select_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/renderer_select.zig"),
+            .target = host_target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zbgfx", .module = zbgfx_mod }},
+        }),
+    });
+    const renderer_select_run = b.addRunArtifact(renderer_select_tests);
+    test_step.dependOn(&renderer_select_run.step);
+    b.step("test-renderer-select", "Test the LABELLE_BGFX_RENDERER table and init diagnostics (#176)").dependOn(&renderer_select_run.step);
+
     // ── Unit tests for the window-icon frame builder (labelle-cli#359) ──
     // `src/window_icon.zig` is pure Zig (size table + box downscale, no
     // zglfw/stb/bgfx), so it EXECUTES on the host like platform.zig. The
