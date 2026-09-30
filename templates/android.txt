@@ -366,9 +366,20 @@ fn gameInit() callconv(.c) void {
 // Per-frame tick: advance the engine, then render through bgfx. Mirrors
 // the desktop template's loop body (tick → beginFrame → render →
 // endFrame). The shell only calls this while the surface is live and
-// the activity is resumed, so no `isRunning()`/close handling is needed
-// here — the activity lifecycle drives shutdown.
+// the activity is resumed.
 fn gameFrame() callconv(.c) void {
+    // Honor `game.quit()` (e.g. the menu Exit button), exactly as the desktop
+    // loop does: the engine only flips its `running` flag, so forward it to
+    // `window.requestQuit()`. The shell sees the request after this frame and
+    // asks the platform to close the app (FP#979); until the activity is
+    // gone, don't tick/render a game that has already quit. Gated so backends
+    // that predate `requestQuit` still build.
+    if (comptime @hasDecl(window, "requestQuit")) {
+        if (!g.isRunning()) {
+            window.requestQuit();
+            return;
+        }
+    }
     // Frame-rate-independent sim: derive dt from the real frame period
     // (`window.frameDuration` measures it with a monotonic clock) instead of
     // a fixed 0.016, so game speed doesn't drift if the device renders below
