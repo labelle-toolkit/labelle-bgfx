@@ -585,6 +585,13 @@ fn initWindowAndroid(w: i32, h: i32) void {
     init.platformData.queue = null;
     init.platformData.type = .Default;
     bgfx_callback.install(&init);
+    // `init.fallback` is deliberately left at bgfx's default (`true`, set by
+    // `Init::Init` in bgfx.cpp): when the requested renderer fails to create,
+    // `rendererCreate` walks the remaining supported backends, with OpenGLES
+    // ranked first on Android. That internal fallback IS Android's recovery
+    // (labelle-android's crash guard relies on it); unlike the desktop policy
+    // (`renderer_select.bgfxFallback`), there is no retry of our own here.
+    // `acceptInitRenderer` still rejects a Noop / shader-less actual renderer.
 
     if (!bgfx.init(&init)) {
         std.log.err("bgfx: renderer init failed (requested={s})", .{renderer_select.rendererName(init.type)});
@@ -621,9 +628,11 @@ fn requestedRenderer(default: bgfx.RendererType) bgfx.RendererType {
 
 /// D4 (RFC #172): after a `bgfx.init` that returned true, log
 /// `requested=<X> actual=<Y>` (warning when bgfx's fallback changed it), and
-/// reject `Noop` — bgfx's last-resort fallback that renders nothing. On `Noop`
-/// the context is shut down and `false` returned, so the caller takes its
-/// ordinary init-failure path.
+/// reject `Noop` — bgfx's last-resort fallback that renders nothing — and any
+/// actual renderer this backend ships no shader variants for (Direct3D after
+/// bgfx's internal fallback on Windows, PR #194; `hasShaderVariants`). On a
+/// rejection the context is shut down and `false` returned, so the caller
+/// takes its ordinary init-failure path (the desktop OpenGL retry included).
 fn acceptInitRenderer(requested: bgfx.RendererType) bool {
     const verdict = renderer_select.reportInit(requested, bgfx.getRendererType());
     // Every init path (desktop, headless, wasm, Android incl. surface-restore
@@ -631,7 +640,7 @@ fn acceptInitRenderer(requested: bgfx.RendererType) bool {
     // single reset point for the presented-frame counter (#182) — on both
     // outcomes: a fresh context, or a `Noop` one we just shut down.
     frame_counter.global.reset();
-    if (verdict == .noop) {
+    if (!renderer_select.accepted(verdict)) {
         bgfx.shutdown();
         return false;
     }
@@ -680,6 +689,11 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     // Vulkan on Windows (#30) and Linux (#193); auto (Metal) on macOS, the
     // deliberate macOS choice (owner decision).
     init.type = requestedRenderer(desktop_policy.default);
+    // Windows/Linux own the retry below, so bgfx's internal fallback is off:
+    // otherwise a failed Vulkan "succeeds" on Direct3D11 on Windows (no D3D
+    // shader variants) and the OpenGL retry never runs (PR #194). macOS keeps
+    // bgfx's default. See `renderer_select.bgfxFallback`.
+    init.fallback = renderer_select.bgfxFallback(desktop_policy, .initial);
     init.swapChain.width = @intCast(screen_w);
     init.swapChain.height = @intCast(screen_h);
     init.reset = current_reset;
@@ -715,8 +729,9 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     init.platformData.type = .Default;
     bgfx_callback.install(&init);
 
-    // A `Noop` start counts as a failed init (D4, #176): `acceptInitRenderer`
-    // has already shut it down, so the retry below starts from a clean slate.
+    // A `Noop` or shader-less (e.g. Direct3D) start counts as a failed init
+    // (D4, #176, #194): `acceptInitRenderer` has already shut it down, so the
+    // retry below starts from a clean slate.
     if (!(bgfx.init(&init) and acceptInitRenderer(init.type))) {
         // The requested renderer was unavailable. Where the OS policy has an
         // init fallback (Windows and Linux: OpenGL, the last renderer with
@@ -731,6 +746,9 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
                 renderer_select.rendererName(init.type), renderer_select.rendererName(retry),
             });
             init.type = retry;
+            // Never let the retry fall through to another backend: a failed
+            // OpenGL must fail here, not land on Direct3D.
+            init.fallback = renderer_select.bgfxFallback(desktop_policy, .retry);
             initialized = bgfx.init(&init) and acceptInitRenderer(init.type);
         }
         // If bgfx is still not up — the fallback also failed, or there was no
@@ -833,6 +851,11 @@ pub fn initHeadless(w: i32, h: i32) bool {
     var init: bgfx.Init = undefined;
     bgfx.initCtor(&init);
     init.type = requested;
+    // Same rule as the windowed path: on Windows/Linux bgfx must not swap the
+    // failed Vulkan for Direct3D (it can init surfaceless too). A failure
+    // returns false and the caller's invisible-window path applies the
+    // windowed policy (Vulkan, then OpenGL). macOS keeps bgfx's default.
+    init.fallback = renderer_select.bgfxFallback(desktop_policy, .initial);
     // No backbuffer/swapchain exists, so the resolution MUST be 0×0 (bgfx:
     // "resolution of non-existing backbuffer can't be larger than 0x0!"). The
     // real render size lives on the offscreen framebuffer created below.
@@ -850,8 +873,8 @@ pub fn initHeadless(w: i32, h: i32) bool {
         std.log.err("bgfx: headless init failed (no {s} device available?)", .{@tagName(init.type)});
         return false;
     }
-    // D4 (#176): log requested/actual; a `Noop` start is a failed init (the
-    // caller falls back to the invisible window).
+    // D4 (#176): log requested/actual; a `Noop` or shader-less start is a
+    // failed init (the caller falls back to the invisible window).
     if (!acceptInitRenderer(init.type)) return false;
 
     // The primary view has no swapchain to present to — bind it to an offscreen

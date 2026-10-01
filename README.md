@@ -53,13 +53,21 @@ host-tested). `LABELLE_BGFX_RENDERER` (below) overrides the default everywhere.
 | Windows | Vulkan (no Direct3D shader variants, #30) | retry OpenGL once |
 | Linux | Vulkan (owner decision, #193) | retry OpenGL once |
 | macOS | bgfx auto → Metal, by owner decision (the best renderer on macOS; never Vulkan) | fail |
-| Headless / surfaceless | Vulkan (Windows/Linux), Metal (macOS) | fall back to the invisible-window path |
-| Android | set by labelle-android (`LABELLE_BGFX_RENDERER`) | bgfx's own fallback |
+| Headless / surfaceless | Vulkan (Windows/Linux), Metal (macOS) | fall back to the invisible-window path (then the windowed policy above) |
+| Android | set by labelle-android (`LABELLE_BGFX_RENDERER`) | bgfx's internal fallback (`Init.fallback`, default on; GLES ranked first) |
 | Web | bgfx auto → WebGL2 (OpenGLES) | fail |
 
 The OpenGL retry is per platform, not per request: an explicit
 `LABELLE_BGFX_RENDERER=vulkan` that fails on Windows or Linux also retries
 OpenGL. Every init logs `requested=<X> actual=<Y>` (D4).
+
+On Windows and Linux (windowed and surfaceless) bgfx's own `Init.fallback` is
+turned off, for the first attempt and the OpenGL retry alike, so a failed
+renderer returns to labelle's policy instead of bgfx silently starting another
+backend (on Windows that would be Direct3D11, #194). As a second guard, every
+init path treats an actual renderer without shipped shader variants as an init
+failure: only Metal, Vulkan, OpenGLES and OpenGL have them. macOS, Android and
+web keep bgfx's internal fallback.
 
 ## Shared gamepad and Android packages
 
@@ -270,7 +278,7 @@ implementations, and the generated loop picks the first that works:
 | `LABELLE_HEADLESS_SURFACELESS=0` | Skip the surfaceless attempt and go straight to the invisible window (#61). Also accepts `false` / `no` / `off` / empty. |
 | `LABELLE_BGFX_ASSERT=continue` | Log a failed bgfx debug assert and keep running instead of breaking. Default is to log **and** break — bgfx's own behaviour, minus the silence. |
 | `LABELLE_BGFX_TRACE=1` | Mirror bgfx's internal trace stream to stderr. Very chatty; off by default. **Debug builds only** — bgfx gates `BX_TRACE` on `BGFX_CONFIG_DEBUG`, so it emits nothing to mirror in ReleaseSafe/ReleaseFast. |
-| `LABELLE_BGFX_RENDERER=vulkan\|vk\|gles\|opengles\|opengl\|gl\|metal` | Request a renderer on every platform, read before each `bgfx.init` (#30, #176). Case-insensitive. Unset/empty keeps the platform default (Windows and Linux: Vulkan with an OpenGL retry; elsewhere bgfx auto-select; headless: Metal/Vulkan). An unknown value logs a warning and uses the default. Every init logs `bgfx: renderer requested=<X> actual=<Y>` and warns if bgfx fell back; a `Noop` start is treated as an init failure. `opengl`/`gles` skip the surfaceless headless attempt (no surfaceless GL path). |
+| `LABELLE_BGFX_RENDERER=vulkan\|vk\|gles\|opengles\|opengl\|gl\|metal` | Request a renderer on every platform, read before each `bgfx.init` (#30, #176). Case-insensitive. Unset/empty keeps the platform default (Windows and Linux: Vulkan with an OpenGL retry; elsewhere bgfx auto-select; headless: Metal/Vulkan). An unknown value logs a warning and uses the default. Every init logs `bgfx: renderer requested=<X> actual=<Y>` and warns if bgfx fell back; a `Noop` start, or one on a renderer with no shipped shader variants (e.g. Direct3D), is treated as an init failure. `opengl`/`gles` skip the surfaceless headless attempt (no surfaceless GL path). |
 
 ### If a headless run dies with no output
 

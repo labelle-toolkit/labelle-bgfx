@@ -71,20 +71,57 @@ pub fn rendererName(r: RendererType) []const u8 {
     return if (r == .Count) "auto" else @tagName(r);
 }
 
+/// Whether this backend ships shader variants for `r`: the renderers
+/// `gfx/programs.zig` has embedded arms for (Metal `mtl`, Vulkan `spv`,
+/// OpenGLES `essl`, OpenGL `glsl`). Any other renderer would be handed GLSL
+/// bytecode it cannot load: invalid programs, imgui off, and a crash at the
+/// first sprite (labelle-bgfx#30, labelle-engine#683). The switch is
+/// exhaustive on purpose, so a renderer added to bgfx's enum is a compile
+/// error here rather than a silent "supported".
+pub fn hasShaderVariants(r: RendererType) bool {
+    return switch (r) {
+        .Metal, .Vulkan, .OpenGLES, .OpenGL => true,
+        .Noop, .Agc, .Direct3D11, .Direct3D12, .Gnm, .Nvn, .WebGPU, .Count => false,
+    };
+}
+
 /// D4 verdict on a `bgfx.init` that returned true.
 pub const InitVerdict = enum {
     /// Got what was asked for (or `auto` picked a real renderer).
     ok,
-    /// bgfx's fallback started a different renderer than the explicit request.
+    /// bgfx's fallback started a different renderer than the explicit request
+    /// (one we ship shaders for, so it is kept).
     fallback,
     /// bgfx came up on `Noop`: nothing renders. Treated as an init failure.
     noop,
+    /// bgfx came up on a renderer this backend ships no shader variants for
+    /// (e.g. Direct3D11 after bgfx's internal fallback on Windows, PR #194).
+    /// Treated as an init failure, so the caller's retry path runs.
+    unsupported,
 };
 
 pub fn classify(requested: RendererType, actual: RendererType) InitVerdict {
     if (actual == .Noop) return .noop;
+    if (!hasShaderVariants(actual)) return .unsupported;
     if (requested == .Count or requested == actual) return .ok;
     return .fallback;
+}
+
+/// Whether a verdict keeps the context (`ok`/`fallback`) or turns the init
+/// into a failure (`noop`/`unsupported`: shutdown + the caller's failure path).
+pub fn accepted(verdict: InitVerdict) bool {
+    return switch (verdict) {
+        .ok, .fallback => true,
+        .noop, .unsupported => false,
+    };
+}
+
+/// One `bgfx.init` attempt, end to end: `init_returned` is what `bgfx.init`
+/// returned, `actual` is `bgfx.getRendererType()` after it. `true` = keep the
+/// context; `false` = the attempt failed (the caller shuts a live context down
+/// and consults `initRetryRenderer`).
+pub fn attemptAccepted(requested: RendererType, init_returned: bool, actual: RendererType) bool {
+    return init_returned and accepted(classify(requested, actual));
 }
 
 /// Log the D4 line for a successful `bgfx.init` and return the verdict. The
@@ -101,6 +138,10 @@ pub fn reportInit(requested: RendererType, actual: RendererType) InitVerdict {
         .noop => std.log.err(
             "bgfx: renderer requested={s} came up as Noop (nothing would render); treating as an init failure",
             .{rendererName(requested)},
+        ),
+        .unsupported => std.log.err(
+            "bgfx: renderer requested={s} came up as {s}, which this backend ships no shader variants for; treating as an init failure",
+            .{ rendererName(requested), rendererName(actual) },
         ),
     }
     return verdict;
@@ -135,6 +176,31 @@ pub fn desktopPolicy(os: std.Target.Os.Tag) DesktopPolicy {
     return switch (os) {
         .windows, .linux => .{ .default = .Vulkan, .init_fallback = .OpenGL },
         else => .{ .default = .Count, .init_fallback = null },
+    };
+}
+
+/// Which `bgfx.init` attempt of the windowed-desktop sequence.
+pub const Attempt = enum { initial, retry };
+
+/// The value for `bgfx.Init.fallback` on `attempt`.
+///
+/// bgfx's `Init::Init` defaults `fallback = true`, and `rendererCreate` then
+/// walks its per-platform score list when the requested renderer fails to
+/// create. On Windows that list puts Direct3D11/12 first, so a failed Vulkan
+/// init "succeeds" on Direct3D11 (reproduced by Codex on PR #194 with
+/// `VK_ICD_FILENAMES` pointed at a bogus ICD), and our OpenGL retry never runs.
+///
+/// So: where the policy owns a retry (`init_fallback != null`: Windows and
+/// Linux) the internal fallback is OFF on every attempt, so a failed request
+/// returns `false` and the policy decides what comes next. The retry itself is
+/// always OFF too: a failed OpenGL retry must fail, never land on Direct3D.
+/// Policies with no retry of their own (macOS, other OSes) keep bgfx's
+/// default: macOS behaviour is unchanged (auto → Metal). `classify` still
+/// rejects an unsupported actual renderer on every path as a second guard.
+pub fn bgfxFallback(policy: DesktopPolicy, attempt: Attempt) bool {
+    return switch (attempt) {
+        .initial => policy.init_fallback == null,
+        .retry => false,
     };
 }
 
@@ -205,7 +271,7 @@ test "classify: auto and exact matches are ok" {
 
 test "classify: a different actual renderer is a fallback" {
     try testing.expectEqual(InitVerdict.fallback, classify(.Vulkan, .OpenGLES));
-    try testing.expectEqual(InitVerdict.fallback, classify(.Vulkan, .Direct3D11));
+    try testing.expectEqual(InitVerdict.fallback, classify(.Vulkan, .OpenGL));
     try testing.expectEqual(InitVerdict.fallback, classify(.Metal, .Vulkan));
 }
 
@@ -266,4 +332,87 @@ test "initRetryRenderer: no retry on macOS, whatever was requested" {
     const p = desktopPolicy(.macos);
     for ([_]RendererType{ .Count, .Metal, .Vulkan, .OpenGL }) |r|
         try testing.expectEqual(@as(?RendererType, null), initRetryRenderer(p, r));
+}
+
+test "hasShaderVariants: exactly the shipped set (mtl/spv/essl/glsl)" {
+    // Every RendererType, so a new bgfx renderer can't slip past this table.
+    inline for (@typeInfo(RendererType).@"enum".fields) |f| {
+        const r: RendererType = @enumFromInt(f.value);
+        const expected = switch (r) {
+            .Metal, .Vulkan, .OpenGLES, .OpenGL => true,
+            else => false,
+        };
+        try testing.expectEqual(expected, hasShaderVariants(r));
+    }
+    for ([_]RendererType{ .Noop, .Agc, .Direct3D11, .Direct3D12, .Gnm, .Nvn, .WebGPU, .Count }) |r|
+        try testing.expect(!hasShaderVariants(r));
+}
+
+test "classify: an actual renderer with no shader variants is unsupported" {
+    // The PR #194 Windows repro: Vulkan requested, bgfx's internal fallback
+    // started Direct3D11. Not a kept `.fallback` any more.
+    try testing.expectEqual(InitVerdict.unsupported, classify(.Vulkan, .Direct3D11));
+    try testing.expectEqual(InitVerdict.unsupported, classify(.OpenGL, .Direct3D11));
+    try testing.expectEqual(InitVerdict.unsupported, classify(.Count, .Direct3D11));
+    for ([_]RendererType{ .Agc, .Direct3D12, .Gnm, .Nvn, .WebGPU }) |r|
+        try testing.expectEqual(InitVerdict.unsupported, classify(.Vulkan, r));
+    // Noop keeps its own verdict (checked first).
+    try testing.expectEqual(InitVerdict.noop, classify(.Vulkan, .Noop));
+}
+
+test "accepted: ok and fallback keep the context; noop and unsupported fail" {
+    try testing.expect(accepted(.ok));
+    try testing.expect(accepted(.fallback));
+    try testing.expect(!accepted(.noop));
+    try testing.expect(!accepted(.unsupported));
+}
+
+test "bgfxFallback: Windows and Linux disable bgfx's internal fallback on both attempts" {
+    for ([_]std.Target.Os.Tag{ .windows, .linux }) |os| {
+        const p = desktopPolicy(os);
+        try testing.expectEqual(false, bgfxFallback(p, .initial));
+        try testing.expectEqual(false, bgfxFallback(p, .retry));
+    }
+}
+
+test "bgfxFallback: macOS and other OSes keep bgfx's default on the initial attempt" {
+    // No policy-owned retry there, so bgfx's own fallback is unchanged
+    // (macOS: auto -> Metal, owner decision). A retry never happens on these
+    // policies, but if it did it would still be fallback=false.
+    for ([_]std.Target.Os.Tag{ .macos, .freebsd, .openbsd, .netbsd }) |os| {
+        const p = desktopPolicy(os);
+        try testing.expectEqual(true, bgfxFallback(p, .initial));
+        try testing.expectEqual(false, bgfxFallback(p, .retry));
+        try testing.expectEqual(@as(?RendererType, null), initRetryRenderer(p, p.default));
+    }
+}
+
+test "init sequence: Vulkan 'succeeding' on Direct3D11 is rejected and retries OpenGL" {
+    // PR #194 repro, end to end through the pure policy: bgfx.init returned
+    // true but the actual renderer is Direct3D11.
+    for ([_]std.Target.Os.Tag{ .windows, .linux }) |os| {
+        const p = desktopPolicy(os);
+        const requested = p.default;
+        // The mechanism: the attempt is rejected because of the verdict,
+        // not because init returned false.
+        try testing.expectEqual(InitVerdict.unsupported, classify(requested, .Direct3D11));
+        try testing.expect(!attemptAccepted(requested, true, .Direct3D11));
+        const retry = initRetryRenderer(p, requested) orelse return error.TestExpectedRetry;
+        try testing.expectEqual(RendererType.OpenGL, retry);
+        try testing.expectEqual(false, bgfxFallback(p, .retry));
+        // The retry is accepted on OpenGL, rejected on Direct3D (defensive:
+        // fallback=false should make that impossible), and never retries again.
+        try testing.expect(attemptAccepted(retry, true, .OpenGL));
+        try testing.expect(!attemptAccepted(retry, true, .Direct3D11));
+        try testing.expect(!attemptAccepted(retry, false, .OpenGL));
+        try testing.expectEqual(@as(?RendererType, null), initRetryRenderer(p, retry));
+    }
+}
+
+test "attemptAccepted: a false init or Noop fails; a real shipped renderer passes" {
+    try testing.expect(!attemptAccepted(.Vulkan, false, .Vulkan));
+    try testing.expect(!attemptAccepted(.Vulkan, true, .Noop));
+    try testing.expect(attemptAccepted(.Vulkan, true, .Vulkan));
+    try testing.expect(attemptAccepted(.Count, true, .Metal));
+    try testing.expect(attemptAccepted(.Count, true, .OpenGLES));
 }
