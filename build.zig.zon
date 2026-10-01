@@ -46,9 +46,10 @@
         // (commit 0b229b7). It moved to the labelle-toolkit org on GitHub so it
         // sits with the rest of the toolkit and so upstreaming is a normal PR;
         // the Codeberg copy is stale and should not be repinned.
+        // #188 CI candidate: exact PR9 head; replace with released tag/hash before merge.
         .zbgfx = .{
-            .url = "https://github.com/labelle-toolkit/zbgfx/archive/refs/tags/v0.12.2.tar.gz",
-            .hash = "zbgfx-0.12.2-Sm4IxFYBDQdj-XPqTpWnWfv7W4QHa5LxmR6ZL4wkqzRS",
+            .url = "https://github.com/labelle-toolkit/zbgfx/archive/4c49e6a120d4eff0164d8f5e35f5e7b646f8dd7c.tar.gz",
+            .hash = "zbgfx-0.12.2-Sm4IxJtWDQc2LXOG920sw6BbOyrQS6ohpT5gPyL9FKG5",
         },
         .zglfw = .{
             .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",
