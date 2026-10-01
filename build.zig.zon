@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0x9cd73c2cb5d6d1eb,
     .name = .labelle_bgfx,
-    .version = "0.33.0",
+    .version = "0.33.1",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Browser persistent storage (IndexedDB bridge), wasm-only (lazy).
@@ -46,8 +46,8 @@
         // sits with the rest of the toolkit and so upstreaming is a normal PR;
         // the Codeberg copy is stale and should not be repinned.
         .zbgfx = .{
-            .url = "https://github.com/labelle-toolkit/zbgfx/archive/5f3f9074164b457ca1f2e411166456203d9ae7e3.tar.gz",
-            .hash = "zbgfx-0.12.1-Sm4IxFYBDQdFNAW0eXqsmK_DTtfBfPcg2UEoTNviDhv7",
+            .url = "https://github.com/labelle-toolkit/zbgfx/archive/5ff87a2261f32f951fc9c7dba08268a74f3113e1.tar.gz",
+            .hash = "zbgfx-0.12.2-Sm4IxFYBDQdj-XPqTpWnWfv7W4QHa5LxmR6ZL4wkqzRS",
         },
         .zglfw = .{
             .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",
