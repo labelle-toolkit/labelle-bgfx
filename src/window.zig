@@ -597,26 +597,16 @@ fn initWindowAndroid(w: i32, h: i32) void {
     bgfx.setViewRect(0, 0, 0, @intCast(w), @intCast(h), 0.0, 1.0);
 }
 
-/// The platform's DEFAULT renderer for the windowed desktop init
-/// (labelle-bgfx#30), used when `LABELLE_BGFX_RENDERER` is unset/invalid.
-///
-/// bgfx's `.Count` auto-select resolves to **Direct3D11** on Windows, but this
-/// backend ships NO Direct3D shader variants — `gfx/programs.zig` only has
-/// Metal/Vulkan/OpenGLES/GLSL arms, so a D3D context is handed GLSL bytecode →
-/// invalid shaders, imgui disabled, and a crash at the first sprite draw
-/// (labelle-engine#683; the imgui-bgfx D3D11 bridge gap is the same root cause).
-/// Until DXBC variants exist, steer Windows onto a renderer that HAS variants:
-///   - default: Vulkan (`.spv` sprite/YUV variants exist),
-///   - fallback: OpenGL (the existing `-p 120` GLSL `else` arm) — see the
-///     init-failure retry in `initWindowDesktop`.
-///
-/// Every other desktop OS keeps `.Count` (auto): macOS→Metal and
-/// Linux→OpenGL/Vulkan already resolve to renderers this backend has shader
-/// variants for. The `LABELLE_BGFX_RENDERER` override (every platform, #176)
-/// is applied on top by `requestedRenderer`.
-fn desktopDefaultRenderer() bgfx.RendererType {
-    return if (builtin.target.os.tag == .windows) .Vulkan else .Count;
-}
+/// The windowed desktop init's renderer policy for this build's OS: the
+/// default (Vulkan on Windows and Linux, bgfx auto elsewhere so macOS gets
+/// Metal) and the one-shot OpenGL init-failure retry. The per-OS table and its
+/// reasons (Windows has no Direct3D shader variants, labelle-bgfx#30; Linux is
+/// the owner's Vulkan-by-default decision, #193) live in
+/// `renderer_select.desktopPolicy`, host-tested. `LABELLE_BGFX_RENDERER`
+/// (#176) is applied on top by `requestedRenderer`. Android (os tag `.linux`)
+/// never reads this: `initWindowAndroid` requests `.Count` and labelle-android
+/// sets the variable.
+const desktop_policy = renderer_select.desktopPolicy(builtin.target.os.tag);
 
 /// The renderer to hand `bgfx.init`: `LABELLE_BGFX_RENDERER` when it names one
 /// (table in `renderer_select.zig`), else `default` — the calling init path's
@@ -685,10 +675,9 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     var init: bgfx.Init = undefined;
     bgfx.initCtor(&init);
 
-    // Renderer: `LABELLE_BGFX_RENDERER` if set (#176); else `.Count` (auto) on
-    // macOS/Linux and a variant-backed renderer on Windows, since auto → D3D11
-    // there has no shaders (labelle-bgfx#30).
-    init.type = requestedRenderer(desktopDefaultRenderer());
+    // Renderer: `LABELLE_BGFX_RENDERER` if set (#176); else the OS default —
+    // Vulkan on Windows (#30) and Linux (#193), auto (Metal) on macOS.
+    init.type = requestedRenderer(desktop_policy.default);
     init.swapChain.width = @intCast(screen_w);
     init.swapChain.height = @intCast(screen_h);
     init.reset = current_reset;
@@ -727,25 +716,28 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     // A `Noop` start counts as a failed init (D4, #176): `acceptInitRenderer`
     // has already shut it down, so the retry below starts from a clean slate.
     if (!(bgfx.init(&init) and acceptInitRenderer(init.type))) {
-        // The preferred renderer was unavailable. On Windows fall back to OpenGL
-        // — the last renderer with valid shader variants (labelle-bgfx#30) — so a
-        // box without Vulkan still renders instead of failing init outright.
-        // (`.Count`/non-Windows already tried the platform's best; nothing to
-        // retry there.) An explicit `LABELLE_BGFX_RENDERER=opengl` also lands
-        // here directly and skips the retry.
+        // The requested renderer was unavailable. Where the OS policy has an
+        // init fallback (Windows and Linux: OpenGL, the last renderer with
+        // valid shader variants), retry once, so a box without a working
+        // Vulkan driver still renders; D4 logs requested vs actual. This also
+        // covers an explicit `LABELLE_BGFX_RENDERER=vulkan` that fails. A
+        // failed OpenGL request, and macOS (auto already tried Metal), have
+        // nothing to retry.
         var initialized = false;
-        if (builtin.target.os.tag == .windows and init.type != .OpenGL) {
-            std.log.warn("bgfx: renderer {} init failed; retrying with OpenGL", .{init.type});
-            init.type = .OpenGL;
+        if (renderer_select.initRetryRenderer(desktop_policy, init.type)) |retry| {
+            std.log.warn("bgfx: renderer {s} init failed; retrying with {s}", .{
+                renderer_select.rendererName(init.type), renderer_select.rendererName(retry),
+            });
+            init.type = retry;
             initialized = bgfx.init(&init) and acceptInitRenderer(init.type);
         }
-        // If bgfx is still not up — the OpenGL fallback also failed, or there was
-        // no fallback to try (non-Windows, or OpenGL was already the selection) —
-        // do NOT continue: `setViewClear`/`setViewRect` and every later bgfx call
-        // would run against a dead context (guaranteed crash / UB). Fail the same
-        // way the earlier GLFW steps do — tear the window/GLFW down and return, so
-        // `glfw_window` is null and `shouldQuit()` reports done on the first frame,
-        // exiting the loop cleanly instead of crashing.
+        // If bgfx is still not up — the fallback also failed, or there was no
+        // fallback to try — do NOT continue: `setViewClear`/`setViewRect` and
+        // every later bgfx call would run against a dead context (guaranteed
+        // crash / UB). Fail the same way the earlier GLFW steps do — tear the
+        // window/GLFW down and return, so `glfw_window` is null and
+        // `shouldQuit()` reports done on the first frame, exiting the loop
+        // cleanly instead of crashing.
         if (!initialized) {
             std.log.err("bgfx: renderer init failed (no usable graphics backend); aborting window init", .{});
             win.destroy();
@@ -765,7 +757,8 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
 
 /// Renderer for a TRUE surfaceless init: Vulkan (Windows/Linux) or Metal
 /// (macOS/iOS) — the only bgfx desktop backends that init with no surface.
-/// OpenGL has no surfaceless path, so — unlike the windowed `desktopDefaultRenderer`
+/// This already matches the windowed default on Windows/Linux (Vulkan, #193).
+/// OpenGL has no surfaceless path, so — unlike the windowed `desktop_policy`
 /// — there is NO GL fallback here: without a Vulkan/Metal device, `initHeadless`
 /// fails rather than degrading.
 fn headlessDefaultRenderer() bgfx.RendererType {

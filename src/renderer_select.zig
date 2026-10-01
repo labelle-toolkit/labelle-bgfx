@@ -7,8 +7,10 @@
 //! no bgfx library linked (only the `RendererType` enum is referenced). The
 //! `getenv` call and the `bgfx.init` sequencing live in `window.zig`.
 //!
-//! Platform policy (which renderer a platform USES when the variable is unset)
-//! also stays in `window.zig`; nothing here is platform-specific.
+//! The windowed-desktop platform policy (which renderer each OS uses when the
+//! variable is unset, and which renderer it retries after an init failure) is
+//! here too, as a pure function of the OS tag so every row is host-testable
+//! from any machine. `window.zig` calls it with `builtin.target.os.tag`.
 const std = @import("std");
 const bgfx = @import("zbgfx").bgfx;
 
@@ -104,6 +106,46 @@ pub fn reportInit(requested: RendererType, actual: RendererType) InitVerdict {
     return verdict;
 }
 
+/// Windowed-desktop renderer policy for one OS (labelle-bgfx#30, #193).
+pub const DesktopPolicy = struct {
+    /// Renderer requested when `LABELLE_BGFX_RENDERER` is unset/invalid.
+    /// `.Count` = bgfx auto-select.
+    default: RendererType,
+    /// Renderer retried ONCE when `bgfx.init` with the requested renderer fails
+    /// (or comes up `Noop`). `null` = no retry: the init fails outright.
+    init_fallback: ?RendererType,
+};
+
+/// The windowed-desktop policy for `os`.
+///
+/// - **Windows → Vulkan, OpenGL retry.** bgfx's auto-select picks Direct3D11
+///   there, and this backend ships no Direct3D shader variants
+///   (`gfx/programs.zig` has only Metal/Vulkan/GLES/GLSL arms), so auto would
+///   hand D3D GLSL bytecode and crash at the first sprite (labelle-bgfx#30,
+///   labelle-engine#683).
+/// - **Linux → Vulkan, OpenGL retry.** Owner decision (2026-10-01, RFC #172,
+///   labelle-bgfx#193): Vulkan is the default whenever bgfx is used. The
+///   OpenGL retry keeps a box without a working Vulkan driver starting.
+/// - **Everything else → auto, no retry.** macOS resolves to Metal (our build
+///   has no MoltenVK, so Vulkan is not an option there); other OSes keep
+///   bgfx's own choice.
+pub fn desktopPolicy(os: std.Target.Os.Tag) DesktopPolicy {
+    return switch (os) {
+        .windows, .linux => .{ .default = .Vulkan, .init_fallback = .OpenGL },
+        else => .{ .default = .Count, .init_fallback = null },
+    };
+}
+
+/// The renderer to retry with after `failed` did not init, or `null` for no
+/// retry. Keyed on the platform (`policy.init_fallback`), not on whether the
+/// request came from `LABELLE_BGFX_RENDERER`: an explicit `vulkan` that fails
+/// on Windows/Linux still retries OpenGL (Windows' behaviour since #30). A
+/// failed OpenGL request has nothing left to retry.
+pub fn initRetryRenderer(policy: DesktopPolicy, failed: RendererType) ?RendererType {
+    const fallback = policy.init_fallback orelse return null;
+    return if (failed == fallback) null else fallback;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -175,4 +217,42 @@ test "rendererName: auto for Count, tag name otherwise" {
     try testing.expectEqualStrings("auto", rendererName(.Count));
     try testing.expectEqualStrings("Vulkan", rendererName(.Vulkan));
     try testing.expectEqualStrings("OpenGLES", rendererName(.OpenGLES));
+}
+
+test "desktopPolicy: Windows and Linux default to Vulkan with an OpenGL retry" {
+    for ([_]std.Target.Os.Tag{ .windows, .linux }) |os| {
+        const p = desktopPolicy(os);
+        try testing.expectEqual(RendererType.Vulkan, p.default);
+        try testing.expectEqual(@as(?RendererType, .OpenGL), p.init_fallback);
+    }
+}
+
+test "desktopPolicy: macOS and other OSes keep auto-select with no retry" {
+    for ([_]std.Target.Os.Tag{ .macos, .freebsd, .openbsd, .netbsd }) |os| {
+        const p = desktopPolicy(os);
+        try testing.expectEqual(RendererType.Count, p.default);
+        try testing.expectEqual(@as(?RendererType, null), p.init_fallback);
+    }
+}
+
+test "initRetryRenderer: a failed Vulkan default retries OpenGL on Windows and Linux" {
+    for ([_]std.Target.Os.Tag{ .windows, .linux }) |os| {
+        const p = desktopPolicy(os);
+        try testing.expectEqual(@as(?RendererType, .OpenGL), initRetryRenderer(p, p.default));
+    }
+}
+
+test "initRetryRenderer: explicit non-GL requests retry OpenGL; a failed OpenGL does not" {
+    const p = desktopPolicy(.linux);
+    // Explicit LABELLE_BGFX_RENDERER requests go through the same retry.
+    try testing.expectEqual(@as(?RendererType, .OpenGL), initRetryRenderer(p, .Vulkan));
+    try testing.expectEqual(@as(?RendererType, .OpenGL), initRetryRenderer(p, .OpenGLES));
+    // OpenGL already failed: nothing left, no infinite retry.
+    try testing.expectEqual(@as(?RendererType, null), initRetryRenderer(p, .OpenGL));
+}
+
+test "initRetryRenderer: no retry on macOS, whatever was requested" {
+    const p = desktopPolicy(.macos);
+    for ([_]RendererType{ .Count, .Metal, .Vulkan, .OpenGL }) |r|
+        try testing.expectEqual(@as(?RendererType, null), initRetryRenderer(p, r));
 }
