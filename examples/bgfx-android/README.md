@@ -27,7 +27,7 @@ loop — unchanged.)
 
 APK packaging, install and launch moved out of the labelle CLI into the
 `android` provider, [labelle-android](https://github.com/labelle-toolkit/labelle-android)
-v0.2.0, which needs **labelle-cli v2.0.0 or newer** (older CLIs reserve the
+v0.4.0, which needs **labelle-cli v2.0.0 or newer** (older CLIs reserve the
 `android` namespace and reject the provider). This example does not list the
 provider yet: CI's `android-example` job builds it with labelle-cli v1.71.0,
 which would reject it. To run it on a device, add the plugin and
@@ -35,7 +35,7 @@ its settings file to `project.labelle`:
 
 ```zig
 .plugins = .{
-    .{ .name = "android", .repo = "github.com/labelle-toolkit/labelle-android", .version = "0.2.0" },
+    .{ .name = "android", .repo = "github.com/labelle-toolkit/labelle-android", .version = "0.4.0" },
 },
 .provider_config = .{ .{ .package = "android", .file = "providers/android.json" } },
 ```

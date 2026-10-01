@@ -530,6 +530,33 @@ pub fn build(b: *std.Build) void {
     const sprobe_step = b.step("screenshot-probe", "Run the headless screenshot-to-file validation probe (#36)");
     sprobe_step.dependOn(&b.addRunArtifact(sprobe).step);
 
+    // ── Windowed screenshot + overlay-view probe (labelle-bgfx#68) ──
+    // `zig build windowed-screenshot-probe` — the WINDOWED `--screenshot` path
+    // (`takeScreenshot` → async `requestScreenShot` on the backbuffer), which
+    // `screenshot-probe` (surfaceless `captureHeadless`) does not touch. Paints
+    // the scene on view 0 and the imgui bridge's unbound view 200 on the capture
+    // frame, then reads the `.tga` back and asserts both are in it. Opens an
+    // invisible GLFW window, so it needs a display server (macOS CI, a desktop).
+    const wsprobe = b.addExecutable(.{
+        .name = "windowed_screenshot_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/windowed_screenshot_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    wsprobe.root_module.addImport("zbgfx", zbgfx_mod);
+    wsprobe.root_module.addImport("window", window_mod);
+    wsprobe.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| wsprobe.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        wsprobe.root_module.linkSystemLibrary("gdi32", .{});
+        wsprobe.root_module.linkSystemLibrary("user32", .{});
+    }
+    const wsprobe_step = b.step("windowed-screenshot-probe", "Run the windowed screenshot + imgui-overlay-view probe (#68)");
+    wsprobe_step.dependOn(&b.addRunArtifact(wsprobe).step);
+
     // Exercise real per-frame exhaustion on demand; no GPU needed by unit tests.
     const transient_probe = b.addExecutable(.{
         .name = "transient_exhaustion_probe",
@@ -872,6 +899,50 @@ pub fn build(b: *std.Build) void {
     b.step("test-shader-material", "Run generic shader material ownership, validation and lifecycle tests").dependOn(&shader_material_run.step);
 
     test_step.dependOn(&b.addRunArtifact(platform_tests).step);
+
+    // ── Unit tests for the LABELLE_BGFX_RENDERER table + D4 verdict (#176) ──
+    // `src/renderer_select.zig` references only zbgfx's `RendererType` enum
+    // (a pure Zig binding module), so it EXECUTES on the host with no bgfx
+    // library linked, like platform.zig.
+    const renderer_select_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/renderer_select.zig"),
+            .target = host_target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zbgfx", .module = zbgfx_mod }},
+        }),
+    });
+    const renderer_select_run = b.addRunArtifact(renderer_select_tests);
+    test_step.dependOn(&renderer_select_run.step);
+    b.step("test-renderer-select", "Test the LABELLE_BGFX_RENDERER table and init diagnostics (#176)").dependOn(&renderer_select_run.step);
+
+    // ── Unit tests for the presented-frame counter (#182) ──
+    // `src/frame_counter.zig` is pure Zig (an atomic `usize` counter + its C-ABI `u64` export
+    // `labelle_bgfx_frames_presented`), so it executes on the host.
+    const frame_counter_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/frame_counter.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    const frame_counter_run = b.addRunArtifact(frame_counter_tests);
+    test_step.dependOn(&frame_counter_run.step);
+    b.step("test-frame-counter", "Test the labelle_bgfx_frames_presented counter (#182)").dependOn(&frame_counter_run.step);
+
+    // ── Unit tests for browser touch-identifier keys (#187) ──
+    // `src/touch_key.zig` is pure Zig; input.zig only reaches it on wasm, so
+    // test it as its own root on the host rather than through input.zig.
+    const touch_key_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/touch_key.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    const touch_key_run = b.addRunArtifact(touch_key_tests);
+    test_step.dependOn(&touch_key_run.step);
+    b.step("test-touch-key", "Test browser touch-identifier keys, incl. iOS negative ids (#187)").dependOn(&touch_key_run.step);
 
     // ── Unit tests for the window-icon frame builder (labelle-cli#359) ──
     // `src/window_icon.zig` is pure Zig (size table + box downscale, no

@@ -643,6 +643,9 @@ fn setWasmTouchPos(t: *const em.TouchPoint) void {
     if (comptime gui_enabled) imgui.imgui_bridge_mouse_pos(mouse_x, mouse_y);
 }
 
+// Touch identifiers are opaque bits: iOS Safari reports negative ones (#187).
+const touchKey = @import("touch_key.zig").touchKey;
+
 /// Number of valid entries in the event's touch array (clamped to the fixed 32).
 fn wasmTouchCount(e: *const em.TouchEvent) usize {
     if (e.numTouches <= 0) return 0;
@@ -652,7 +655,7 @@ fn wasmTouchCount(e: *const em.TouchEvent) usize {
 /// The touch point matching `id`, if present in this event.
 fn findWasmTouch(e: *const em.TouchEvent, id: u64) ?*const em.TouchPoint {
     for (e.touches[0..wasmTouchCount(e)]) |*t| {
-        if (@as(u64, @intCast(t.identifier)) == id) return t;
+        if (touchKey(t.identifier) == id) return t;
     }
     return null;
 }
@@ -767,7 +770,7 @@ fn handleWasmPinch(e: *const em.TouchEvent, is_end: bool) bool {
             // Re-seed from the first ACTIVE touch (index 0 may be the lifted one).
             for (e.touches[0..wasmTouchCount(e)]) |*t| {
                 if (touchIsActive(t, is_end)) {
-                    touch_id = @intCast(t.identifier);
+                    touch_id = touchKey(t.identifier);
                     setWasmTouchPos(t);
                     touch_active = true; // resume single-pointer tracking (no press)
                     break;
@@ -788,7 +791,7 @@ fn wasmTouchStart(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) 
     if (handleWasmPinch(e, false)) return true; // ≥2 fingers → pinch-zoom, not a click
     if (touch_active) return true; // already tracking a primary finger
     const t = &e.touches[0];
-    touch_id = @intCast(t.identifier);
+    touch_id = touchKey(t.identifier);
     setWasmTouchPos(t);
     touch_active = true;
     pointer_down = true;
@@ -820,7 +823,7 @@ fn wasmTouchEnd(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bo
     // (as `isChanged`) or omits it. If so, a non-primary finger ended: keep the
     // pointer down and just refresh position.
     for (e.touches[0..wasmTouchCount(e)]) |*t| {
-        if (@as(u64, @intCast(t.identifier)) == touch_id and !t.isChanged) {
+        if (touchKey(t.identifier) == touch_id and !t.isChanged) {
             setWasmTouchPos(t);
             return true;
         }

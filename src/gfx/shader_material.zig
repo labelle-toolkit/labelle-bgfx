@@ -7,6 +7,7 @@ const bgfx = @import("zbgfx").bgfx;
 const embedded = @import("../shaders.zig");
 const texture = @import("texture.zig");
 const binary = @import("shader_binary.zig");
+const programs = @import("programs.zig");
 const Registry = @import("material_store.zig").Store(Driver);
 var registry = Registry{ .allocator = heap.allocator, .driver = .{} };
 var context_active = false;
@@ -35,14 +36,23 @@ fn vertexBytes() []const u8 {
     };
 }
 pub fn create(desc: sm.Descriptor) sm.Error!sm.Id {
-    if (!supported()) return error.Unsupported;
-    const bytes = switch (bgfx.getRendererType()) {
+    if (!context_active) return error.Unsupported;
+    const renderer = bgfx.getRendererType();
+    const label = if (desc.label.len != 0) desc.label else "<unlabelled>";
+    const bytes = switch (renderer) {
         .OpenGL => desc.shaders.glsl,
         .OpenGLES => desc.shaders.essl,
         .Vulkan => desc.shaders.spv,
         .Metal => desc.shaders.mtl,
-        else => return error.Unsupported,
+        else => {
+            // No vertex stage for this renderer either (`vertexBytes`).
+            programs.logMissingVariant(label, renderer);
+            return error.Unsupported;
+        },
     };
+    // The store still returns the error (`Unsupported` for empty bytes); this
+    // just names which material and variant, instead of failing silently (#176).
+    if (bytes.len == 0) programs.logMissingVariant(label, renderer);
     return registry.create(desc, bytes);
 }
 pub fn setParameter(id: sm.Id, name: []const u8, values: []const f32) sm.Error!void {
