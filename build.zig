@@ -1751,6 +1751,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     });
     hook_example_mod.addImport("window", window_mod);
     hook_example_mod.addImport("backend_gfx", gfx_mod);
+    hook_example_mod.addImport("backend_audio", audio_mod);
     const hook_example_lib = b.addLibrary(.{
         .name = "wasm_demo_hook",
         .linkage = .static,
