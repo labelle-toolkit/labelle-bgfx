@@ -37,7 +37,8 @@
         // `-Dvideo` (default off, so no VideoToolbox/CoreMedia/CoreVideo dependency), and
         // raises the x86 CPU baseline to SSE4.2 because bx's simd_t.h now
         // requires it. The screen_shot vtable fix below is still IN this commit.
-        // RFC #172/#175 release: v0.12.1 carries #173/#174/#177/#178/#181, API 161 vendor
+        // RFC #172/#175 release: v0.12.2 adds #195 reset/capture initialization
+        // to #173/#174/#177/#178/#181, API 161 vendor
         // plus the web ASTC fix: the emscripten format table lists the full
         // LDR set, so 8x8 samples natively on WebGL (#147).
         //
@@ -46,7 +47,7 @@
         // sits with the rest of the toolkit and so upstreaming is a normal PR;
         // the Codeberg copy is stale and should not be repinned.
         .zbgfx = .{
-            .url = "https://github.com/labelle-toolkit/zbgfx/archive/5ff87a2261f32f951fc9c7dba08268a74f3113e1.tar.gz",
+            .url = "https://github.com/labelle-toolkit/zbgfx/archive/refs/tags/v0.12.2.tar.gz",
             .hash = "zbgfx-0.12.2-Sm4IxFYBDQdj-XPqTpWnWfv7W4QHa5LxmR6ZL4wkqzRS",
         },
         .zglfw = .{
