@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0x9cd73c2cb5d6d1eb,
     .name = .labelle_bgfx,
-    .version = "0.33.1",
+    .version = "0.33.2",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Browser persistent storage (IndexedDB bridge), wasm-only (lazy).
@@ -37,7 +37,7 @@
         // `-Dvideo` (default off, so no VideoToolbox/CoreMedia/CoreVideo dependency), and
         // raises the x86 CPU baseline to SSE4.2 because bx's simd_t.h now
         // requires it. The screen_shot vtable fix below is still IN this commit.
-        // RFC #172/#175 release: v0.12.2 adds #195 reset/capture initialization
+        // RFC #172/#175 release: v0.12.3 adds #188 pre-rotation on top of #195 reset/capture initialization
         // to #173/#174/#177/#178/#181, API 161 vendor
         // plus the web ASTC fix: the emscripten format table lists the full
         // LDR set, so 8x8 samples natively on WebGL (#147).
@@ -46,9 +46,9 @@
         // (commit 0b229b7). It moved to the labelle-toolkit org on GitHub so it
         // sits with the rest of the toolkit and so upstreaming is a normal PR;
         // the Codeberg copy is stale and should not be repinned.
-        // #188 CI candidate: version-only PR12 release candidate; replace with released tag/hash before merge.
+        // #188: released generic Vulkan pre-rotation; all three consumers use this pin.
         .zbgfx = .{
-            .url = "https://github.com/labelle-toolkit/zbgfx/archive/0d6dac6d29a0726ae148accd6f3286c738202b76.tar.gz",
+            .url = "https://github.com/labelle-toolkit/zbgfx/archive/refs/tags/v0.12.3.tar.gz",
             .hash = "zbgfx-0.12.3-Sm4IxJtWDQcMwkbsyah3s3aOHfxmPZEUl3TZNwV9pXRU",
         },
         .zglfw = .{
