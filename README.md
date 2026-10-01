@@ -52,7 +52,7 @@ host-tested). `LABELLE_BGFX_RENDERER` (below) overrides the default everywhere.
 |---|---|---|
 | Windows | Vulkan (no Direct3D shader variants, #30) | retry OpenGL once |
 | Linux | Vulkan (owner decision, #193) | retry OpenGL once |
-| macOS | bgfx auto → Metal (no MoltenVK in this build) | fail |
+| macOS | bgfx auto → Metal, by owner decision (the best renderer on macOS; never Vulkan) | fail |
 | Headless / surfaceless | Vulkan (Windows/Linux), Metal (macOS) | fall back to the invisible-window path |
 | Android | set by labelle-android (`LABELLE_BGFX_RENDERER`) | bgfx's own fallback |
 | Web | bgfx auto → WebGL2 (OpenGLES) | fail |

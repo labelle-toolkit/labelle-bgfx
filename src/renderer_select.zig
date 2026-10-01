@@ -126,9 +126,11 @@ pub const DesktopPolicy = struct {
 /// - **Linux → Vulkan, OpenGL retry.** Owner decision (2026-10-01, RFC #172,
 ///   labelle-bgfx#193): Vulkan is the default whenever bgfx is used. The
 ///   OpenGL retry keeps a box without a working Vulkan driver starting.
-/// - **Everything else → auto, no retry.** macOS resolves to Metal (our build
-///   has no MoltenVK, so Vulkan is not an option there); other OSes keep
-///   bgfx's own choice.
+/// - **macOS → auto (Metal), no retry.** Metal is the deliberate macOS choice
+///   (owner decision, 2026-10-01: the best renderer there), not a missing
+///   Vulkan feature. Do NOT switch macOS to Vulkan. `.Count` resolves to
+///   Metal; the build also has no MoltenVK.
+/// - **Everything else → auto, no retry:** bgfx's own choice.
 pub fn desktopPolicy(os: std.Target.Os.Tag) DesktopPolicy {
     return switch (os) {
         .windows, .linux => .{ .default = .Vulkan, .init_fallback = .OpenGL },
@@ -227,8 +229,17 @@ test "desktopPolicy: Windows and Linux default to Vulkan with an OpenGL retry" {
     }
 }
 
-test "desktopPolicy: macOS and other OSes keep auto-select with no retry" {
-    for ([_]std.Target.Os.Tag{ .macos, .freebsd, .openbsd, .netbsd }) |os| {
+test "desktopPolicy: macOS stays on auto (Metal), never Vulkan, no retry" {
+    // Owner decision (2026-10-01): Metal is the macOS renderer. `.Count` is
+    // bgfx auto-select, which resolves to Metal on macOS.
+    const p = desktopPolicy(.macos);
+    try testing.expectEqual(RendererType.Count, p.default);
+    try testing.expect(p.default != .Vulkan);
+    try testing.expectEqual(@as(?RendererType, null), p.init_fallback);
+}
+
+test "desktopPolicy: other OSes keep auto-select with no retry" {
+    for ([_]std.Target.Os.Tag{ .freebsd, .openbsd, .netbsd }) |os| {
         const p = desktopPolicy(os);
         try testing.expectEqual(RendererType.Count, p.default);
         try testing.expectEqual(@as(?RendererType, null), p.init_fallback);

@@ -598,8 +598,9 @@ fn initWindowAndroid(w: i32, h: i32) void {
 }
 
 /// The windowed desktop init's renderer policy for this build's OS: the
-/// default (Vulkan on Windows and Linux, bgfx auto elsewhere so macOS gets
-/// Metal) and the one-shot OpenGL init-failure retry. The per-OS table and its
+/// default (Vulkan on Windows and Linux; bgfx auto elsewhere, so macOS gets
+/// Metal, which is the deliberate macOS choice by owner decision, not a
+/// missing feature) and the one-shot OpenGL init-failure retry. The per-OS table and its
 /// reasons (Windows has no Direct3D shader variants, labelle-bgfx#30; Linux is
 /// the owner's Vulkan-by-default decision, #193) live in
 /// `renderer_select.desktopPolicy`, host-tested. `LABELLE_BGFX_RENDERER`
@@ -676,7 +677,8 @@ fn initWindowDesktop(w: i32, h: i32, title: [:0]const u8) void {
     bgfx.initCtor(&init);
 
     // Renderer: `LABELLE_BGFX_RENDERER` if set (#176); else the OS default —
-    // Vulkan on Windows (#30) and Linux (#193), auto (Metal) on macOS.
+    // Vulkan on Windows (#30) and Linux (#193); auto (Metal) on macOS, the
+    // deliberate macOS choice (owner decision).
     init.type = requestedRenderer(desktop_policy.default);
     init.swapChain.width = @intCast(screen_w);
     init.swapChain.height = @intCast(screen_h);
