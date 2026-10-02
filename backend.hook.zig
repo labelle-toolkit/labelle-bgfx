@@ -385,7 +385,10 @@ pub const wasm_editor_exported_runtime_methods_arg =
 /// The page MUST be cross-origin isolated (COOP `same-origin` + COEP
 /// `require-corp`): without it a threaded module fails to start, so the
 /// provider ships it next to a single-threaded fallback.
-pub const wasm_pthread_args = [_][]const u8{ "-pthread", "-sPTHREAD_POOL_SIZE=4" };
+// With imported shared memory, Emscripten defaults INITIAL_MEMORY to 16 MiB
+// instead of deriving it from static data. FP's embedded assets alone need
+// about 32 MiB, so reserve 64 MiB initially; ALLOW_MEMORY_GROWTH stays enabled.
+pub const wasm_pthread_args = [_][]const u8{ "-pthread", "-sPTHREAD_POOL_SIZE=4", "-sINITIAL_MEMORY=67108864" };
 
 /// The pthread args `emLinkStep` adds: all of them on a threaded build,
 /// none otherwise (a single-threaded link must never see `-pthread`).
