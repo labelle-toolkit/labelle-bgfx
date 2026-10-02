@@ -387,6 +387,12 @@ pub const wasm_editor_exported_runtime_methods_arg =
 /// provider ships it next to a single-threaded fallback.
 pub const wasm_pthread_args = [_][]const u8{ "-pthread", "-sPTHREAD_POOL_SIZE=4" };
 
+/// The pthread args `emLinkStep` adds: all of them on a threaded build,
+/// none otherwise (a single-threaded link must never see `-pthread`).
+pub fn pthreadArgs(wasm_threads: bool) []const []const u8 {
+    return if (wasm_threads) &wasm_pthread_args else &.{};
+}
+
 /// Options for `emLinkStep` — the subset of emcc options the wasm residual sets.
 /// Uses only `std.Build`/`std.builtin` types so the hook stays provider-free.
 pub const EmLinkOptions = struct {
@@ -667,7 +673,7 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
     // objects already carry atomics + bulk_memory (the assembler set the
     // target features on a threaded generation); a single-threaded link
     // never sees these args.
-    if (options.wasm_threads) emcc.addArgs(&wasm_pthread_args);
+    emcc.addArgs(pthreadArgs(options.wasm_threads));
 
     // EVERY static lib reachable from the game's link graph (element 0 IS lib_main
     // itself): the game, bgfx/bx/bimg, AND any GUI bridge (bgfx_imgui_bridge +
@@ -993,6 +999,12 @@ test "editor-preview defaults OFF: a pre-preview HookContext/EmLinkOptions liter
     };
     try testing.expect(!opts.editor_preview);
     try testing.expect(!opts.wasm_threads);
+}
+
+test "wasm threads: the link gets the pthread args only when threaded" {
+    // emLinkStep adds exactly `pthreadArgs(options.wasm_threads)`.
+    try testing.expectEqual(@as(usize, 0), pthreadArgs(false).len);
+    try testing.expectEqualSlices([]const u8, &wasm_pthread_args, pthreadArgs(true));
 }
 
 test "wasm threads: -pthread plus a pre-started worker pool (labelle-web#24)" {
