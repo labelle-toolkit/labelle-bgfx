@@ -1728,6 +1728,8 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .install_dir = .prefix,
         .install_subdir = "web",
     });
+    const install_demo_music = b.addInstallFile(b.path("example/assets/music/demo.mp3"), "web/assets/music/demo.mp3");
+    install_web.step.dependOn(&install_demo_music.step);
     b.getInstallStep().dependOn(&install_web.step);
 
     const wasm_step = b.step("wasm-example", "Build the bgfx WebGL/wasm smoke example (emcc → zig-out/web/wasm_demo.html)");
@@ -1772,6 +1774,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     });
     const wasm_hook_step = b.step("wasm-example-hook", "Build the wasm example, linked by backend.hook.zig's emLinkStep (same code as a generated game)");
     wasm_hook_step.dependOn(&hook_install.step);
+    wasm_hook_step.dependOn(&install_demo_music.step);
 
     // A `test` step is expected by CI even on wasm; wire a no-op so `zig build
     // test -Dtarget=wasm32-emscripten` succeeds (the real unit tests run on the

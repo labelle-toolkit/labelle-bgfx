@@ -81,6 +81,8 @@ jobs:
             bgfx-${{ runner.os }}-
       - name: Build + test
         run: zig build test --summary all
+      - name: Browser audio loading and cancellation
+        run: node --test test/web_audio_test.js
       # A green suite is not evidence a test RAN. `src/video/desktop.zig`'s one
       # test was invisible to the runner for its whole life (labelle-bgfx#102):
       # `gfx.zig` re-exports the module through a comptime-gated

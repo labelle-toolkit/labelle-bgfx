@@ -140,8 +140,8 @@
         // sub-packages above. The generated app build must also wire this dep
         // onto the `audio` module (see CLAUDE notes / report).
         .labelle_audio = .{
-            .url = "https://github.com/labelle-toolkit/labelle-audio/archive/refs/tags/v0.2.1.tar.gz",
-            .hash = "labelle_audio-0.2.1-QQRmYI4eAQDChv7DVK74-HPS9_J2bJw5ZDKFOazffYjU",
+            .url = "https://github.com/labelle-toolkit/labelle-audio/archive/refs/tags/v0.4.3.tar.gz",
+            .hash = "labelle_audio-0.4.3-QQRmYB7kBAAefkZ-LltC7r07Q1BzvLzf_lpjMSdqA63p",
         },
         // Emscripten SDK (bgfx-wasm epic labelle-bgfx#8). Provides `emcc` (the
         // WASM link step in `backend.hook.zig`'s wasm `post_wire`) and the

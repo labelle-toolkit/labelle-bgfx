@@ -89,10 +89,17 @@ pub fn ensureInit() void {
 // otherwise. On wasm that grows linear memory behind emscripten's malloc and
 // corrupts its heap and stack (`audio_heap.zig`), so hand it bgfx's heap before
 // anything is allocated. On desktop and Android that is the same
-// page_allocator, so nothing changes there. Setting it is one store, so every
-// entry point that can allocate does it.
+// page_allocator. Publish it once before any worker reads it: repeating init
+// from allocation entry points would race the workers' allocator reads.
+var heap_init_state: std.atomic.Value(u8) = .init(0);
 fn useHeap() void {
-    Audio.init(heap.allocator);
+    if (heap_init_state.load(.acquire) == 2) return;
+    if (heap_init_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+        Audio.init(heap.allocator);
+        heap_init_state.store(2, .release);
+    } else {
+        while (heap_init_state.load(.acquire) != 2) std.atomic.spinLoopHint();
+    }
 }
 
 /// Cumulative frames pushed through the output device callback. >0 confirms the

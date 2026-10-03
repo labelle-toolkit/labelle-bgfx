@@ -26,18 +26,24 @@ EM_JS_DEPS(labelle_web_audio, "$UTF8ToString");
 // page can't decode audio at all.
 EM_JS(int, labelle_web_audio_open_js, (const char *url_ptr), {
     const Offline = globalThis.OfflineAudioContext || globalThis.webkitOfflineAudioContext;
-    if (typeof fetch === 'undefined' || !Offline) return 0;
+    if (typeof fetch === 'undefined' || typeof AbortController === 'undefined' || !Offline) return 0;
     if (!globalThis.__labelleWebAudio) globalThis.__labelleWebAudio = { next: 1, loads: new Map() };
     const reg = globalThis.__labelleWebAudio;
     const url = UTF8ToString(url_ptr);
-    const load = { state: 0, pcm: null, frames: 0 };
+    const controller = new AbortController();
+    const load = { state: 0, pcm: null, frames: 0, controller, timeout: null };
     const id = reg.next++;
     reg.loads.set(id, load);
     const fail = (why) => {
+        if (reg.loads.get(id) !== load || load.state !== 0) return;
         console.warn('audio: ' + url + ': ' + why);
         load.state = -1;
     };
-    fetch(url)
+    load.timeout = setTimeout(() => {
+        fail('fetch/decode timed out');
+        controller.abort();
+    }, 30000);
+    fetch(url, { signal: controller.signal })
         .then((res) => {
             if (!res.ok) throw new Error('HTTP ' + res.status);
             return res.arrayBuffer();
@@ -49,7 +55,7 @@ EM_JS(int, labelle_web_audio_open_js, (const char *url_ptr), {
             if (p && typeof p.catch === 'function') p.catch(reject);
         }))
         .then((buf) => {
-            if (reg.loads.get(id) !== load) return;
+            if (reg.loads.get(id) !== load || load.state !== 0) return;
             const n = buf.length;
             const left = buf.getChannelData(0);
             const right = buf.numberOfChannels > 1 ? buf.getChannelData(1) : left;
@@ -64,7 +70,8 @@ EM_JS(int, labelle_web_audio_open_js, (const char *url_ptr), {
             load.frames = n;
             load.state = 1;
         })
-        .catch((err) => fail(err && err.message ? err.message : String(err)));
+        .catch((err) => fail(err && err.message ? err.message : String(err)))
+        .finally(() => clearTimeout(load.timeout));
     return id;
 });
 
@@ -89,11 +96,15 @@ EM_JS(int, labelle_web_audio_copy_js, (int id, short *ptr, int len), {
     return n;
 });
 
-// Drop the load and its decoded samples. A load still in flight finishes in
-// the background and is discarded.
+// Drop the load and its decoded samples; cancel any outstanding fetch.
 EM_JS(void, labelle_web_audio_close_js, (int id), {
     const reg = globalThis.__labelleWebAudio;
-    if (reg) reg.loads.delete(id);
+    const load = reg && reg.loads.get(id);
+    if (load) {
+        reg.loads.delete(id);
+        clearTimeout(load.timeout);
+        load.controller.abort();
+    }
 });
 
 // ── C entry points called from `audio.zig` ───────────────────────────────────
