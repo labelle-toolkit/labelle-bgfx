@@ -51,8 +51,10 @@ var mix_fn: ?MixFn = null;
 /// Cumulative frames pushed through the device callback. Read once at
 /// `stop` (and via `framesMixed`) to print a single proof-of-life line;
 /// not used for control flow. Atomic because it's written from the audio
-/// thread.
-var frames_mixed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+/// thread. 32-bit on wasm, which has no 64-bit atomics without the atomics
+/// feature (the browser build is single-threaded; it wraps after ~25 h).
+const FrameCount = if (@import("builtin").cpu.arch.isWasm()) u32 else u64;
+var frames_mixed: std.atomic.Value(FrameCount) = std.atomic.Value(FrameCount).init(0);
 
 /// Audio-thread data callback. miniaudio hands us a frame budget and a
 /// raw output buffer for `ma_format_s16` / 2 channels; we reinterpret it
@@ -75,7 +77,7 @@ fn deviceDataCallback(
     // Cheap proof-of-life so headless runs can confirm the callback is
     // actually firing (audibility can't be asserted without a speaker).
     // Log exactly once on the first invocation; thereafter just count.
-    const prev = frames_mixed.fetchAdd(frames, .monotonic);
+    const prev = frames_mixed.fetchAdd(@intCast(frames), .monotonic);
     if (prev == 0) {
         std.log.info("audio: device callback firing (first {d} frames mixed)", .{frames});
     }

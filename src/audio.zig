@@ -6,7 +6,7 @@
 ///
 ///   * It instantiates `labelle_audio.Mixer(device_backend)`, where
 ///     `device_backend` is bgfx's real OS playback device (miniaudio on
-///     desktop, AAudio on Android) selected at comptime. Those device modules
+///     desktop and in the browser, AAudio on Android) selected at comptime. Those device modules
 ///     satisfy the shared `DeviceSink` contract (`ensureStarted`/`stop`/
 ///     `framesMixed`), so the shared mixer drives them directly.
 ///   * Every `pub fn` below forwards to `Audio.*`, preserving bgfx's public
@@ -33,14 +33,15 @@ const labelle_audio = @import("labelle-audio");
 const is_android = builtin.target.os.tag == .linux and
     (builtin.target.abi == .android or builtin.target.abi == .androideabi);
 
-// wasm/Emscripten has no OS playback device wired yet — use the shared
-// device-less NullSink so the mixer compiles + links under emcc (no miniaudio
-// C TU, no AAudio externs). Same observable behavior as headless.
+// wasm/Emscripten plays through miniaudio's Web Audio backend (a
+// ScriptProcessorNode on the page's AudioContext, resumed on the first
+// click/touch), the same `audio_device.zig` desktop uses. `buildWasm` compiles
+// miniaudio with only that backend.
 const is_wasm = builtin.target.cpu.arch.isWasm();
 
 // Output device, selected per target — the shared `DeviceSink` the mixer
 // drives. On Android it's labelle-android's AAudio device (#306, moved there
-// in #149 phase 1c); on desktop it's the miniaudio device. Both expose
+// in #149 phase 1c); on desktop and wasm it's the miniaudio device. Both expose
 // `ensureStarted`/`stop`/`framesMixed`, so they satisfy
 // `labelle_audio.DeviceSink`. `if (is_android)` is comptime, so only the taken
 // branch is analyzed — the desktop miniaudio `@cImport` is never seen on
@@ -48,8 +49,6 @@ const is_wasm = builtin.target.cpu.arch.isWasm();
 // seen on desktop — the same pattern as `zglfw` in `window.zig`.
 const device_backend = if (is_android)
     @import("labelle_android").aaudio
-else if (is_wasm)
-    labelle_audio.NullSink
 else
     @import("audio_device.zig");
 
@@ -82,7 +81,25 @@ pub const targets_audio_loader_contract: u32 = 1;
 /// point that can start audio. On Android this is a no-op pump-wise until the
 /// AAudio stream opens (no device → mixer state advances only when pumped).
 pub fn ensureInit() void {
+    useHeap();
     Audio.ensureInit();
+}
+
+// The mixer owns PCM with its own allocator, `page_allocator` unless told
+// otherwise. On wasm that grows linear memory behind emscripten's malloc and
+// corrupts its heap and stack (`audio_heap.zig`), so hand it bgfx's heap before
+// anything is allocated. On desktop and Android that is the same
+// page_allocator. Publish it once before any worker reads it: repeating init
+// from allocation entry points would race the workers' allocator reads.
+var heap_init_state: std.atomic.Value(u8) = .init(0);
+fn useHeap() void {
+    if (heap_init_state.load(.acquire) == 2) return;
+    if (heap_init_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+        Audio.init(heap.allocator);
+        heap_init_state.store(2, .release);
+    } else {
+        while (heap_init_state.load(.acquire) != 2) std.atomic.spinLoopHint();
+    }
 }
 
 /// Cumulative frames pushed through the output device callback. >0 confirms the
@@ -148,6 +165,7 @@ fn readFileBytes(path: [:0]const u8) ?[]u8 {
 /// file via the libc shim, then hands the bytes to the shared mixer (which owns
 /// decode + the PCM). Returns the sound id, or 0 on failure.
 pub fn loadSound(path: [:0]const u8) u32 {
+    useHeap();
     const bytes = readFileBytes(path) orelse return 0;
     defer heap.allocator.free(bytes);
     return Audio.loadSoundFromMemory(bytes);
@@ -178,9 +196,173 @@ pub fn setSoundVolume(id: u32, volume: f32) void {
 /// Load a WAV file from `path` and register it as a looping music stream. Same
 /// libc file-read shim as `loadSound`. Returns the music id, or 0 on failure.
 pub fn loadMusic(path: [:0]const u8) u32 {
+    useHeap();
     const bytes = readFileBytes(path) orelse return 0;
     defer heap.allocator.free(bytes);
     return Audio.loadMusicFromMemory(bytes);
+}
+
+/// Load the bundled asset `name` (e.g. `"music/theme.ogg"`) and register it
+/// as a looping music stream. Returns the music id, or 0 on failure.
+///
+/// On Android the file is opened in the APK by `labelle_android.assets.openFd`
+/// and decoded by the platform decoder, `labelle_android.video.decodeTrack`
+/// (AMediaExtractor + AMediaCodec, so MP3, OGG Vorbis, AAC and Opus), which
+/// also resamples to the mixer's 48 kHz stereo — the path the intro video's
+/// audio already takes (`src/video/backend.zig`). The asset must be stored
+/// uncompressed in the APK: the NDK refuses an fd for a compressed entry.
+///
+/// The decode is synchronous and takes seconds for a long track on a slow
+/// device (a 2-minute MP3 is ~7 s on the MT6750 P42), long enough for an
+/// Android "not responding" dialog. Games should use `loadMusicAssetAsync`.
+///
+/// On desktop it loads `assets/<name>` with `loadMusic`, so only a WAV at the
+/// device rate works there until desktop decodes compressed audio. The browser
+/// can't fetch synchronously, so on wasm this returns 0: use
+/// `loadMusicAssetAsync`, which fetches and decodes in the browser.
+pub fn loadMusicAsset(name: []const u8) u32 {
+    if (comptime is_android) return loadMusicAssetAndroid(name);
+    var buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&buf, "assets/{s}", .{name}) catch return 0;
+    return loadMusic(path);
+}
+
+/// A music asset being decoded off the calling thread by
+/// `loadMusicAssetAsync`. The caller owns it (e.g. a file-scope `var`) and
+/// keeps it alive until `poll` returns non-null. Call `wait` before `deinit`
+/// if a load may still be running, so the worker can't register its music
+/// into (and restart) a mixer that is shutting down.
+pub const MusicAssetLoad = struct {
+    name_buf: [256]u8 = undefined,
+    name_len: usize = 0,
+    result: std.atomic.Value(u32) = .init(pending),
+    thread: ?std.Thread = null,
+    /// The browser fetch + decode in flight on wasm (`web_audio.c`), 0 if none.
+    web_id: c_int = 0,
+
+    const pending: u32 = std.math.maxInt(u32);
+
+    /// `null` while decoding; then the music id, or 0 if the load failed.
+    pub fn poll(self: *MusicAssetLoad) ?u32 {
+        if (comptime is_wasm) {
+            if (self.web_id != 0) webFinish(self);
+        }
+        const id = self.result.load(.acquire);
+        if (id == pending) return null;
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        return id;
+    }
+
+    /// Block until the decode is done; then the music id, or 0 if the load
+    /// failed or was never started. The browser can't block on a fetch, so on
+    /// wasm a load still in flight is dropped and reported as 0.
+    pub fn wait(self: *MusicAssetLoad) u32 {
+        if (comptime is_wasm) {
+            if (self.web_id != 0) webFinish(self);
+            if (self.web_id != 0) {
+                labelle_web_audio_close(self.web_id);
+                self.web_id = 0;
+                self.result.store(0, .release);
+            }
+        }
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        const id = self.result.load(.acquire);
+        return if (id == pending) 0 else id;
+    }
+};
+
+/// `loadMusicAsset` on a worker thread, so a long decode doesn't freeze the
+/// game. Poll `load.poll()` each frame. Returns false if it couldn't start
+/// (name too long, no thread, or `load` is still decoding a previous asset).
+/// Single-threaded targets load synchronously, so `poll` is ready at once.
+pub fn loadMusicAssetAsync(load: *MusicAssetLoad, name: []const u8) bool {
+    // A running worker reads `name_buf`; don't overwrite it under it.
+    if (load.thread != null and load.poll() == null) return false;
+    if (comptime is_wasm) {
+        if (load.web_id != 0) return false;
+    }
+    // Leave room for the NUL the Android asset path needs.
+    if (name.len >= load.name_buf.len) return false;
+    @memcpy(load.name_buf[0..name.len], name);
+    load.name_len = name.len;
+    // Bring the mixer up here, on the caller's thread, not from the worker.
+    ensureInit();
+    if (comptime is_wasm) return webStart(load, name);
+    if (comptime builtin.single_threaded) {
+        load.result.store(loadMusicAsset(name), .release);
+        return true;
+    }
+    load.result.store(MusicAssetLoad.pending, .release);
+    load.thread = std.Thread.spawn(.{}, loadMusicAssetWorker, .{load}) catch return false;
+    return true;
+}
+
+fn loadMusicAssetWorker(load: *MusicAssetLoad) void {
+    load.result.store(loadMusicAsset(load.name_buf[0..load.name_len]), .release);
+}
+
+// The browser half (`web_audio.c`): fetch `assets/<name>`, decode it with the
+// browser's decoder at 48 kHz stereo, and hand the i16 samples over on request.
+// Only referenced on wasm, so never linked elsewhere.
+extern fn labelle_web_audio_open(url: [*:0]const u8) c_int;
+extern fn labelle_web_audio_status(id: c_int) c_int;
+extern fn labelle_web_audio_copy(id: c_int, ptr: [*]i16, len: c_int) c_int;
+extern fn labelle_web_audio_close(id: c_int) void;
+
+fn webStart(load: *MusicAssetLoad, name: []const u8) bool {
+    if (load.web_id != 0) return false; // still fetching the previous asset
+    var buf: [512]u8 = undefined;
+    const url = std.fmt.bufPrintZ(&buf, "assets/{s}", .{name}) catch return false;
+    const id = labelle_web_audio_open(url.ptr);
+    if (id == 0) return false;
+    load.web_id = id;
+    load.result.store(MusicAssetLoad.pending, .release);
+    return true;
+}
+
+// Once the browser has decoded the asset, copy it into the mixer and close the
+// browser-side load. Leaves `web_id` set while the fetch is still running.
+fn webFinish(load: *MusicAssetLoad) void {
+    const frames = labelle_web_audio_status(load.web_id);
+    if (frames == 0) return;
+    defer {
+        labelle_web_audio_close(load.web_id);
+        load.web_id = 0;
+    }
+    if (frames < 0) return load.result.store(0, .release);
+    const len: usize = @as(usize, @intCast(frames)) * 2;
+    const samples = heap.allocator.alloc(i16, len) catch return load.result.store(0, .release);
+    // The mixer copies the samples, so this buffer is freed here.
+    defer heap.allocator.free(samples);
+    const copied: usize = @intCast(labelle_web_audio_copy(load.web_id, samples.ptr, @intCast(len)));
+    if (copied != len) return load.result.store(0, .release);
+    std.log.info("[audio] music asset {s}: {d} frames ({d:.2} s at 48 kHz)", .{ load.name_buf[0..load.name_len], frames, @as(f64, @floatFromInt(frames)) / 48000.0 });
+    load.result.store(loadMusicFromPcm(samples, 2, 48000), .release);
+}
+
+// The bgfx Android shell's export of the running NativeActivity (the same
+// symbol `src/android.zig` adapts; the audio module can't import that file).
+// Only referenced on Android, so never linked elsewhere.
+extern fn labelle_bgfx_get_native_activity() ?*anyopaque;
+
+fn loadMusicAssetAndroid(name: []const u8) u32 {
+    const android = @import("labelle_android");
+    // labelle-android opens the asset in the APK (it reads the activity's
+    // asset manager through the NDK header) and hands back a dup'd fd.
+    const asset = android.assets.openFd(labelle_bgfx_get_native_activity(), name) orelse return 0;
+    // `decodeTrack` reads the fd synchronously and leaves it open.
+    defer asset.close();
+    var pcm = android.video.decodeTrack(heap.allocator, asset.fd, asset.start, asset.len) catch return 0;
+    defer pcm.deinit(heap.allocator);
+    std.log.info("[audio] music asset {s}: {d} frames ({d:.2} s at 48 kHz)", .{ name, pcm.frames, @as(f64, @floatFromInt(pcm.frames)) / 48000.0 });
+    // The mixer copies the samples, so the decoded buffer is freed here.
+    return loadMusicFromPcm(pcm.samples, 2, 48000);
 }
 
 /// Register an already-decoded interleaved PCM_16 buffer as a looping music
@@ -189,6 +371,7 @@ pub fn loadMusic(path: [:0]const u8) u32 {
 /// device rate (48000): the mixer does not resample. Public signature keeps the
 /// `u16` channels arg bgfx exposed; the shared mixer takes `u8`, so we narrow.
 pub fn loadMusicFromPcm(samples: []const i16, channels: u16, sample_rate: u32) u32 {
+    useHeap();
     if (samples.len == 0 or channels == 0 or channels > 2) return 0;
     return Audio.loadMusicFromPcm(samples, @intCast(channels), sample_rate);
 }
@@ -285,4 +468,49 @@ test "loadMusicFromPcm rejects an out-of-range channel count" {
     Audio.resetForTest();
     const pcm = [_]i16{ 1, 2, 3, 4 };
     try testing.expectEqual(@as(u32, 0), loadMusicFromPcm(&pcm, 3, 48000));
+}
+
+test "loadMusicAsset returns 0 for an asset that isn't there" {
+    try testing.expectEqual(@as(u32, 0), loadMusicAsset("music/does_not_exist.ogg"));
+}
+
+test "loadMusicAsset returns 0 for a name too long for its path buffer" {
+    const long = "m" ** 600;
+    try testing.expectEqual(@as(u32, 0), loadMusicAsset(long));
+}
+
+test "loadMusicAssetAsync reports a missing asset as 0 once the worker is done" {
+    var load: MusicAssetLoad = .{};
+    try testing.expect(loadMusicAssetAsync(&load, "music/does_not_exist.ogg"));
+    const id = while (true) {
+        if (load.poll()) |v| break v;
+        std.Thread.yield() catch {};
+    };
+    try testing.expectEqual(@as(u32, 0), id);
+}
+
+test "loadMusicAssetAsync refuses a name longer than its buffer" {
+    var load: MusicAssetLoad = .{};
+    try testing.expect(!loadMusicAssetAsync(&load, "m" ** 300));
+    // No room left for the NUL terminator.
+    try testing.expect(!loadMusicAssetAsync(&load, "m" ** 256));
+}
+
+test "MusicAssetLoad.wait joins the worker and returns its result" {
+    var load: MusicAssetLoad = .{};
+    try testing.expect(loadMusicAssetAsync(&load, "music/does_not_exist.ogg"));
+    try testing.expectEqual(@as(u32, 0), load.wait());
+    try testing.expect(load.thread == null);
+    // The finished load can be reused.
+    try testing.expect(loadMusicAssetAsync(&load, "music/does_not_exist.ogg"));
+    try testing.expectEqual(@as(u32, 0), load.wait());
+}
+
+test "MusicAssetLoad.wait on a load that never started returns 0" {
+    var load: MusicAssetLoad = .{};
+    try testing.expectEqual(@as(u32, 0), load.wait());
+}
+
+test "Android asset music loader is type checked" {
+    if (comptime is_android) _ = &loadMusicAssetAndroid;
 }

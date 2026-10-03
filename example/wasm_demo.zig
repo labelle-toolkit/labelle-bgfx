@@ -7,7 +7,11 @@
 //!   * the frame is driven by `emscripten_set_main_loop` (the browser owns the
 //!     event loop — a blocking `while` would freeze the page),
 //!   * `gfx.drawRectangleRec` submits through the sprite program (lazy shader
-//!     init) so the whole render seam is exercised.
+//!     init) so the whole render seam is exercised,
+//!   * the audio module plays through miniaudio's Web Audio backend: a looping
+//!     two-note tone from PCM, swapped for `assets/music/demo.mp3` if the page
+//!     serves one (fetched + decoded by `loadMusicAssetAsync`). Browsers start
+//!     audio only after a click or tap on the page.
 //!
 //! This mirrors the shape of the assembler's `templates/wasm.txt` but uses the
 //! backend's own `window` + `gfx` modules directly so it can be built by the
@@ -16,6 +20,7 @@
 const std = @import("std");
 const window = @import("window");
 const gfx = @import("backend_gfx");
+const audio = @import("backend_audio");
 
 const screen_w: i32 = 800;
 const screen_h: i32 = 600;
@@ -71,9 +76,44 @@ pub const panic = std.debug.FullPanic(struct {
 
 var t: f32 = 0;
 
+// Two notes (A4, E5), half a second each, 48 kHz stereo i16.
+const tone_rate = 48000;
+var tone_pcm: [tone_rate * 2]i16 = undefined;
+var music: u32 = 0;
+var asset_load: audio.MusicAssetLoad = .{};
+var asset_pending = false;
+
+fn startAudio() void {
+    for (0..tone_rate) |i| {
+        const hz: f32 = if (i < tone_rate / 2) 440 else 659.25;
+        const s = @sin(2 * std.math.pi * hz * @as(f32, @floatFromInt(i)) / tone_rate);
+        const v: i16 = @intFromFloat(s * 6000);
+        tone_pcm[2 * i] = v;
+        tone_pcm[2 * i + 1] = v;
+    }
+    music = audio.loadMusicFromPcm(&tone_pcm, 2, tone_rate);
+    audio.playMusic(music);
+    asset_pending = audio.loadMusicAssetAsync(&asset_load, "music/demo.mp3");
+}
+
+fn tickAudio() void {
+    if (asset_pending) {
+        if (asset_load.poll()) |id| {
+            asset_pending = false;
+            if (id != 0) {
+                audio.stopMusic(music);
+                music = id;
+                audio.playMusic(music);
+            }
+        }
+    }
+    audio.updateMusic(music);
+}
+
 fn frame() callconv(.c) void {
     const dt: f32 = @min(@as(f32, @floatCast(window.frameDuration())), 4.0 / 60.0);
     t += dt;
+    tickAudio();
 
     // Keep the design canvas mapped onto the live drawing buffer.
     gfx.setScreenSize(window.width(), window.height());
@@ -100,6 +140,7 @@ pub fn main() void {
     _ = std.heap.c_allocator;
 
     window.initWindow(screen_w, screen_h, title);
+    startAudio();
     // No `defer closeWindow()` — emscripten keeps running after main returns;
     // the main-loop callback drives the app.
     emscripten_set_main_loop(&frame, 0, 1);

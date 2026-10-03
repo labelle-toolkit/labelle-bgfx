@@ -1606,12 +1606,15 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const android_gp_dep = b.dependency("labelle_android_gamepad", .{ .target = target, .optimize = optimize });
     input_mod.addImport("android_gamepad", android_gp_dep.module("android_gamepad"));
 
-    // ── Audio backend module (device-less on wasm) ──────────────────────
+    // ── Audio backend module (Web Audio on wasm) ────────────────────────
     // The manifest lists `audio` as a base module on EVERY platform, so the
     // assembler-generated build.zig does `backend_dep.module("audio")`. Create
-    // it here (mirroring desktop/android) — `src/audio.zig` comptime-selects the
-    // shared NullSink on wasm (no miniaudio C TU, no AAudio externs), so it
-    // compiles + links under emcc without an OS playback device.
+    // it here (mirroring desktop/android). `src/audio.zig` drives the same
+    // miniaudio device as desktop (`audio_device.zig`); miniaudio is compiled
+    // with ONLY its Web Audio backend (a ScriptProcessorNode, so no
+    // AudioWorklet, SharedArrayBuffer or COOP/COEP headers), and `web_audio.c`
+    // fetches + decodes music assets in the browser. The macros are module-wide
+    // so the `@cImport` of miniaudio.h sees what miniaudio.c is built with.
     const labelle_audio_dep = b.dependency("labelle_audio", .{ .target = target, .optimize = optimize });
     const audio_mod = b.addModule("audio", .{
         .root_source_file = b.path("src/audio.zig"),
@@ -1620,6 +1623,17 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .link_libc = true,
     });
     audio_mod.addImport("labelle-audio", labelle_audio_dep.module("labelle-audio"));
+    // Sysroot before the C sources, as for gfx_mod above.
+    audio_mod.addSystemIncludePath(emsdk_sysroot_lp);
+    audio_mod.addIncludePath(b.path("libs/miniaudio"));
+    audio_mod.addCMacro("MA_ENABLE_ONLY_SPECIFIC_BACKENDS", "1");
+    audio_mod.addCMacro("MA_ENABLE_WEBAUDIO", "1");
+    // gnu99, not desktop's c99: miniaudio's Web Audio backend uses EM_ASM,
+    // which emscripten refuses in strict -std=c* modes. No UBSan: zig adds it
+    // to C in Debug, and emcc's link has no zig UBSan runtime to resolve
+    // `__ubsan_handle_*` against.
+    audio_mod.addCSourceFile(.{ .file = b.path("libs/miniaudio/miniaudio.c"), .flags = &.{ "-std=gnu99", "-fno-sanitize=undefined" } });
+    audio_mod.addCSourceFile(.{ .file = b.path("src/web_audio.c"), .flags = &.{"-fno-sanitize=undefined"} });
 
     // ── Window backend module ───────────────────────────────────────
     // No zglfw; src/window.zig comptime-selects `initWindowWasm`, which hands
@@ -1651,6 +1665,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     });
     example_mod.addImport("window", window_mod);
     example_mod.addImport("backend_gfx", gfx_mod);
+    example_mod.addImport("backend_audio", audio_mod);
 
     // Compile the Zig side to a static lib; emcc links it + the bgfx C++ archive
     // into the final .wasm/.js/.html.
@@ -1713,6 +1728,8 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .install_dir = .prefix,
         .install_subdir = "web",
     });
+    const install_demo_music = b.addInstallFile(b.path("example/assets/music/demo.mp3"), "web/assets/music/demo.mp3");
+    install_web.step.dependOn(&install_demo_music.step);
     b.getInstallStep().dependOn(&install_web.step);
 
     const wasm_step = b.step("wasm-example", "Build the bgfx WebGL/wasm smoke example (emcc → zig-out/web/wasm_demo.html)");
@@ -1736,6 +1753,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     });
     hook_example_mod.addImport("window", window_mod);
     hook_example_mod.addImport("backend_gfx", gfx_mod);
+    hook_example_mod.addImport("backend_audio", audio_mod);
     const hook_example_lib = b.addLibrary(.{
         .name = "wasm_demo_hook",
         .linkage = .static,
@@ -1756,6 +1774,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     });
     const wasm_hook_step = b.step("wasm-example-hook", "Build the wasm example, linked by backend.hook.zig's emLinkStep (same code as a generated game)");
     wasm_hook_step.dependOn(&hook_install.step);
+    wasm_hook_step.dependOn(&install_demo_music.step);
 
     // A `test` step is expected by CI even on wasm; wire a no-op so `zig build
     // test -Dtarget=wasm32-emscripten` succeeds (the real unit tests run on the

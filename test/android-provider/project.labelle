@@ -1,5 +1,5 @@
 // labelle-cli#405 D11 fixture: this bgfx checkout next to the `android`
-// provider plugin (labelle-android v0.4.0, the release bgfx pins).
+// provider plugin (labelle-android v0.6.0, the release bgfx pins).
 //
 // The assembler wires a plugin as a `.path` dependency and bgfx pins
 // labelle-android by url+hash, so the Android build graph holds two
@@ -34,7 +34,7 @@
         .{ .name = "hud", .order = 0, .space = .screen },
     },
     .plugins = .{
-        .{ .name = "android", .repo = "github.com/labelle-toolkit/labelle-android", .version = "0.4.0" },
+        .{ .name = "android", .repo = "github.com/labelle-toolkit/labelle-android", .version = "0.6.0" },
     },
     .provider_config = .{
         .{ .package = "android", .file = "providers/android.json" },

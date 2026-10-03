@@ -81,6 +81,8 @@ jobs:
             bgfx-${{ runner.os }}-
       - name: Build + test
         run: zig build test --summary all
+      - name: Browser audio loading and cancellation
+        run: node --test test/web_audio_test.js
       # A green suite is not evidence a test RAN. `src/video/desktop.zig`'s one
       # test was invisible to the runner for its whole life (labelle-bgfx#102):
       # `gfx.zig` re-exports the module through a comptime-gated
@@ -458,7 +460,7 @@ jobs:
           stage core/2.1.0 labelle-toolkit/labelle-core v2.1.0
           stage gfx/2.2.0 labelle-toolkit/labelle-gfx v2.2.0
           stage engine/3.4.1 labelle-toolkit/labelle-engine v3.4.1
-          stage plugins/github.com/labelle-toolkit/labelle-android/0.4.0 labelle-toolkit/labelle-android v0.4.0
+          stage plugins/github.com/labelle-toolkit/labelle-android/0.6.0 labelle-toolkit/labelle-android v0.6.0
 
           cd "$GITHUB_WORKSPACE/labelle-bgfx/test/android-provider"
           # Capture, then check: a missing package is only a WARNING to
