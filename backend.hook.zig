@@ -197,6 +197,14 @@ pub const HookContext = struct {
     /// an editor-preview generation (assembler ≥ 0.74.0). Mirrors
     /// `manifest_v2.HookContext`.
     editor_preview: bool = false,
+    /// Threaded web build (labelle-web#24, wasm only): the wasm arm links with
+    /// Emscripten pthreads (`wasm_pthread_args`). DEFAULTED, like
+    /// `editor_preview`, so a generated build.zig that omits it (every
+    /// single-threaded build) keeps compiling; the assembler emits
+    /// `.wasm_threads = true` only on a threaded generation, which also gives
+    /// the target `atomics` + `bulk_memory` and marks every module
+    /// `single_threaded = false` (emcc can't add those after compilation).
+    wasm_threads: bool = false,
 };
 
 /// REQUIRED android SDK accessor — the testable enforcement of "no silent 34
@@ -361,6 +369,33 @@ pub const wasm_editor_exported_functions_arg =
 pub const wasm_editor_exported_runtime_methods_arg =
     "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8";
 
+/// Emscripten pthreads link args, added ONLY on a threaded build
+/// (`wasm_threads`, labelle-web#24). `-pthread` links the threaded runtime
+/// (shared memory, the worker bootstrap); `PTHREAD_POOL_SIZE` pre-starts that
+/// many workers at page load, so `std.Thread.spawn` never waits on the main
+/// loop to create one. 4 covers a job system on phones (an iPhone has 6
+/// cores) while bounding load-time cost.
+///
+/// Heap growth stays on (`wasm_allow_memory_growth_arg`). emcc warns
+/// `-Wpthreads-mem-growth` (JS heap views get slower), but the labelle-web#24
+/// spike ran it on desktop Chromium, WebKit and a real iPhone; only the
+/// iOS 18.7 SIMULATOR crashed. A fixed heap remains an option if the slowdown
+/// shows up in measurements.
+///
+/// The page MUST be cross-origin isolated (COOP `same-origin` + COEP
+/// `require-corp`): without it a threaded module fails to start, so the
+/// provider ships it next to a single-threaded fallback.
+// With imported shared memory, Emscripten defaults INITIAL_MEMORY to 16 MiB
+// instead of deriving it from static data. FP's embedded assets alone need
+// about 32 MiB, so reserve 64 MiB initially; ALLOW_MEMORY_GROWTH stays enabled.
+pub const wasm_pthread_args = [_][]const u8{ "-pthread", "-sPTHREAD_POOL_SIZE=4", "-sINITIAL_MEMORY=67108864" };
+
+/// The pthread args `emLinkStep` adds: all of them on a threaded build,
+/// none otherwise (a single-threaded link must never see `-pthread`).
+pub fn pthreadArgs(wasm_threads: bool) []const []const u8 {
+    return if (wasm_threads) &wasm_pthread_args else &.{};
+}
+
 /// Options for `emLinkStep` — the subset of emcc options the wasm residual sets.
 /// Uses only `std.Build`/`std.builtin` types so the hook stays provider-free.
 pub const EmLinkOptions = struct {
@@ -385,6 +420,9 @@ pub const EmLinkOptions = struct {
     /// `wasm_editor_exported_functions_arg`). Threaded from
     /// `HookContext.editor_preview` by `post_wire`.
     editor_preview: bool = false,
+    /// Threaded build: add `wasm_pthread_args`. Threaded from
+    /// `HookContext.wasm_threads` by `post_wire`.
+    wasm_threads: bool = false,
     /// Whether an external EMSDK must also have the default sysroot include dir
     /// to be used. False only when the caller's C compiles take the sysroot
     /// from elsewhere (build.zig's `-Demsdk_sysroot`), so the link and
@@ -634,6 +672,11 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
         emcc.addArg(wasm_editor_exported_functions_arg);
         emcc.addArg(wasm_editor_exported_runtime_methods_arg);
     }
+    // Threaded web build (labelle-web#24): link Emscripten pthreads. The
+    // objects already carry atomics + bulk_memory (the assembler set the
+    // target features on a threaded generation); a single-threaded link
+    // never sees these args.
+    emcc.addArgs(pthreadArgs(options.wasm_threads));
 
     // EVERY static lib reachable from the game's link graph (element 0 IS lib_main
     // itself): the game, bgfx/bx/bimg, AND any GUI bridge (bgfx_imgui_bridge +
@@ -765,6 +808,7 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
                 .lib_backend = bgfx_artifact,
                 .emsdk = emsdk,
                 .editor_preview = ctx.editor_preview,
+                .wasm_threads = ctx.wasm_threads,
             });
             // `post_wire` is void, so it owns the install/run wiring (mirrors
             // raylib's wasm arm).
@@ -949,6 +993,7 @@ test "editor-preview defaults OFF: a pre-preview HookContext/EmLinkOptions liter
         .android_target_sdk = null,
     };
     try testing.expect(!ctx.editor_preview);
+    try testing.expect(!ctx.wasm_threads);
     const opts: EmLinkOptions = .{
         .optimize = .Debug,
         .lib_main = undefined,
@@ -956,6 +1001,20 @@ test "editor-preview defaults OFF: a pre-preview HookContext/EmLinkOptions liter
         .emsdk = undefined,
     };
     try testing.expect(!opts.editor_preview);
+    try testing.expect(!opts.wasm_threads);
+}
+
+test "wasm threads: the link gets the pthread args only when threaded" {
+    // emLinkStep adds exactly `pthreadArgs(options.wasm_threads)`.
+    try testing.expectEqual(@as(usize, 0), pthreadArgs(false).len);
+    try testing.expectEqualSlices([]const u8, &wasm_pthread_args, pthreadArgs(true));
+}
+
+test "wasm threads: -pthread plus a pre-started worker pool (labelle-web#24)" {
+    // `-pthread` is what links the threaded runtime; without the pool,
+    // `std.Thread.spawn` would wait for the main loop to create a worker.
+    try testing.expectEqualStrings("-pthread", wasm_pthread_args[0]);
+    try testing.expect(std.mem.startsWith(u8, wasm_pthread_args[1], "-sPTHREAD_POOL_SIZE="));
 }
 
 test "emToolPath: EMSDK unset → emsdk dependency (behavior byte-identical to pre-#535)" {

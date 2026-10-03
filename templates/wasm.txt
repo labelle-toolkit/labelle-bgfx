@@ -56,6 +56,10 @@ const BackendGfxType = @import("backend_gfx");
 extern "c" fn emscripten_console_log(str: [*:0]const u8) void;
 
 pub const std_options: std.Options = .{
+    // Zig's ReleaseSafe thread startup installs a POSIX alternate signal
+    // stack by default. Emscripten has no native signals: sigaltstack fails
+    // before the worker entry point runs. Keep runtime safety, skip that setup.
+    .signal_stack_size = null,
     .logFn = struct {
         fn logFn(
             comptime level: std.log.Level,
