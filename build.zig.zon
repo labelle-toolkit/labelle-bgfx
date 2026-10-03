@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0x9cd73c2cb5d6d1eb,
     .name = .labelle_bgfx,
-    .version = "0.34.0",
+    .version = "0.35.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Browser persistent storage (IndexedDB bridge), wasm-only (lazy).
@@ -76,7 +76,7 @@
         // `@import`s its build helpers (`resolveNdk` / `addAndroidSysroot` /
         // `nativeAppGlueDir`, phase 1e) at the top level, which resolves the
         // package on every build — desktop and wasm included.
-        // Pinned to the labelle-android v0.4.0 release tag. v0.2.0 added the
+        // Pinned to the labelle-android v0.6.0 release tag. v0.6.0 exposes APK asset file descriptors. v0.2.0 added the
         // `android` CLI provider (labelle-cli#405); v0.4.0 adds the renderer
         // setting and Vulkan crash guard (labelle-bgfx#172) and
         // `activity.finish`, which `android_app.zig` calls when the game
@@ -92,8 +92,8 @@
         // `labelle_android` imports at the plugin's module; CI's
         // test/android-provider fixture checks the link.
         .labelle_android = .{
-            .url = "https://github.com/labelle-toolkit/labelle-android/archive/refs/tags/v0.4.0.tar.gz",
-            .hash = "labelle_android-0.4.0-sErgQhD2EQAjTrW_EAyyyRM9s1l16o3DeXuvthjJ6Kg3",
+            .url = "https://github.com/labelle-toolkit/labelle-android/archive/refs/tags/v0.6.0.tar.gz",
+            .hash = "labelle_android-0.6.0-sErgQrFVEgALiS0egGbEFTIsfmaAylxbXdhf20v1-vDV",
         },
         // Shared windowless-SDL desktop gamepad source (core#28). In-tree
         // sub-package shared with the raylib and sokol desktop backends via a

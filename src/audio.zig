@@ -277,6 +277,9 @@ pub const MusicAssetLoad = struct {
 pub fn loadMusicAssetAsync(load: *MusicAssetLoad, name: []const u8) bool {
     // A running worker reads `name_buf`; don't overwrite it under it.
     if (load.thread != null and load.poll() == null) return false;
+    if (comptime is_wasm) {
+        if (load.web_id != 0) return false;
+    }
     // Leave room for the NUL the Android asset path needs.
     if (name.len >= load.name_buf.len) return false;
     @memcpy(load.name_buf[0..name.len], name);
@@ -499,4 +502,8 @@ test "MusicAssetLoad.wait joins the worker and returns its result" {
 test "MusicAssetLoad.wait on a load that never started returns 0" {
     var load: MusicAssetLoad = .{};
     try testing.expectEqual(@as(u32, 0), load.wait());
+}
+
+test "Android asset music loader is type checked" {
+    if (comptime is_android) _ = &loadMusicAssetAndroid;
 }
