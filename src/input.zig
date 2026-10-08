@@ -9,6 +9,7 @@ const std = @import("std");
 
 /// labelle-core, for the comptime input-contract conformance gate below.
 const core = @import("labelle-core");
+const gui_pointer = @import("gui_pointer.zig");
 
 // Prove this module satisfies labelle-core's input contract — formerly only a
 // duck-typed claim in the doc comment above. The required core is small
@@ -850,6 +851,10 @@ fn wasmTouchEnd(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bo
         wasm_mouse_released_accum[0] = true;
         if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(0, false);
     }
+    // The finger is gone, so ImGui must stop hovering the lift point (#202).
+    // Its trickled event queue applies this only after the button events
+    // above, so the tap still clicks where the finger was.
+    if (comptime gui_enabled) imgui.imgui_bridge_mouse_pos(gui_pointer.absent, gui_pointer.absent);
     return true;
 }
 
@@ -942,11 +947,14 @@ pub fn newFrame() void {
         if (pointer_down and !pointer_down_prev) mouse_pressed[0] = true;
         if (!pointer_down and pointer_down_prev) mouse_released[0] = true;
         mouse_down[0] = pointer_down;
+        // ImGui loses the pointer from the frame after a release, so it stops
+        // hovering the lift point (#202); the engine's mouse fields keep it.
+        const gui_pos = gui_pointer.touchPos(pointer_down, pointer_down_prev, mouse_x, mouse_y);
         pointer_down_prev = pointer_down;
 
         // Forward the touch pointer to Dear ImGui as mouse pos + button 0.
         // No-op (comptime-eliminated) unless the imgui bridge is linked.
-        forwardGuiInput();
+        forwardGuiInput(gui_pos.x, gui_pos.y);
 
         // Snapshot gamepad button state at the frame boundary so the next
         // frame's `isGamepadButtonPressed` can derive the rising edge (#310
@@ -1054,7 +1062,7 @@ pub fn newFrame() void {
     // Forward the GLFW mouse (cursor pos already in framebuffer pixels above,
     // buttons read live, wheel accumulated by the scroll callback) to Dear
     // ImGui. No-op (comptime-eliminated) unless the imgui bridge is linked.
-    forwardGuiInput();
+    forwardGuiInput(mouse_x, mouse_y);
 }
 
 // ── GUI (Dear ImGui) input forwarding ──────────────────────────────────
@@ -1071,6 +1079,9 @@ pub fn newFrame() void {
 //     the `scrollCallback`-accumulated delta for this frame.
 //   - Android (NDK): the touch pointer is mirrored onto `mouse_x`/`mouse_y` +
 //     `mouse_down[0]`; there is no wheel.
+//
+// On Android a lifted finger is reported as ImGui's "no mouse" position from
+// the frame after its release (`gui_pointer.touchPos`, #202).
 //
 // We forward mouse position every frame and the down-state of buttons 0..2
 // (left/right/middle) — imgui's `AddMouseButtonEvent` only enqueues an event
@@ -1094,10 +1105,10 @@ fn guiButtonDown(button: u32) bool {
     return false;
 }
 
-fn forwardGuiInput() void {
+fn forwardGuiInput(x: f32, y: f32) void {
     if (comptime !gui_enabled) return;
 
-    imgui.imgui_bridge_mouse_pos(mouse_x, mouse_y);
+    imgui.imgui_bridge_mouse_pos(x, y);
 
     var b: u32 = 0;
     while (b < GUI_FORWARDED_BUTTONS) : (b += 1) {
