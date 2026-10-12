@@ -53,10 +53,14 @@ The window module exposes two optional backend APIs:
 - `isCursorOverWindow() bool`: true while a mouse/pen is over the focused
   desktop window or browser canvas. Browser touch input is excluded.
 
-Use `@import("backend_window")` in an assembler-generated game, or the `window`
-module in a standalone backend app. These are backend extensions, not additions
-to the required core contract: games targeting other backends should guard
-calls with `@hasDecl`. No engine or assembler version bump is required.
+Game scripts should use the shared engine API, `game.setCursorVisible(...)`
+and `game.isCursorOverWindow()`. The assembler binds these to the window after
+initialization; core supplies safe false-returning defaults for older backends.
+This requires the companion shared-cursor core, engine and assembler changes.
+
+The `window` declarations here implement that optional core interface. Backend
+standalone applications (including the examples below) may call them directly;
+game scripts do not need a backend import. Native image cursors remain deferred.
 
 Call from the window/draw thread, after initialization. Each frame, compute
 `show = custom_cursor_enabled and window.isCursorOverWindow()`, then call
