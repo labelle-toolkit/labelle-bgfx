@@ -43,6 +43,61 @@ Since the bgfx API 161 vendor (#119):
   or Linux when Vulkan fails to init, or an explicit `LABELLE_BGFX_RENDERER=opengl`.
   macOS uses Metal; Android and WebGL2 use GLES 3.0 and are unaffected.
 
+## Custom mouse pointers
+
+The window module exposes two optional backend APIs:
+
+- `setCursorVisible(visible: bool) bool`: hide the system pointer for a
+  game-drawn overlay, or restore it. Returns false when unsupported or no window
+  exists. Calls before window creation are not queued.
+- `isCursorOverWindow() bool`: true while a mouse/pen is over the focused
+  desktop window or browser canvas. Browser touch input is excluded.
+
+Use `@import("backend_window")` in an assembler-generated game, or the `window`
+module in a standalone backend app. These are backend extensions, not additions
+to the required core contract: games targeting other backends should guard
+calls with `@hasDecl`. No engine or assembler version bump is required.
+
+Call from the window/draw thread, after initialization. Each frame, compute
+`show = custom_cursor_enabled and window.isCursorOverWindow()`, then call
+`window.setCursorVisible(!show)`. Draw the custom artwork **only if** the call
+succeeds and `show` is true. Restore visibility before disabling/removing the
+overlay; `closeWindow()` also restores it. This does not lock, warp or remap
+input coordinates.
+
+Draw last in screen space (e.g. ImGui's foreground draw list), outside the world
+camera. Backend input coordinates are framebuffer pixels. Position the image at
+`mouse_position - hotspot * scale`, scaling the artwork and hotspot equally;
+never apply the world camera/letterbox transform to those coordinates. Keep
+ImGui's built-in `MouseDrawCursor` disabled so it does not add a second pointer.
+The game owns cursor art and scaling; native image cursors are deferred.
+
+Desktop uses GLFW's hidden/normal modes. Web styles only `Module.canvas`, keeps
+the surrounding page untouched, and restores the previous inline cursor value
+and CSS priority. Resize does not replace this style. Android and surfaceless
+runs return false without modifying input.
+
+Examples (C toggles the custom pointer, mouse press turns it red):
+
+```sh
+zig build cursor-example
+zig build -Dtarget=wasm32-emscripten wasm-example
+```
+
+The examples share `example/cursor_overlay.zig`, a triangle with its tip exactly
+at the click hotspot. The web example must be served over HTTP and opened in a
+WebGL2-capable browser. Try moving out of the canvas, switching focus, resizing,
+and changing display scale; the default pointer should return outside the game
+and when C disables the overlay.
+
+Validation:
+
+```sh
+node --test test/web_cursor_test.js
+# Real GLFW mode changes under an X11 display (no GPU needed by this test):
+LABELLE_TEST_CURSOR_WINDOW=1 xvfb-run -a zig build test cursor-example-build
+```
+
 ## Default renderer per platform
 
 Windowed desktop policy lives in `src/renderer_select.zig` (`desktopPolicy`,

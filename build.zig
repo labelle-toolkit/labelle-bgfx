@@ -433,6 +433,28 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(bgfx_artifact);
     if (glfw_artifact) |a| b.installArtifact(a);
 
+    // Shared software-cursor example; the wasm smoke example uses the same overlay.
+    const cursor_example = b.addExecutable(.{
+        .name = "cursor_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("example/cursor_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    cursor_example.root_module.addImport("window", window_mod);
+    cursor_example.root_module.addImport("backend_gfx", gfx_mod);
+    cursor_example.root_module.addImport("backend_input", input_mod);
+    cursor_example.root_module.linkLibrary(bgfx_artifact);
+    if (glfw_artifact) |a| cursor_example.root_module.linkLibrary(a);
+    if (target.result.os.tag == .windows) {
+        cursor_example.root_module.linkSystemLibrary("gdi32", .{});
+        cursor_example.root_module.linkSystemLibrary("user32", .{});
+    }
+    b.step("cursor-example", "Run the custom pointer example (C toggles)").dependOn(&b.addRunArtifact(cursor_example).step);
+    b.step("cursor-example-build", "Compile the custom pointer example").dependOn(&cursor_example.step);
+
     // ── Headless feasibility probe (labelle-bgfx#36, option B) ──────
     // `zig build headless-probe` — inits bgfx with nwh=null (Vulkan), renders
     // into an offscreen framebuffer, and reads a pixel back with NO window.
@@ -1570,6 +1592,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // Browser fullscreen (`window.zig` wasm `setFullscreen`/`isFullscreen`,
     // labelle-bgfx#99): the EM_JS half driving the DOM Fullscreen API.
     gfx_mod.addCSourceFile(.{ .file = b.path("src/web_fullscreen.c"), .flags = &.{} });
+    gfx_mod.addCSourceFile(.{ .file = b.path("src/web_cursor.c"), .flags = &.{} });
     if (b.lazyDependency("labelle_web", .{ .target = target, .optimize = optimize })) |web_storage| {
         gfx_mod.addImport("persistent_storage", web_storage.module("storage"));
         gfx_mod.addCSourceFile(.{ .file = web_storage.path("src/web_storage.c"), .flags = &.{} });
@@ -1665,6 +1688,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     });
     example_mod.addImport("window", window_mod);
     example_mod.addImport("backend_gfx", gfx_mod);
+    example_mod.addImport("backend_input", input_mod);
     example_mod.addImport("backend_audio", audio_mod);
 
     // Compile the Zig side to a static lib; emcc links it + the bgfx C++ archive
@@ -1753,6 +1777,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     });
     hook_example_mod.addImport("window", window_mod);
     hook_example_mod.addImport("backend_gfx", gfx_mod);
+    hook_example_mod.addImport("backend_input", input_mod);
     hook_example_mod.addImport("backend_audio", audio_mod);
     const hook_example_lib = b.addLibrary(.{
         .name = "wasm_demo_hook",
