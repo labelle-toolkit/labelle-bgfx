@@ -21,6 +21,13 @@ pub fn touchPos(down: bool, down_prev: bool, x: f32, y: f32) Pos {
     return .{ .x = x, .y = y };
 }
 
+/// Whether a touch end with `fingers_left` still down removes the pointer.
+/// A pinch whose fingers all lift together ends with no tracked pointer, yet
+/// the hover must still go; while a finger stays, ImGui keeps tracking it.
+pub fn clearsOnTouchEnd(fingers_left: usize) bool {
+    return fingers_left == 0;
+}
+
 test "a finger on the screen is reported where it is" {
     try std.testing.expectEqual(Pos{ .x = 10, .y = 20 }, touchPos(true, false, 10, 20));
     try std.testing.expectEqual(Pos{ .x = 10, .y = 20 }, touchPos(true, true, 10, 20));
@@ -32,4 +39,13 @@ test "the release frame keeps the lift point so the tap still clicks" {
 
 test "after the release frame the pointer is gone" {
     try std.testing.expectEqual(Pos{ .x = absent, .y = absent }, touchPos(false, false, 10, 20));
+}
+
+test "a touch end that leaves no finger down clears the pointer (pinch end)" {
+    try std.testing.expect(clearsOnTouchEnd(0));
+}
+
+test "a touch end with a finger still down keeps the pointer" {
+    try std.testing.expect(!clearsOnTouchEnd(1));
+    try std.testing.expect(!clearsOnTouchEnd(2));
 }

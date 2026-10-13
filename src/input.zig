@@ -818,7 +818,12 @@ fn wasmTouchEnd(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bo
     // finger (isChanged), so `is_end=true` excludes it. Still ≥2 active → stay
     // in pinch; dropping below 2 exits pinch + re-seeds the single pointer.
     if (handleWasmPinch(e, true)) return true;
-    if (!touch_active) return true;
+    if (!touch_active) {
+        // Nothing tracked: a pinch whose fingers all lifted together ends
+        // here. With no finger left, ImGui must still stop hovering (#202).
+        if (gui_pointer.clearsOnTouchEnd(wasmActiveTouchCount(e, true))) clearGuiPointer();
+        return true;
+    }
     // The primary is still down iff it appears in this event as an ACTIVE
     // (not-changed) touch — true whether emscripten includes the ended touch
     // (as `isChanged`) or omits it. If so, a non-primary finger ended: keep the
@@ -854,8 +859,14 @@ fn wasmTouchEnd(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bo
     // The finger is gone, so ImGui must stop hovering the lift point (#202).
     // Its trickled event queue applies this only after the button events
     // above, so the tap still clicks where the finger was.
-    if (comptime gui_enabled) imgui.imgui_bridge_mouse_pos(gui_pointer.absent, gui_pointer.absent);
+    clearGuiPointer();
     return true;
+}
+
+/// Tell ImGui the touch pointer is gone (`-FLT_MAX`), so it stops hovering
+/// the lift point (#202).
+fn clearGuiPointer() void {
+    if (comptime gui_enabled) imgui.imgui_bridge_mouse_pos(gui_pointer.absent, gui_pointer.absent);
 }
 
 /// Register the HTML5 canvas mouse + touch callbacks (wasm only). Called from
