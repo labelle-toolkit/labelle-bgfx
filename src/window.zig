@@ -1141,6 +1141,7 @@ pub fn teardownSurface() void {
 }
 
 pub fn closeWindow() void {
+    _ = setCursorVisible(true);
     // Release the sprite program (+ its shaders), the s_tex sampler
     // uniform, the 1x1 white texture, the font atlas, and any uploaded
     // textures BEFORE bgfx tears down — otherwise bgfx reports these live
@@ -1525,6 +1526,37 @@ pub fn frameDuration() f64 {
     defer last_frame_ns = now;
     if (last_frame_ns == 0 or now <= last_frame_ns) return 1.0 / 60.0;
     return @as(f64, @floatFromInt(now - last_frame_ns)) / @as(f64, std.time.ns_per_s);
+}
+
+// Canvas-scoped browser cursor controls; linked only on wasm.
+extern "c" fn labelle_web_cursor_visible(visible: c_int) c_int;
+extern "c" fn labelle_web_cursor_over() c_int;
+
+/// Show/restore the system pointer, or hide it for a game-drawn cursor.
+/// Returns false without a desktop window/browser canvas (including Android
+/// and surfaceless runs). Calls before init are not queued. Hiding does NOT
+/// lock or warp the pointer, so input coordinates and click targeting stay
+/// unchanged. Call on the window thread, after init. Restore before removing
+/// the game's overlay; closeWindow also restores the browser's prior style.
+/// Native custom image cursors are deliberately not part of this API: draw
+/// artwork in a screen-space overlay with its hotspot at the mouse position.
+pub fn setCursorVisible(visible: bool) bool {
+    if (is_android) return false;
+    if (is_wasm) return labelle_web_cursor_visible(@intFromBool(visible)) != 0;
+    const win = glfw_window orelse return false;
+    win.setInputMode(.cursor, if (visible) .normal else .hidden) catch return false;
+    return true;
+}
+
+/// Whether a custom pointer should be drawn: the pointer is over the focused
+/// game window/canvas. False on touch-only Android and without a window.
+/// Use this each draw frame to restore the system pointer when focus is lost.
+/// Browser touch events are excluded (CSS :hover can remain stuck after taps).
+pub fn isCursorOverWindow() bool {
+    if (is_android) return false;
+    if (is_wasm) return labelle_web_cursor_over() != 0;
+    const win = glfw_window orelse return false;
+    return win.getAttribute(.hovered) and win.getAttribute(.focused);
 }
 
 // Browser Fullscreen API shim (`src/web_fullscreen.c`, wasm graph only). Only
@@ -2276,4 +2308,32 @@ test "window icon: the embedded PNG fixture decodes and yields 32 + 16 frames" {
     try testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, at.px(small, 12, 4));
     try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, at.px(small, 4, 12));
     try testing.expectEqualSlices(u8, &.{ 255, 255, 255, 0 }, at.px(small, 12, 12));
+}
+
+test "cursor controls without a window are safe and unsupported" {
+    try std.testing.expect(!setCursorVisible(false));
+    try std.testing.expect(!setCursorVisible(true));
+    try std.testing.expect(!isCursorOverWindow());
+}
+
+test "desktop cursor visibility changes GLFW mode without locking the pointer" {
+    if (no_glfw) return error.SkipZigTest;
+    // Opt-in real-window integration check, including on display-less CI hosts.
+    if (std.c.getenv("LABELLE_TEST_CURSOR_WINDOW") == null) return error.SkipZigTest;
+    try glfw.init();
+    defer glfw.terminate();
+    glfw.windowHint(.client_api, .no_api);
+    glfw.windowHint(.visible, false);
+    const win = try glfw.createWindow(100, 100, "cursor test", null, null);
+    glfw_window = win;
+    defer {
+        win.destroy();
+        glfw_window = null;
+    }
+    try std.testing.expect(setCursorVisible(false));
+    try std.testing.expectEqual(glfw.Cursor.Mode.hidden, try win.getInputMode(.cursor));
+    try std.testing.expect(setCursorVisible(false));
+    try std.testing.expect(setCursorVisible(true));
+    try std.testing.expectEqual(glfw.Cursor.Mode.normal, try win.getInputMode(.cursor));
+    try std.testing.expect(!isCursorOverWindow()); // hidden test window
 }
