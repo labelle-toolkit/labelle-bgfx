@@ -81,8 +81,8 @@ jobs:
             bgfx-${{ runner.os }}-
       - name: Build + test
         run: zig build test --summary all
-      - name: Browser audio loading and cancellation
-        run: node --test test/web_audio_test.js
+      - name: Browser audio and cursor bridges
+        run: node --test test/web_audio_test.js test/web_cursor_test.js
       # A green suite is not evidence a test RAN. `src/video/desktop.zig`'s one
       # test was invisible to the runner for its whole life (labelle-bgfx#102):
       # `gfx.zig` re-exports the module through a comptime-gated
@@ -864,7 +864,7 @@ jobs:
             libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
             libxinerama-dev libxcursor-dev libxi-dev \
             libwayland-dev libxkbcommon-dev \
-            libvulkan-dev libvulkan1 mesa-vulkan-drivers vulkan-tools
+            libvulkan-dev libvulkan1 mesa-vulkan-drivers vulkan-tools xvfb xauth
       - name: Cache Zig artifacts
         uses: actions/cache@v4
         with:
@@ -878,6 +878,8 @@ jobs:
         env:
           DISPLAY: ""
         run: vulkaninfo --summary 2>/dev/null | grep -iE 'deviceName|driverName|apiVersion' || true
+      - name: Cursor controls with a real GLFW window
+        run: LABELLE_TEST_CURSOR_WINDOW=1 xvfb-run -a zig build test cursor-example-build --summary all
       - name: Run surfaceless probes with NO display server
         env:
           # Prove it's truly display-less: no X/Wayland available to fall back on.

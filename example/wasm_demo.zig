@@ -129,6 +129,7 @@ fn frame() callconv(.c) void {
         gfx.color(180, 120, 255, 255),
     );
 
+    @import("cursor_overlay.zig").draw(); // C toggles; click changes color.
     window.endFrame();
 }
 
