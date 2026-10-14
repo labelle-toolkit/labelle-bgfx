@@ -978,6 +978,19 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(gui_pointer_tests).step);
 
+    // ── Unit tests for the browser touch callbacks (#202) ──
+    // `src/web_touch.zig` is the touch state machine input.zig's wasm-only
+    // callbacks hand each event to, with ImGui passed in, so the callbacks'
+    // logic runs on the host.
+    const web_touch_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/web_touch.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(web_touch_tests).step);
+
     // ── Unit tests for the window-icon frame builder (labelle-cli#359) ──
     // `src/window_icon.zig` is pure Zig (size table + box downscale, no
     // zglfw/stb/bgfx), so it EXECUTES on the host like platform.zig. The

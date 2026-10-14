@@ -10,6 +10,7 @@ const std = @import("std");
 /// labelle-core, for the comptime input-contract conformance gate below.
 const core = @import("labelle-core");
 const gui_pointer = @import("gui_pointer.zig");
+const web_touch = @import("web_touch.zig");
 
 // Prove this module satisfies labelle-core's input contract — formerly only a
 // duck-typed claim in the doc comment above. The required core is small
@@ -80,31 +81,10 @@ const em = if (is_wasm) struct {
         deltaZ: f64,
         deltaMode: u32,
     };
-    // EmscriptenTouchPoint / EmscriptenTouchEvent (html5.h), byte-faithful.
-    const TouchPoint = extern struct {
-        identifier: i32,
-        screenX: i32,
-        screenY: i32,
-        clientX: i32,
-        clientY: i32,
-        pageX: i32,
-        pageY: i32,
-        isChanged: bool,
-        onTarget: bool,
-        targetX: i32,
-        targetY: i32,
-        canvasX: i32,
-        canvasY: i32,
-    };
-    const TouchEvent = extern struct {
-        timestamp: f64,
-        numTouches: i32,
-        ctrlKey: bool,
-        shiftKey: bool,
-        altKey: bool,
-        metaKey: bool,
-        touches: [32]TouchPoint,
-    };
+    // EmscriptenTouchPoint / EmscriptenTouchEvent: shared with the host-tested
+    // touch state machine.
+    const TouchPoint = web_touch.TouchPoint;
+    const TouchEvent = web_touch.TouchEvent;
     // EmscriptenKeyboardEvent (html5.h), byte-faithful. `EM_UTF8` is `char`,
     // `EM_HTML5_SHORT_STRING_LEN_BYTES` is 32 → the four DOM string fields
     // (`key`/`code`/`charValue`/`locale`) are `[32]u8`. We read `keyCode` (DOM
@@ -175,24 +155,9 @@ var wasm_key_down: [MAX_KEYS]bool = [_]bool{false} ** MAX_KEYS;
 var wasm_key_pressed_accum: [MAX_KEYS]bool = [_]bool{false} ** MAX_KEYS;
 var wasm_key_released_accum: [MAX_KEYS]bool = [_]bool{false} ** MAX_KEYS;
 
-// wasm multi-touch pinch-zoom state (#16). When ≥2 fingers are down we compute
-// the distance between the first two touch points and feed its frame-over-frame
-// delta into the wheel (mobile analog of the mouse wheel). `wasm_pinch_prev_dist`
-// is reset on entering/leaving pinch mode so the first pinch frame never jumps.
-var wasm_pinch_active: bool = false;
-var wasm_pinch_prev_dist: f32 = 0;
-// Pinch sensitivity: ~1 wheel-unit (one notch) per this many pixels of spread.
-const WASM_PINCH_PX_PER_WHEEL: f32 = 80.0;
-
-// Deferred-press state (pinch-vs-tap disambiguation). The FIRST finger down is
-// recorded as the primary but is NOT yet committed to a button-0 press: no imgui
-// down, no `wasm_mouse_down[0]`, no press edge. This defers the press until we
-// know the gesture is a single tap and not the start of a two-finger pinch. It
-// is promoted to a real press either on the next `newFrame` (still the lone
-// active touch → hold/drag) or synthesized as a same-frame down+up on touchend
-// (fast tap). If a 2nd finger arrives first, `cancelWasmPrimary` drops the
-// pending primary WITHOUT any imgui down/up → the pinch leaves zero clicks.
-var wasm_primary_pending: bool = false;
+// wasm touch state: the primary pointer, the deferred tap and the pinch
+// (`web_touch.zig`, host-tested), fed by the HTML5 touch callbacks below.
+var web_touch_state: web_touch.State = .{};
 
 // ── Android analog gamepad state (#310 Stage 4 / #250) ──────────────
 //
@@ -617,256 +582,65 @@ fn wasmBlur(_: i32, _: *const anyopaque, _: ?*anyopaque) callconv(.c) bool {
             if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(@intCast(b), false);
         }
     }
-    touch_active = false;
-    pointer_down = false;
-    wasm_primary_pending = false; // drop any uncommitted deferred tap on focus loss
-    wasm_pinch_active = false;
-    wasm_pinch_prev_dist = 0;
+    web_touch_state.blur(); // drop any uncommitted deferred tap and pinch on focus loss
     return false;
 }
 
 // ── wasm/emscripten HTML5 touch callbacks (mobile web) ──────────────────
-// Mirror the Android NativeActivity glue's single-primary-pointer model: map
-// the first touch point onto mouse button 0 + the cursor position, so imgui and
-// the engine's mouse-driven hit-testing see touch transparently. Also drive the
-// engine's touch getters (getTouchX/Y/Count/Id) for games that read touch
-// directly. Two fingers pinch-zoom (see `handleWasmPinch`, #16). Desktop fires
-// mouse callbacks; mobile fires these — a device just uses whichever it has.
+// Thin adapters over `web_touch.State`, which maps the first touch point onto
+// mouse button 0 + the cursor position and pinch-zooms with two fingers.
+// Desktop fires mouse callbacks; mobile fires these — a device just uses
+// whichever it has.
 
-/// Position (scaled CSS→framebuffer) from the primary touch point.
-fn setWasmTouchPos(t: *const em.TouchPoint) void {
+/// Dear ImGui as `web_touch` reaches it. No-op (comptime-eliminated) unless
+/// the imgui bridge is linked.
+const WebGui = struct {
+    pub fn mousePos(x: f32, y: f32) void {
+        if (comptime gui_enabled) imgui.imgui_bridge_mouse_pos(x, y);
+    }
+    pub fn mouseButton(button: i32, down: bool) void {
+        if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(button, down);
+    }
+    pub fn mouseWheel(x: f32, y: f32) void {
+        if (comptime gui_enabled) imgui.imgui_bridge_mouse_wheel(x, y);
+    }
+};
+
+/// The mouse fields the touch callbacks share with the HTML5 mouse callbacks.
+fn webMouse() web_touch.Mouse {
+    return .{
+        .x = &mouse_x,
+        .y = &mouse_y,
+        .down = &wasm_mouse_down[0],
+        .pressed_accum = &wasm_mouse_pressed_accum[0],
+        .released_accum = &wasm_mouse_released_accum[0],
+        .wheel_accum = &wasm_wheel_accum,
+        .latched_down = mouse_down[0],
+    };
+}
+
+/// `webMouse` with the CSS→framebuffer scale a touch event's positions need.
+fn webEventMouse() web_touch.Mouse {
     const s = wasmScale();
-    mouse_x = @as(f32, @floatFromInt(t.targetX)) * s.x;
-    mouse_y = @as(f32, @floatFromInt(t.targetY)) * s.y;
-    // Engine touch getters (Android-parity): expose as touch index 0.
-    touch_x = mouse_x;
-    touch_y = mouse_y;
-    if (comptime gui_enabled) imgui.imgui_bridge_mouse_pos(mouse_x, mouse_y);
+    var m = webMouse();
+    m.scale_x = s.x;
+    m.scale_y = s.y;
+    return m;
 }
 
-// Touch identifiers are opaque bits: iOS Safari reports negative ones (#187).
-const touchKey = @import("touch_key.zig").touchKey;
-
-/// Number of valid entries in the event's touch array (clamped to the fixed 32).
-fn wasmTouchCount(e: *const em.TouchEvent) usize {
-    if (e.numTouches <= 0) return 0;
-    return @min(@as(usize, @intCast(e.numTouches)), e.touches.len);
-}
-
-/// The touch point matching `id`, if present in this event.
-fn findWasmTouch(e: *const em.TouchEvent, id: u64) ?*const em.TouchPoint {
-    for (e.touches[0..wasmTouchCount(e)]) |*t| {
-        if (touchKey(t.identifier) == id) return t;
-    }
-    return null;
-}
-
-// ── wasm two-finger pinch-zoom (#16) ────────────────────────────────────
-// Mobile analog of the mouse wheel: with ≥2 fingers down, feed the change in
-// the first-two-fingers distance into `wasm_wheel_accum` (+ the imgui wheel),
-// so games that map `getMouseWheelMove()` → camera zoom (e.g. FP's
-// camera_control) get pinch-to-zoom for free. Spreading fingers apart grows
-// the distance → positive wheel (zoom in); pinching in → negative (zoom out).
-
-// A touch point is ACTIVE (still on the surface after this event) unless this
-// is a touchend/cancel AND the point is one of the lifted (`isChanged`) ones.
-// emscripten's `touches` array is the UNION of on-surface + changed points, so
-// on touchend a lifted finger is still listed (with `isChanged=true`); on
-// touchstart the just-placed finger is also `isChanged` but IS active — hence
-// the `is_end` gate (a plain skip-`isChanged` would undercount on start).
-fn touchIsActive(t: *const em.TouchPoint, is_end: bool) bool {
-    return !(is_end and t.isChanged);
-}
-
-/// Count of touches that remain active after this event (drives the pinch gate).
-fn wasmActiveTouchCount(e: *const em.TouchEvent, is_end: bool) usize {
-    var count: usize = 0;
-    for (e.touches[0..wasmTouchCount(e)]) |*t| {
-        if (touchIsActive(t, is_end)) count += 1;
-    }
-    return count;
-}
-
-/// Framebuffer-pixel distance between the first two ACTIVE touch points (0 if
-/// <2). Skips lifted fingers on touchend so a 3→2 finger lift measures the two
-/// surviving fingers, never a finger that's leaving.
-fn wasmPinchDist(e: *const em.TouchEvent, is_end: bool) f32 {
-    var pts: [2]*const em.TouchPoint = undefined;
-    var k: usize = 0;
-    for (e.touches[0..wasmTouchCount(e)]) |*t| {
-        if (touchIsActive(t, is_end)) {
-            pts[k] = t;
-            k += 1;
-            if (k == 2) break;
-        }
-    }
-    if (k < 2) return 0;
-    const s = wasmScale();
-    const ax = @as(f32, @floatFromInt(pts[0].targetX)) * s.x;
-    const ay = @as(f32, @floatFromInt(pts[0].targetY)) * s.y;
-    const bx = @as(f32, @floatFromInt(pts[1].targetX)) * s.x;
-    const by = @as(f32, @floatFromInt(pts[1].targetY)) * s.y;
-    const dx = bx - ax;
-    const dy = by - ay;
-    return @sqrt(dx * dx + dy * dy);
-}
-
-/// Cancel any in-progress single-finger primary pointer WITHOUT leaving a
-/// phantom click — called when a 2nd finger promotes the gesture to a pinch.
-///
-/// Two cases, keyed on `wasm_primary_pending`:
-///   • Still DEFERRED (the common quick-pinch): no imgui down was ever sent and
-///     no press edge latched, so we just drop the pending primary. This is the
-///     whole fix — the primary never became a press, so the pinch leaks zero
-///     clicks (previously `wasmTouchStart` latched button 0 down immediately and
-///     this balancing up registered a phantom imgui click).
-///   • Already PROMOTED (fingers landed >1 frame apart, so the primary became a
-///     real hold): the imgui down was sent, so balance it with an imgui up (else
-///     imgui's button sticks). The ENGINE release EDGE is only emitted when the
-///     press was actually LATCHED (`mouse_down[0]`); otherwise a release would be
-///     a phantom, so we just drop the still-unlatched press accum.
-fn cancelWasmPrimary() void {
-    touch_active = false;
-    pointer_down = false;
-    if (wasm_primary_pending) {
-        wasm_primary_pending = false; // deferred press never committed → nothing to undo
-        return;
-    }
-    wasm_mouse_pressed_accum[0] = false; // drop an as-yet-unlatched press
-    wasm_mouse_down[0] = false;
-    if (mouse_down[0]) wasm_mouse_released_accum[0] = true; // only if latched
-    if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(0, false);
-}
-
-/// Drive pinch mode from an incoming touch event (`is_end` true for
-/// touchend/cancel). Returns true when the event is consumed as a pinch (the
-/// caller then skips the single-pointer logic). Entering pinch cancels the
-/// single-finger press so the gesture zooms instead of dragging; leaving pinch
-/// (back to ≤1 active touch) re-seeds the primary pointer (position only, no
-/// press) from the remaining finger so single-pointer tracking resumes without
-/// a phantom click. `wasm_pinch_prev_dist` is reset on both transitions so
-/// neither the first nor a later pinch frame jumps.
-fn handleWasmPinch(e: *const em.TouchEvent, is_end: bool) bool {
-    const n = wasmActiveTouchCount(e, is_end);
-    if (n >= 2) {
-        const dist = wasmPinchDist(e, is_end);
-        if (!wasm_pinch_active) {
-            wasm_pinch_active = true;
-            wasm_pinch_prev_dist = dist; // seed → no jump on the first move
-            cancelWasmPrimary();
-        } else {
-            const delta = (dist - wasm_pinch_prev_dist) / WASM_PINCH_PX_PER_WHEEL;
-            wasm_pinch_prev_dist = dist;
-            if (delta != 0) {
-                wasm_wheel_accum += delta;
-                if (comptime gui_enabled) imgui.imgui_bridge_mouse_wheel(0, delta);
-            }
-        }
-        return true;
-    }
-    if (wasm_pinch_active) {
-        wasm_pinch_active = false;
-        wasm_pinch_prev_dist = 0;
-        if (n == 1) {
-            // Re-seed from the first ACTIVE touch (index 0 may be the lifted one).
-            for (e.touches[0..wasmTouchCount(e)]) |*t| {
-                if (touchIsActive(t, is_end)) {
-                    touch_id = touchKey(t.identifier);
-                    setWasmTouchPos(t);
-                    touch_active = true; // resume single-pointer tracking (no press)
-                    break;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-// Single-primary-pointer model (Android-parity): the FIRST finger down becomes
-// the pointer, tracked by its `identifier`; other fingers are ignored until it
-// lifts. This prevents a second finger from emitting an extra button-0 press or
-// a stray finger's `touchend` from releasing an in-progress drag. A second
-// finger instead triggers pinch-zoom (`handleWasmPinch`), not a click.
 fn wasmTouchStart(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bool {
-    if (e.numTouches <= 0) return true;
-    if (handleWasmPinch(e, false)) return true; // ≥2 fingers → pinch-zoom, not a click
-    if (touch_active) return true; // already tracking a primary finger
-    const t = &e.touches[0];
-    touch_id = touchKey(t.identifier);
-    setWasmTouchPos(t);
-    touch_active = true;
-    pointer_down = true;
-    // Deferred press: record the primary but do NOT commit a button-0 press yet
-    // (no imgui down, no `wasm_mouse_down[0]`, no press edge). If a 2nd finger
-    // arrives before promotion → pinch, and the primary never became a press, so
-    // no phantom click. A genuine single tap is committed later: promoted to a
-    // real held press on the next `newFrame` (drag), or synthesized as a
-    // same-frame down+up on `touchend` (fast tap that lifts within one frame).
-    wasm_primary_pending = true;
+    web_touch_state.start(WebGui, e, webEventMouse());
     return true;
 }
 
 fn wasmTouchMove(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bool {
-    if (handleWasmPinch(e, false)) return true; // ≥2 fingers → feed wheel delta, no move
-    if (!touch_active) return true;
-    if (findWasmTouch(e, touch_id)) |t| setWasmTouchPos(t);
+    web_touch_state.move(WebGui, e, webEventMouse());
     return true;
 }
 
 fn wasmTouchEnd(_: i32, e: *const em.TouchEvent, _: ?*anyopaque) callconv(.c) bool {
-    // Count only ACTIVE (non-lifted) touches: a touchend still LISTS the lifted
-    // finger (isChanged), so `is_end=true` excludes it. Still ≥2 active → stay
-    // in pinch; dropping below 2 exits pinch + re-seeds the single pointer.
-    if (handleWasmPinch(e, true)) return true;
-    if (!touch_active) {
-        // Nothing tracked: a pinch whose fingers all lifted together ends
-        // here. With no finger left, ImGui must still stop hovering (#202).
-        if (gui_pointer.clearsOnTouchEnd(wasmActiveTouchCount(e, true))) clearGuiPointer();
-        return true;
-    }
-    // The primary is still down iff it appears in this event as an ACTIVE
-    // (not-changed) touch — true whether emscripten includes the ended touch
-    // (as `isChanged`) or omits it. If so, a non-primary finger ended: keep the
-    // pointer down and just refresh position.
-    for (e.touches[0..wasmTouchCount(e)]) |*t| {
-        if (touchKey(t.identifier) == touch_id and !t.isChanged) {
-            setWasmTouchPos(t);
-            return true;
-        }
-    }
-    // Primary finger lifted → release the pointer.
-    touch_active = false;
-    pointer_down = false;
-    if (wasm_primary_pending) {
-        // Fast tap: the finger lifted before any `newFrame` promoted the
-        // deferred press, and no 2nd finger turned it into a pinch. Synthesize a
-        // full down+up at the release point so imgui still registers a click and
-        // the engine sees a press+release edge this frame. (`setWasmTouchPos`
-        // already forwarded the imgui position on touchstart/touchmove.)
-        wasm_primary_pending = false;
-        wasm_mouse_pressed_accum[0] = true;
-        wasm_mouse_released_accum[0] = true;
-        if (comptime gui_enabled) {
-            imgui.imgui_bridge_mouse_button(0, true);
-            imgui.imgui_bridge_mouse_button(0, false);
-        }
-    } else if (wasm_mouse_down[0]) {
-        // Promoted press (hold/drag) → normal release edge.
-        wasm_mouse_down[0] = false;
-        wasm_mouse_released_accum[0] = true;
-        if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(0, false);
-    }
-    // The finger is gone, so ImGui must stop hovering the lift point (#202).
-    // Its trickled event queue applies this only after the button events
-    // above, so the tap still clicks where the finger was.
-    clearGuiPointer();
+    web_touch_state.end(WebGui, e, webEventMouse());
     return true;
-}
-
-/// Tell ImGui the touch pointer is gone (`-FLT_MAX`), so it stops hovering
-/// the lift point (#202).
-fn clearGuiPointer() void {
-    if (comptime gui_enabled) imgui.imgui_bridge_mouse_pos(gui_pointer.absent, gui_pointer.absent);
 }
 
 /// Register the HTML5 canvas mouse + touch callbacks (wasm only). Called from
@@ -981,19 +755,10 @@ pub fn newFrame() void {
     // Android pointer path), copy the live down-state, drain the wheel, and forward
     // to Dear ImGui. Returning here keeps every zglfw reference comptime-eliminated.
     if (comptime is_wasm) {
-        // Promote a deferred single-tap press: if the primary finger is still the
-        // lone active touch one frame after touchdown — i.e. no 2nd finger turned
-        // it into a pinch — commit it to a real button-0 press now so holds/drags
-        // work. A pinch would have cleared `wasm_primary_pending` via
-        // `cancelWasmPrimary` before reaching here, so a pinch never promotes → no
-        // phantom click. Done BEFORE the latch loop so the press edge lands this
-        // same frame.
-        if (wasm_primary_pending and touch_active and !wasm_pinch_active) {
-            wasm_primary_pending = false;
-            wasm_mouse_down[0] = true;
-            wasm_mouse_pressed_accum[0] = true;
-            if (comptime gui_enabled) imgui.imgui_bridge_mouse_button(0, true);
-        }
+        // Promote a deferred single-tap press to a real one (no pinch began
+        // since touchdown). Done BEFORE the latch loop so the press edge lands
+        // this same frame.
+        web_touch_state.promote(WebGui, webMouse());
         // Latch the async-callback state into this frame's engine getters
         // (isMouseButton{Down,Pressed,Released}, getMouseWheelMove). imgui is fed
         // event-driven directly from the callbacks (see wasmMouse*), so no
@@ -1209,27 +974,28 @@ pub fn setAndroidTouches(xs: []const f32, ys: []const f32) void {
 }
 
 pub fn getTouchCount() u32 {
-    // Android reports the full multi-touch set; wasm HTML5 feeds the single
-    // primary pointer into `touch_active` (its pinch is handled separately).
+    // Android reports the full multi-touch set; wasm HTML5 tracks the single
+    // primary pointer in `web_touch_state` (its pinch is handled separately).
     if (is_android) return @intCast(android_touch_count);
-    if (is_wasm) return if (touch_active) 1 else 0;
+    if (is_wasm) return if (web_touch_state.active) 1 else 0;
     return 0; // GLFW desktop: no touch support
 }
 
 pub fn getTouchX(index: u32) f32 {
     if (is_android) return if (index < android_touch_count) android_touch_x[index] else 0;
-    if (is_wasm and index == 0 and touch_active) return touch_x;
+    if (is_wasm and index == 0 and web_touch_state.active) return web_touch_state.x;
     return 0;
 }
 
 pub fn getTouchY(index: u32) f32 {
     if (is_android) return if (index < android_touch_count) android_touch_y[index] else 0;
-    if (is_wasm and index == 0 and touch_active) return touch_y;
+    if (is_wasm and index == 0 and web_touch_state.active) return web_touch_state.y;
     return 0;
 }
 
 pub fn getTouchId(index: u32) u64 {
-    if ((is_android or is_wasm) and index == 0 and touch_active) return touch_id;
+    if (is_android and index == 0 and touch_active) return touch_id;
+    if (is_wasm and index == 0 and web_touch_state.active) return web_touch_state.id;
     return 0;
 }
 
