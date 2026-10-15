@@ -944,6 +944,31 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&touch_key_run.step);
     b.step("test-touch-key", "Test browser touch-identifier keys, incl. iOS negative ids (#187)").dependOn(&touch_key_run.step);
 
+    // ── Unit tests for the touch pointer ImGui sees (#202) ──
+    // `src/gui_pointer.zig` is pure Zig; input.zig reaches it on Android and
+    // wasm only, so test it as its own root on the host.
+    const gui_pointer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gui_pointer.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(gui_pointer_tests).step);
+
+    // ── Unit tests for the browser touch callbacks (#202) ──
+    // `src/web_touch.zig` is the touch state machine input.zig's wasm-only
+    // callbacks hand each event to, with ImGui passed in, so the callbacks'
+    // logic runs on the host.
+    const web_touch_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/web_touch.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(web_touch_tests).step);
+
     // ── Unit tests for the window-icon frame builder (labelle-cli#359) ──
     // `src/window_icon.zig` is pure Zig (size table + box downscale, no
     // zglfw/stb/bgfx), so it EXECUTES on the host like platform.zig. The
