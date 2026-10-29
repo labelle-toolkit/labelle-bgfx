@@ -63,7 +63,8 @@ comptime {
 /// The shared PCM mixer, parameterized by bgfx's OS device as the `DeviceSink`.
 /// Owns WAV decode + slot arrays + the spinlock + the full AudioInterface
 /// surface; the public fns below forward to it.
-const Audio = labelle_audio.Mixer(device_backend);
+// Unit tests advance playback manually; a real callback would race EOF assertions.
+const Audio = labelle_audio.Mixer(if (builtin.is_test) labelle_audio.NullSink else device_backend);
 
 // Contract-version tags (labelle-assembler#453 item 1). The assembler emits
 // directional `@compileError` version asserts in the generated game's main.zig
