@@ -394,3 +394,13 @@ So, before writing a test, check `build.zig` for a `b.addTest` whose
 
 To confirm your tests are collected, put a deliberately failing block in the
 file and run `zig build test`. If it passes, your tests are dead.
+
+### Non-looping music / playlists
+
+The exported `audio` module provides `setMusicLooping(id, false)` for music
+loaded from disk, PCM, or `loadMusicAssetAsync`. Default looping is unchanged.
+After `playMusic`, a non-looping track stops at EOF and `isMusicPlaying` reports
+false. Track user pause/stop separately, since paused music also reports false.
+Unload a finished track before loading the next to bound decoded PCM memory.
+This is a backend audio extension, alongside the asset-loading API; it does not
+require changing the portable core AudioInterface or the graphics dependency pair.

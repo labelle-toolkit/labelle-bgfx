@@ -63,7 +63,8 @@ comptime {
 /// The shared PCM mixer, parameterized by bgfx's OS device as the `DeviceSink`.
 /// Owns WAV decode + slot arrays + the spinlock + the full AudioInterface
 /// surface; the public fns below forward to it.
-const Audio = labelle_audio.Mixer(device_backend);
+// Unit tests advance playback manually; a real callback would race EOF assertions.
+const Audio = labelle_audio.Mixer(if (builtin.is_test) labelle_audio.NullSink else device_backend);
 
 // Contract-version tags (labelle-assembler#453 item 1). The assembler emits
 // directional `@compileError` version asserts in the generated game's main.zig
@@ -400,6 +401,13 @@ pub fn isMusicPlaying(id: u32) bool {
     return Audio.isMusicPlaying(id);
 }
 
+/// Opt a music stream out of its default looping mode for playlist playback.
+/// At EOF isMusicPlaying becomes false; paused streams also report false.
+/// Preserves position and pause state. Invalid/unloaded IDs are ignored.
+pub fn setMusicLooping(id: u32, looping: bool) void {
+    Audio.setMusicLooping(id, looping);
+}
+
 pub fn setMusicVolume(id: u32, volume: f32) void {
     Audio.setMusicVolume(id, volume);
 }
@@ -513,4 +521,18 @@ test "MusicAssetLoad.wait on a load that never started returns 0" {
 
 test "Android asset music loader is type checked" {
     if (comptime is_android) _ = &loadMusicAssetAndroid;
+}
+
+test "music loop control forwards to the shared mixer" {
+    Audio.resetForTest();
+    const id = loadMusicFromPcm(&.{ 100, 200, 300, 400 }, 2, 48000);
+    try testing.expect(id != 0);
+    defer unloadMusic(id);
+    setMusicLooping(id, false);
+    playMusic(id);
+    var out: [6]i16 = undefined;
+    mixAudio(&out, 3);
+    try testing.expect(!isMusicPlaying(id));
+    try testing.expectEqual(@as(i16, 100), out[0]);
+    try testing.expectEqual(@as(i16, 0), out[4]);
 }
