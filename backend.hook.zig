@@ -225,12 +225,10 @@ pub fn libcTxt(
     crt_dir: []const u8,
 ) ![]u8 {
     return std.mem.concat(allocator, u8, &.{
-        "include_dir=",     include_dir,     "\n",
-        "sys_include_dir=", sys_include_dir, "\n",
-        "crt_dir=",         crt_dir,         "\n",
-        "msvc_lib_dir=\n",
-        "kernel32_lib_dir=\n",
-        "gcc_dir=\n",
+        "include_dir=",     include_dir,           "\n",
+        "sys_include_dir=", sys_include_dir,       "\n",
+        "crt_dir=",         crt_dir,               "\n",
+        "msvc_lib_dir=\n",  "kernel32_lib_dir=\n", "gcc_dir=\n",
     });
 }
 
@@ -545,10 +543,40 @@ const dep_activate_step_name = "hook: emsdk activate latest (zig-pkg emsdk)";
 
 /// Pin `run`'s EM_CONFIG to `em_config` (the chosen emsdk's `.emscripten`), so
 /// an EM_CONFIG inherited from the environment can't point this emcc at another
-/// SDK's tools. `run` is a `*std.Build.Step.Run` (or anything with
-/// `setEnvironmentVariable`, so the tests can record the call).
-fn pinEmConfig(run: anytype, em_config: []const u8) void {
+/// SDK's tools. Only toolchain-relevant environment enters the cache key.
+pub fn pinEmConfig(run: *std.Build.Step.Run, em_config: []const u8) void {
+    // Zig hashes the entire explicit environment. Cloning it to set EM_CONFIG
+    // would include changing CI job IDs and force every job to relink.
+    const b = run.step.owner;
+    const source = &b.graph.environ_map;
+    const keys = b.allocator.dupe([]const u8, source.keys()) catch @panic("OOM");
+    std.mem.sort([]const u8, keys, {}, struct {
+        fn lessThan(_: void, a: []const u8, c: []const u8) bool {
+            return std.mem.order(u8, a, c) == .lt;
+        }
+    }.lessThan);
+    run.clearEnvironment();
+    for (keys) |key| {
+        if (emccEnvironmentKey(key)) run.setEnvironmentVariable(key, source.get(key).?);
+    }
     run.setEnvironmentVariable("EM_CONFIG", em_config);
+}
+
+fn emccEnvironmentKey(key: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(key, "EM_CONFIG")) return false;
+    // Preserve toolchain overrides: changing compiler flags or configuration
+    // must still invalidate the output. Never pass unrelated CI credentials.
+    for ([_][]const u8{ "EM_", "EMCC_", "EMSDK", "LLVM_", "BINARYEN_", "NODE_", "PYTHON", "LC_" }) |prefix| {
+        if (std.mem.startsWith(u8, key, prefix)) return true;
+    }
+    for ([_][]const u8{
+        "PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "WINDIR", "COMSPEC",
+        "PATHEXT", "TMP", "TEMP", "TMPDIR", "LANG", "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "SOURCE_DATE_EPOCH",
+    }) |name| {
+        if (std.ascii.eqlIgnoreCase(key, name)) return true;
+    }
+    return false;
 }
 
 /// Path to an emscripten tool (e.g. `emcc`). Prefers an external `EMSDK` (the
@@ -956,13 +984,13 @@ test "editor-preview exports: every editor_* contract symbol is in the list" {
     // Contract v1.3: `_editor_reload_prefab` (studio#24 prefab hot-reload)
     // joins, appended last again.
     const contract = [_][]const u8{
-        "_editor_alloc",        "_editor_free",
-        "_editor_pause",        "_editor_step",
-        "_editor_set_scene",    "_editor_load_scene",
+        "_editor_alloc",               "_editor_free",
+        "_editor_pause",               "_editor_step",
+        "_editor_set_scene",           "_editor_load_scene",
         "_editor_set_entity_position", "_editor_pick",
-        "_editor_scene_digest", "_editor_set_camera",
-        "_editor_release_camera", "_editor_set_state",
-        "_editor_load_animation_def", "_editor_reload_prefab",
+        "_editor_scene_digest",        "_editor_set_camera",
+        "_editor_release_camera",      "_editor_set_state",
+        "_editor_load_animation_def",  "_editor_reload_prefab",
     };
     for (contract) |sym| {
         try testing.expect(std.mem.indexOf(u8, wasm_editor_exported_functions_arg, sym) != null);
@@ -1203,24 +1231,13 @@ test "the hook's activate step is named for the external-EMSDK CI gate (#163)" {
     try testing.expect(std.mem.indexOf(u8, dep_activate_step_name, "install") == null);
 }
 
-test "pinEmConfig: sets EM_CONFIG (and only it) on the emcc step (#161)" {
-    // Records what emLinkStep's Run step receives, so the test asserts the
-    // mechanism (the env var name + value), not only the path decision above.
-    const Recorder = struct {
-        calls: usize = 0,
-        key: []const u8 = "",
-        value: []const u8 = "",
-        pub fn setEnvironmentVariable(self: *@This(), key: []const u8, value: []const u8) void {
-            self.calls += 1;
-            self.key = key;
-            self.value = value;
-        }
-    };
-    var rec: Recorder = .{};
-    pinEmConfig(&rec, "/ext/emsdk/.emscripten");
-    try testing.expectEqual(@as(usize, 1), rec.calls);
-    try testing.expectEqualStrings("EM_CONFIG", rec.key);
-    try testing.expectEqualStrings("/ext/emsdk/.emscripten", rec.value);
+test "emcc environment excludes CI identity and retains toolchain inputs" {
+    for ([_][]const u8{ "CI_JOB_ID", "CI_JOB_TOKEN", "CI_PIPELINE_ID", "GITHUB_RUN_ID", "PWD", "EM_CONFIG" }) |key| {
+        try std.testing.expect(!emccEnvironmentKey(key));
+    }
+    for ([_][]const u8{ "Path", "SystemRoot", "HOME", "TMPDIR", "EMCC_CFLAGS", "EM_CACHE", "LLVM_ROOT", "BINARYEN_ROOT", "NODE_OPTIONS", "PYTHONPATH", "SOURCE_DATE_EPOCH" }) |key| {
+        try std.testing.expect(emccEnvironmentKey(key));
+    }
 }
 
 test "selectGreatestValidNdk: a stray dir doesn't shadow a valid older NDK" {

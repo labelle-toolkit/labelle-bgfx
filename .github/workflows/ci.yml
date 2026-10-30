@@ -10,6 +10,25 @@ permissions:
   contents: read
 
 jobs:
+  emcc-cache:
+    name: Emscripten cache (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: zig test backend.hook.zig
+      - run: python test/emcc_cache_test.py
+
   # Missing-SDL2 message (labelle-cli#471 S2). On Windows, Zig has no default
   # SDL2 search path, so a desktop build with the gamepad source wired used
   # to die with a multi-line linker error when SDL2 was absent. The script
