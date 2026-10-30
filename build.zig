@@ -1738,7 +1738,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // raylib — there is NO GLFW emulation and NO asyncify; the frame is driven by
     // emscripten_set_main_loop.
     const emcc = b.addSystemCommand(&.{emcc_exe});
-    emcc.setEnvironmentVariable("EM_CONFIG", em_config);
+    build_hook.pinEmConfig(emcc, em_config);
     if (emsdk_setup) |setup| emcc.step.dependOn(&setup.step);
     if (optimize == .Debug) {
         emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1", "-sASSERTIONS=1" });
