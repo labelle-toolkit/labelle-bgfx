@@ -44,16 +44,44 @@ headless shell 156, SwiftShader), two runs each, all passed with no errors:
 The first `-O1` run was the first browser launch after install (cold disk
 cache). The second is within noise of `-O3`.
 
+## Through the real hook: single-threaded build and both bundle variants
+
+`locked_run.sh` ran a single-threaded generation of the same FP commit
+(`providers/web.json` `"threads": false`, local override to this branch, so
+the staged `backend.hook.zig` is this PR's) with `zig build
+-Doptimize=ReleaseSafe -j2` in `.labelle/bgfx_wasm`:
+
+| | step | time |
+|---|---|---:|
+| `LABELLE_WASM_LINK_OPT=O1` | `compile lib game` (8 GiB MaxRSS), then emcc | 3 min, then **8 s** emcc (319 s total) |
+| unset (default) on the same tree | game cached, only emcc reruns | **2 min** emcc (170 s total) |
+
+Single-threaded outputs: `-O1` game.wasm 36,925,191 (after export wasm-opt
+`-O1` (3 s): 36,139,334) vs default `-O3` 35,880,746 (wasm-opt `-O3` fails
+validation as above). `results/hook-build/` has the zig build summaries.
+
+The bundles were then composed with the fallback at the root and the threaded
+build of the same level in `threaded/`, and smoked in both modes. All four
+runs **passed**, with no errors:
+
+| | mode | main menu | game started | welcome after game | wasm memory | workers |
+|---|---|---:|---:|---:|---:|---:|
+| `-O1` | fallback (`--expect-threads no`) | 3.22 s | 5.70 s | 13.4 s | 122,683,392 | 0 |
+| `-O1` | threaded (`--isolated`) | 1.33 s | 3.97 s | 13.4 s | 200,474,624 | 3 |
+| `-O3` | fallback | 1.17 s | 3.59 s | 13.4 s | 122,683,392 | 0 |
+| `-O3` | threaded | 1.36 s | 4.08 s | 13.3 s | 200,474,624 | 3 |
+
+The first run of each sequence (here the `-O1` fallback) is consistently
+slower, so read that 3.22 s as a cold browser start, not a link-level effect.
+
 ## Not measured
 
-- The single-threaded fallback (`--expect-threads no`): no single-threaded
-  archives existed for this commit, and compiling them (about 10 GiB peak) was
-  not possible on the shared machine at the time. `compose_dist.sh` puts the
-  threaded pair at the root too, so only the isolated run is meaningful.
-- Frame time and memory during gameplay, save/load, audio and settings: the
-  smoke covers startup through the guided opening only.
-- A full `labelle bundle` with this branch: the timings above call emcc and
-  wasm-opt directly with the hook's argv.
+- Frame time and memory during gameplay, save/load, audio and settings. The
+  smoke covers startup through the guided opening only (wasm heap size at
+  that point is identical between levels).
+- A `labelle bundle` run end to end. The fallback above comes from a
+  `"threads": false` generation, not from `-Dwasm_threads=false` on a threaded
+  one, and the export step was reproduced by `compose_dist.sh`/`wasm-opt`.
 
 ## Files
 
