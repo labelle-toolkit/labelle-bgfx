@@ -102,6 +102,39 @@ node --test test/web_cursor_test.js
 LABELLE_TEST_CURSOR_WINDOW=1 xvfb-run -a zig build test cursor-example-build
 ```
 
+## WASM link optimization
+
+The emcc link level is a separate setting from Zig's `-Doptimize` (#208).
+Large games spend most of a release web build in emcc's `-O3` link (binaryen
+over the whole module); CI and preview builds can link at `-O1` instead while
+keeping the objects, assertions and pthread setup of the chosen Zig mode.
+
+| `LABELLE_WASM_LINK_OPT` / `-Dwasm_link_opt` | emcc `-O` flag |
+|---|---|
+| unset, empty or `default` (production) | Debug `-Og`, ReleaseSmall `-Oz`, ReleaseSafe/ReleaseFast `-O3` (unchanged) |
+| `O0`, `O1`, `O2`, `O3`, `Os`, `Oz` | that level, whatever the Zig mode |
+
+- Set `LABELLE_WASM_LINK_OPT` in the environment of `labelle build`/`bundle`/
+  `run` (or of `zig build` in the generated tree). The environment reaches the
+  game's build, labelle-web's single-threaded fallback build at export, and
+  labelle-web's `wasm-opt` pass, which uses the same level.
+- `-Dwasm_link_opt=<level>` does the same on a direct `zig build` and wins
+  over the environment.
+- A value outside the table fails the build at configure time.
+- Only the `-O` flag changes. ReleaseSafe still links with `-sASSERTIONS=1`
+  (ReleaseFast/ReleaseSmall with `=0`), Debug keeps `-sSAFE_HEAP=1
+  -sSTACK_OVERFLOW_CHECK=1`, and a threaded build keeps its pthread args.
+- With the setting unset the link line is byte-for-byte the previous one, so
+  production builds and their link cache are unaffected.
+
+Recommended use: `LABELLE_WASM_LINK_OPT=O1` for CI and preview builds; leave it
+unset for production/release bundles (or set `O3` to make that explicit).
+
+```sh
+LABELLE_WASM_LINK_OPT=O1 labelle bundle --platform=wasm --optimize=ReleaseSafe --output dist
+zig build -Dtarget=wasm32-emscripten wasm-example -Dwasm_link_opt=O1
+```
+
 ## Default renderer per platform
 
 Windowed desktop policy lives in `src/renderer_select.zig` (`desktopPolicy`,
