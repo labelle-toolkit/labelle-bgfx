@@ -1,0 +1,10 @@
+{
+  "link": "O1",
+  "wasm_opt": "O1",
+  "exit": 0,
+  "seconds": 4.06,
+  "peak_rss_bytes": 242741248,
+  "output_tail": "",
+  "wasm_bytes": 36363847,
+  "wasm_gzip9_bytes": 5700089
+}
