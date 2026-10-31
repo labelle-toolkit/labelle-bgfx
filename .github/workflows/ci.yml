@@ -818,6 +818,38 @@ jobs:
           fi
           head -c 4 zig-out/web/wasm_demo_hook.wasm | od -An -tx1 | tr -s ' ' | grep -q '00 61 73 6d' \
             || { echo "FAIL: wasm_demo_hook.wasm has no wasm magic"; exit 1; }
+      # The WASM builder image keeps its emsdk read-only, without
+      # upstream/emscripten/cache, and points EM_CACHE elsewhere
+      # (labelle-assembler#823). With a cold EM_CACHE the build must still take
+      # the external EMSDK, fill the sysroot under EM_CACHE at configure time,
+      # and never install the package. Runs before the zig-pkg check below,
+      # which then covers it too.
+      - name: External EMSDK with a cold EM_CACHE (assembler#823)
+        run: |
+          set -uo pipefail
+          export EM_CACHE="$RUNNER_TEMP/cold-em-cache"
+          zig build -Dtarget=wasm32-emscripten -Demsdk_expect=external wasm-example-hook \
+            --cache-dir "$RUNNER_TEMP/em-cache-zig" --summary all > emcache.log 2>&1
+          status=$?
+          cat emcache.log
+          [ "$status" -eq 0 ] || { echo "FAIL: build exited $status with a cold EM_CACHE"; exit 1; }
+          test -d "$EM_CACHE/sysroot/include" \
+            || { echo "FAIL: the sysroot was not filled under EM_CACHE"; exit 1; }
+          if grep -F "(zig-pkg emsdk)" emcache.log; then
+            echo "FAIL: the build ran emsdk install/activate on the zig-pkg emsdk"; exit 1
+          fi
+          # Half-installed headers: Emscripten creates sysroot/include before
+          # it finishes copying, so readiness is its sysroot_install.stamp.
+          # An include dir without the stamp must still run embuilder.
+          export EM_CACHE="$RUNNER_TEMP/half-em-cache"
+          mkdir -p "$EM_CACHE/sysroot/include"
+          zig build -Dtarget=wasm32-emscripten -Demsdk_expect=external wasm-example-hook \
+            --cache-dir "$RUNNER_TEMP/em-cache-zig-half" --summary all > emcache-half.log 2>&1
+          status=$?
+          cat emcache-half.log
+          [ "$status" -eq 0 ] || { echo "FAIL: build exited $status with a half-installed sysroot"; exit 1; }
+          test -f "$EM_CACHE/sysroot_install.stamp" \
+            || { echo "FAIL: embuilder did not complete the half-installed sysroot"; exit 1; }
       - name: Assert no zig-pkg emsdk install/activate ran
         run: |
           set -euo pipefail
