@@ -1719,6 +1719,10 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // comptime-eliminated — but the option must resolve for the graph to build.
     window_mod.addImport("build_options", input_opts_mod);
 
+    // Re-export the bgfx artifact (parity with the desktop/android installs).
+    // Before the early return below: consumers look it up on every pass.
+    b.installArtifact(bgfx_artifact);
+
     // The emsdk package is still being fetched: the backend's modules and the
     // `bgfx` artifact are declared (above), the emcc examples need the package's
     // emcc and come on the re-run.
@@ -1752,8 +1756,6 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // populated first.
     if (emsdk_setup) |setup| example_lib.step.dependOn(&setup.step);
 
-    // Re-export the bgfx artifact (parity with the desktop/android installs).
-    b.installArtifact(bgfx_artifact);
 
     // emcc link step. Use the emcc from the SAME emsdk whose sysroot the C/C++
     // TUs above include (external EMSDK or the package, `emcc_exe` above), so
