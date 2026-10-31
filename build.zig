@@ -1740,14 +1740,17 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const emcc = b.addSystemCommand(&.{emcc_exe});
     build_hook.pinEmConfig(emcc, em_config);
     if (emsdk_setup) |setup| emcc.step.dependOn(&setup.step);
+    // emcc link optimization (#208): `-Dwasm_link_opt` / LABELLE_WASM_LINK_OPT
+    // override only the `-O` level; unset keeps the -Doptimize mapping. Both
+    // example links (this one and `wasm-example-hook`) use the same level.
+    const link_opt = build_hook.resolveWasmLinkOpt(b);
+    const opt_flag = build_hook.emccOptArg(optimize, link_opt);
     if (optimize == .Debug) {
-        emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1", "-sASSERTIONS=1" });
-    } else if (optimize == .ReleaseSmall) {
-        emcc.addArgs(&.{ "-Oz", "-sASSERTIONS=0" });
+        emcc.addArgs(&.{ opt_flag, "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1", "-sASSERTIONS=1" });
     } else if (optimize == .ReleaseSafe) {
-        emcc.addArgs(&.{ "-O3", "-sASSERTIONS=1" });
+        emcc.addArgs(&.{ opt_flag, "-sASSERTIONS=1" });
     } else {
-        emcc.addArgs(&.{ "-O3", "-sASSERTIONS=0" });
+        emcc.addArgs(&.{ opt_flag, "-sASSERTIONS=0" });
     }
     emcc.addArgs(&.{
         "-sMIN_WEBGL_VERSION=2",
@@ -1821,6 +1824,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         // never picks a different emsdk than the C compiles (and never falls
         // back to a package that wasn't fetched).
         .need_sysroot = emsdk_sysroot_override == null,
+        .link_opt = link_opt,
     });
     const wasm_hook_step = b.step("wasm-example-hook", "Build the wasm example, linked by backend.hook.zig's emLinkStep (same code as a generated game)");
     wasm_hook_step.dependOn(&hook_install.step);
