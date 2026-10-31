@@ -1520,7 +1520,9 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     var emsdk_setup: ?*std.Build.Step.Run = null;
     // The emsdk package, only when it is the source (never fetched otherwise).
     var package_emsdk: ?*std.Build.Dependency = null;
-    switch (source) {
+    // The package path on the configure pass before it is fetched (see below).
+    var emsdk_pending = false;
+    emsdk: switch (source) {
         .external => |ext| {
             // With `-Demsdk_sysroot` the default sysroot dir is not needed, so
             // a cold one is left alone; otherwise fill it now (#823).
@@ -1531,9 +1533,22 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         },
         .package => {
             // Lazy: only fetched when no valid EMSDK is set. On the first
-            // configure it may be missing; the build runner fetches it and
-            // re-runs build().
-            const emsdk_dep = b.lazyDependency("emsdk", .{}) orelse return;
+            // configure it may be missing; the build runner then fetches it and
+            // re-runs build(). That pass must still declare the backend's
+            // modules and the `bgfx` artifact: a consumer's build() (the
+            // generated game) runs on in the same pass and looks them up, and
+            // a missing artifact panics before the runner gets to fetch.
+            // Before labelle-assembler#823 the root's eager emsdk entry (same
+            // hash) meant the package was always present here. So placeholder
+            // paths, never used by any step, and only the example steps are
+            // skipped below.
+            const emsdk_dep = b.lazyDependency("emsdk", .{}) orelse {
+                emsdk_pending = true;
+                default_sysroot = b.path("emsdk-not-fetched-yet");
+                emcc_exe = emcc_name;
+                em_config = "";
+                break :emsdk;
+            };
             package_emsdk = emsdk_dep;
             // One-time emsdk setup (install + activate). A no-op (null) when the
             // `.emscripten` marker is already present (shared package cache
@@ -1703,6 +1718,11 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // practice here (imgui-on-wasm isn't wired yet), so the call is
     // comptime-eliminated — but the option must resolve for the graph to build.
     window_mod.addImport("build_options", input_opts_mod);
+
+    // The emsdk package is still being fetched: the backend's modules and the
+    // `bgfx` artifact are declared (above), the emcc examples need the package's
+    // emcc and come on the re-run.
+    if (emsdk_pending) return;
 
     // ── Self-contained wasm/WebGL example → static lib → emcc link ───
     // Built directly by the backend (no assembler/engine) so the whole wasm
