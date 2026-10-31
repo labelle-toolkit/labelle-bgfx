@@ -1,0 +1,60 @@
+Build Summary: 64/64 steps succeeded
+install success
++- install generated/ success
+   +- emcc (game.html) success 8s
+   |  +- compile lib game ReleaseSafe wasm32-emscripten success 3m MaxRSS:8G
+   |  |  +- WriteFile cached
+   |  |  +- compile lib bgfx_imgui_bridge ReleaseSafe wasm32-emscripten success 59s MaxRSS:176M
+   |  |  |  +- WriteFile cached
+   |  |  |  +- compile lib cimgui_clib ReleaseSafe wasm32-emscripten success 4s MaxRSS:38M
+   |  |  |  +- compile lib cimgui_clib ReleaseSafe wasm32-emscripten (reused)
+   |  |  |  +- translate-c success 2s MaxRSS:19M
+   |  |  |  +- WriteFile (reused)
+   |  |  |  +- compile lib cimgui_clib ReleaseSafe wasm32-emscripten (reused)
+   |  |  |  +- compile lib cimgui_clib ReleaseSafe wasm32-emscripten (reused)
+   |  |  +- WriteFile cached
+   |  |  +- compile lib bgfx ReleaseSafe wasm32-emscripten success 4s MaxRSS:27M
+   |  |  |  +- WriteFile cached
+   |  |  |  +- compile lib bx ReleaseSafe wasm32-emscripten success 2s MaxRSS:23M
+   |  |  |  +- WriteFile cached
+   |  |  |  +- compile lib bimg ReleaseSafe wasm32-emscripten success 2s MaxRSS:24M
+   |  |  |  +- compile lib bx ReleaseSafe wasm32-emscripten (reused)
+   |  |  |  +- compile lib bimg ReleaseSafe wasm32-emscripten (reused)
+   |  |  +- compile lib bgfx_imgui_bridge ReleaseSafe wasm32-emscripten (+7 more reused dependencies)
+   |  |  +- compile lib bgfx ReleaseSafe wasm32-emscripten (+6 more reused dependencies)
+   |  |  +- WriteFile bomb_flare.mtl.bin success
+   |  |  |  +- shader bomb_flare (mtl) (bomb_flare.mtl.bin) success 45ms
+   |  |  |  |  +- compile exe shaderc ReleaseFast native success 2s MaxRSS:34M
+   |  |  |  |  |  +- WriteFile cached
+   |  |  |  |  |  +- compile lib bx Debug native-native success 18s MaxRSS:21M
+   |  |  |  |  |  +- WriteFile cached
+   |  |  |  |  |  +- compile lib glslang ReleaseFast native success 18s MaxRSS:47M
+   |  |  |  |  |  +- WriteFile cached
+   |  |  |  |  |  +- compile lib spirv-opt ReleaseFast native success 1m MaxRSS:71M
+   |  |  |  |  |  +- WriteFile cached
+   |  |  |  |  |  +- compile lib spirv-cross ReleaseFast native success 18s MaxRSS:36M
+   |  |  |  |  |  +- compile lib bx Debug native-native (reused)
+   |  |  |  |  |  +- compile lib glslang ReleaseFast native (reused)
+   |  |  |  |  |  +- compile lib spirv-opt ReleaseFast native (reused)
+   |  |  |  |  |  +- compile lib spirv-cross ReleaseFast native (reused)
+   |  |  |  |  +- WriteFile sprite-varying.def.sc cached
+   |  |  |  +- shader bomb_flare (essl) (bomb_flare.essl.bin) success 52ms
+   |  |  |  |  +- compile exe shaderc ReleaseFast native (+12 more reused dependencies)
+   |  |  |  |  +- WriteFile sprite-varying.def.sc (reused)
+   |  |  |  +- shader bomb_flare (glsl) (bomb_flare.glsl.bin) success 42ms
+   |  |  |  |  +- compile exe shaderc ReleaseFast native (+12 more reused dependencies)
+   |  |  |  |  +- WriteFile sprite-varying.def.sc (reused)
+   |  |  |  +- shader bomb_flare (spv) (bomb_flare.spv.bin) success 98ms
+   |  |  |  |  +- compile exe shaderc ReleaseFast native (+12 more reused dependencies)
+   |  |  |  |  +- WriteFile sprite-varying.def.sc (reused)
+   |  |  |  +- shader bomb_impact (mtl) (bomb_impact.mtl.bin) success 63ms
+   |  |  |  |  +- compile exe shaderc ReleaseFast native (+12 more reused dependencies)
+   |  |  |  |  +- WriteFile sprite-varying.def.sc (reused)
+   |  |  |  +- shader bomb_impact (essl) (bomb_impact.essl.bin) success 609ms
+   |  |  |  |  +- compile exe shaderc ReleaseFast native (+12 more reused dependencies)
+   |  |  |  |  +- WriteFile sprite-varying.def.sc (reused)
+   |  |  |  +- shader bomb_impact (glsl) (bomb_impact.glsl.bin) success 55ms
+   |  |  |  |  +- compile exe shaderc ReleaseFast native (+12 more reused dependencies)
+   |  |  |  |  +- WriteFile sprite-varying.def.sc (reused)
+   |  |  |  +- shader bomb_impact (spv) (bomb_impact.spv.bin) success 78ms
+   |  |  |  |  +- compile exe shaderc ReleaseFast native (+12 more reused dependencies)

@@ -1,0 +1,8 @@
+{
+  "link": "O3",
+  "wasm_opt": "O3",
+  "exit": 1,
+  "seconds": 0.52,
+  "peak_rss_bytes": 151334912,
+  "output_tail": " \n[wasm-validator error in module] unexpected false: nonzero segment flags require bulk memory [--enable-bulk-memory], on \n[wasm-validator error in module] unexpected false: nonzero segment flags require bulk memory [--enable-bulk-memory], on \n[wasm-validator error in module] unexpected false: nonzero segment flags require bulk memory [--enable-bulk-memory], on \n[wasm-validator error in module] unexpected false: nonzero segment flags require bulk memory [--enable-bulk-memory], on \n[wasm-validator error in module] unexpected false: nonzero segment flags require bulk memory [--enable-bulk-memory], on \n[wasm-validator error in module] unexpected false: nonzero segment flags require bulk memory [--enable-bulk-memory], on \n[wasm-validator error in module] unexpected false: nonzero segment flags require bulk memory [--enable-bulk-memory], on \n[wasm-validator error in module] unexpected false: nonzero segment flags require bulk memory [--enable-bulk-memory], on \nFatal: error validating input\n"
+}

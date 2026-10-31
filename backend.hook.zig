@@ -395,6 +395,112 @@ pub fn pthreadArgs(wasm_threads: bool) []const []const u8 {
     return if (wasm_threads) &wasm_pthread_args else &.{};
 }
 
+// ── WASM link optimization, independent of Zig's optimize mode (#208) ───────
+//
+// The emcc link level used to be derived from `-Doptimize` alone (`-O3`, or
+// `-Oz` for ReleaseSmall, `-Og` for Debug). At `-O3` emcc runs binaryen's full
+// pipeline over the whole module, which dominates a large game's link
+// (Flying Platform: ~205 s at -O3 vs ~2 s at -O1 on the same archives, for a
+// ~3% bigger .wasm). `WasmLinkOpt` lets CI and preview builds pick a cheaper
+// link level WITHOUT changing the Zig optimize/safety mode the objects were
+// compiled with.
+//
+// It changes ONLY the emcc `-O` flag. Everything else the Zig mode decides
+// stays as it is: `-sASSERTIONS=1` for ReleaseSafe (`=0` for ReleaseFast/
+// ReleaseSmall), `-sSAFE_HEAP`/`-sSTACK_OVERFLOW_CHECK` for Debug, the pthread
+// args of a threaded build and the WebGL/memory settings.
+//
+// Set it with `LABELLE_WASM_LINK_OPT=<level>` in the environment of the
+// `labelle build`/`bundle`/`run` (or `zig build`) invocation, or with
+// `-Dwasm_link_opt=<level>` on a direct `zig build` of the generated tree (the
+// option wins over the environment). Unset or `default` keeps the production
+// mapping, so nothing changes unless a build opts in.
+
+/// The emcc link optimization level. `default` is the Zig-mode mapping
+/// (`emccOptArg`); every other value is passed to emcc verbatim as `-<tag>`.
+pub const WasmLinkOpt = enum { default, O0, O1, O2, O3, Os, Oz };
+
+/// Environment variable carrying the link level. The environment (rather than
+/// a generated build option) reaches every zig build of the project with no
+/// codegen change, including labelle-web's single-threaded fallback build at
+/// export, which also reads it to pick its `wasm-opt` level.
+pub const wasm_link_opt_env = "LABELLE_WASM_LINK_OPT";
+
+/// The `zig build` option name (`-Dwasm_link_opt=O1`); overrides the env var.
+pub const wasm_link_opt_option = "wasm_link_opt";
+
+/// Parse a `LABELLE_WASM_LINK_OPT` value. Null, empty or whitespace is
+/// `default`; anything else must be a `WasmLinkOpt` tag spelled exactly
+/// (`O1`, not `-O1` or `o1`), so a typo fails the build instead of silently
+/// shipping a different level.
+pub fn parseWasmLinkOpt(value: ?[]const u8) error{InvalidWasmLinkOpt}!WasmLinkOpt {
+    const raw = value orelse return .default;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .default;
+    return std.meta.stringToEnum(WasmLinkOpt, trimmed) orelse error.InvalidWasmLinkOpt;
+}
+
+/// The emcc `-O` flag for a link: `link_opt` verbatim when set, otherwise the
+/// production mapping from the Zig mode (Debug `-Og`, ReleaseSmall `-Oz`,
+/// ReleaseSafe/ReleaseFast `-O3`).
+pub fn emccOptArg(optimize: std.builtin.OptimizeMode, link_opt: WasmLinkOpt) []const u8 {
+    return switch (link_opt) {
+        .default => switch (optimize) {
+            .Debug => "-Og",
+            .ReleaseSmall => "-Oz",
+            .ReleaseSafe, .ReleaseFast => "-O3",
+        },
+        .O0 => "-O0",
+        .O1 => "-O1",
+        .O2 => "-O2",
+        .O3 => "-O3",
+        .Os => "-Os",
+        .Oz => "-Oz",
+    };
+}
+
+/// The optimization + safety args `emLinkStep` passes, in link-line order.
+/// Debug: `<-O> -sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=1`. Otherwise:
+/// `-sASSERTIONS=<1 for ReleaseSafe, else 0> <-O>`. Emscripten DEFAULTS
+/// assertions off in optimized (-O1+) builds, so keeping them for ReleaseSafe
+/// (a safety build) requires `-sASSERTIONS=1` EXPLICITLY; ReleaseFast/
+/// ReleaseSmall disable them. With `link_opt == .default` the args (and their
+/// order) are exactly the pre-#208 ones, so a production link line, and the
+/// zig cache key of its emcc step, is unchanged.
+pub fn emccOptimizeArgs(optimize: std.builtin.OptimizeMode, link_opt: WasmLinkOpt) EmccOptimizeArgs {
+    const o = emccOptArg(optimize, link_opt);
+    return switch (optimize) {
+        .Debug => .{ .buf = .{ o, "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1" }, .len = 3 },
+        .ReleaseSafe => .{ .buf = .{ "-sASSERTIONS=1", o, "" }, .len = 2 },
+        .ReleaseFast, .ReleaseSmall => .{ .buf = .{ "-sASSERTIONS=0", o, "" }, .len = 2 },
+    };
+}
+
+pub const EmccOptimizeArgs = struct {
+    buf: [3][]const u8,
+    len: usize,
+    pub fn slice(self: *const EmccOptimizeArgs) []const []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Resolve the link level for a build: `-Dwasm_link_opt` if given, else
+/// `LABELLE_WASM_LINK_OPT`, else `default`. Declares the build option on `b`,
+/// so call it once per builder (`post_wire` does, for the generated root).
+/// A malformed env value is a configure-time panic naming the valid values.
+pub fn resolveWasmLinkOpt(b: *std.Build) WasmLinkOpt {
+    const from_option = b.option(
+        WasmLinkOpt,
+        wasm_link_opt_option,
+        "emcc link optimization, independent of -Doptimize (default: the -Doptimize mapping; O1 = fast CI/preview link). Overrides " ++ wasm_link_opt_env,
+    );
+    if (from_option) |v| return v;
+    return parseWasmLinkOpt(b.graph.environ_map.get(wasm_link_opt_env)) catch std.debug.panic(
+        "{s}='{s}' is not a WASM link level; use one of default, O0, O1, O2, O3, Os, Oz",
+        .{ wasm_link_opt_env, b.graph.environ_map.get(wasm_link_opt_env).? },
+    );
+}
+
 /// Options for `emLinkStep` — the subset of emcc options the wasm residual sets.
 /// Uses only `std.Build`/`std.builtin` types so the hook stays provider-free.
 pub const EmLinkOptions = struct {
@@ -422,6 +528,9 @@ pub const EmLinkOptions = struct {
     /// Threaded build: add `wasm_pthread_args`. Threaded from
     /// `HookContext.wasm_threads` by `post_wire`.
     wasm_threads: bool = false,
+    /// emcc link optimization (`WasmLinkOpt`, #208). `default` keeps the
+    /// `-Doptimize` mapping; `post_wire` resolves it with `resolveWasmLinkOpt`.
+    link_opt: WasmLinkOpt = .default,
     /// Unused since assembler#823 (kept so existing callers still compile): the
     /// sysroot is no longer part of the EMSDK test, on either side.
     need_sysroot: bool = true,
@@ -674,26 +783,10 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
         activate.step.dependOn(&options.lib_main.step);
         emcc.step.dependOn(&activate.step);
     }
-    if (options.optimize == .Debug) {
-        emcc.addArgs(&.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1" });
-    } else {
-        // Non-Debug: optimize. Emscripten DEFAULTS assertions off (ASSERTIONS=0)
-        // in optimized (-O1+) builds, so keeping them for ReleaseSafe (a safety
-        // build) requires setting -sASSERTIONS=1 EXPLICITLY — merely omitting
-        // -sASSERTIONS=0 would still leave them off. ReleaseFast/ReleaseSmall
-        // disable them for the fastest/smallest builds. (Reused verbatim from
-        // raylib's hook — the exact ReleaseSafe fix.)
-        if (options.optimize == .ReleaseSafe) {
-            emcc.addArg("-sASSERTIONS=1");
-        } else {
-            emcc.addArg("-sASSERTIONS=0");
-        }
-        if (options.optimize == .ReleaseSmall) {
-            emcc.addArg("-Oz");
-        } else {
-            emcc.addArg("-O3");
-        }
-    }
+    // Optimization + safety flags (#208: the `-O` level follows `link_opt`
+    // when set; the safety flags always follow the Zig mode).
+    const opt_args = emccOptimizeArgs(options.optimize, options.link_opt);
+    emcc.addArgs(opt_args.slice());
     // bgfx-specific web settings: force WebGL2, expose the GL proc-address helper
     // bgfx needs, allow heap growth + bump the C stack (backend-agnostic). No GLFW
     // emulation / no asyncify — bgfx owns its WebGL context and the main loop is
@@ -844,6 +937,10 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
             // `lazyDependency` also works for an eager declaration (older
             // assemblers). On the fallback its first configure returns null,
             // and the build runner fetches the package and re-runs build().
+            // -Dwasm_link_opt / LABELLE_WASM_LINK_OPT (#208); default keeps the
+            // -Doptimize mapping. Resolved first: it declares the build option,
+            // which must exist on the pass that returns early below too.
+            const link_opt = resolveWasmLinkOpt(b);
             const emsdk: ?*std.Build.Dependency = if (externalEmsdkValid(b))
                 null
             else
@@ -856,6 +953,7 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
                 .emsdk = emsdk,
                 .editor_preview = ctx.editor_preview,
                 .wasm_threads = ctx.wasm_threads,
+                .link_opt = link_opt,
             });
             // `post_wire` is void, so it owns the install/run wiring (mirrors
             // raylib's wasm arm).
@@ -1049,6 +1147,55 @@ test "editor-preview defaults OFF: a pre-preview HookContext/EmLinkOptions liter
     };
     try testing.expect(!opts.editor_preview);
     try testing.expect(!opts.wasm_threads);
+}
+
+test "wasm link opt: default keeps the pre-#208 production link args, in order" {
+    const Case = struct { mode: std.builtin.OptimizeMode, want: []const []const u8 };
+    const cases = [_]Case{
+        .{ .mode = .Debug, .want = &.{ "-Og", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1" } },
+        .{ .mode = .ReleaseSafe, .want = &.{ "-sASSERTIONS=1", "-O3" } },
+        .{ .mode = .ReleaseFast, .want = &.{ "-sASSERTIONS=0", "-O3" } },
+        .{ .mode = .ReleaseSmall, .want = &.{ "-sASSERTIONS=0", "-Oz" } },
+    };
+    for (cases) |c| {
+        const got = emccOptimizeArgs(c.mode, .default);
+        try testing.expectEqualDeep(c.want, got.slice());
+    }
+}
+
+test "wasm link opt: an explicit level changes only -O; safety flags follow the Zig mode" {
+    // ReleaseSafe at O1 keeps assertions (the CI/preview profile).
+    try testing.expectEqualDeep(@as([]const []const u8, &.{ "-sASSERTIONS=1", "-O1" }), emccOptimizeArgs(.ReleaseSafe, .O1).slice());
+    try testing.expectEqualDeep(@as([]const []const u8, &.{ "-sASSERTIONS=0", "-O1" }), emccOptimizeArgs(.ReleaseFast, .O1).slice());
+    // An explicit O3 on ReleaseSmall overrides the -Oz mapping.
+    try testing.expectEqualDeep(@as([]const []const u8, &.{ "-sASSERTIONS=0", "-O3" }), emccOptimizeArgs(.ReleaseSmall, .O3).slice());
+    try testing.expectEqualDeep(@as([]const []const u8, &.{ "-O1", "-sSAFE_HEAP=1", "-sSTACK_OVERFLOW_CHECK=1" }), emccOptimizeArgs(.Debug, .O1).slice());
+    inline for (@typeInfo(WasmLinkOpt).@"enum".fields) |f| {
+        const lvl: WasmLinkOpt = @enumFromInt(f.value);
+        if (lvl != .default) try testing.expectEqualStrings("-" ++ f.name, emccOptArg(.ReleaseSafe, lvl));
+    }
+}
+
+test "wasm link opt: parse the LABELLE_WASM_LINK_OPT value" {
+    try testing.expectEqual(WasmLinkOpt.default, try parseWasmLinkOpt(null));
+    try testing.expectEqual(WasmLinkOpt.default, try parseWasmLinkOpt(""));
+    try testing.expectEqual(WasmLinkOpt.default, try parseWasmLinkOpt("  "));
+    try testing.expectEqual(WasmLinkOpt.default, try parseWasmLinkOpt("default"));
+    try testing.expectEqual(WasmLinkOpt.O1, try parseWasmLinkOpt("O1"));
+    try testing.expectEqual(WasmLinkOpt.Oz, try parseWasmLinkOpt(" Oz\n"));
+    try testing.expectError(error.InvalidWasmLinkOpt, parseWasmLinkOpt("-O1"));
+    try testing.expectError(error.InvalidWasmLinkOpt, parseWasmLinkOpt("o1"));
+    try testing.expectError(error.InvalidWasmLinkOpt, parseWasmLinkOpt("fast"));
+}
+
+test "wasm link opt: an EmLinkOptions literal without the field keeps the default" {
+    const opts: EmLinkOptions = .{
+        .optimize = .ReleaseSafe,
+        .lib_main = undefined,
+        .lib_backend = undefined,
+        .emsdk = undefined,
+    };
+    try testing.expectEqual(WasmLinkOpt.default, opts.link_opt);
 }
 
 test "wasm threads: the link gets the pthread args only when threaded" {

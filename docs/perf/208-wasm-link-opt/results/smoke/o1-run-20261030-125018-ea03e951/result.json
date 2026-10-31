@@ -1,0 +1,44 @@
+{
+  "passed": true,
+  "artifact_directory": "D:\\prj\\labelle-toolkit\\epic-528\\link-opt-bench\\smoke-o1\\run-20261030-125018-ea03e951",
+  "assets_sha256": {
+    "game.html": "4b920d30edf8983a5e4c2bbc53c733b6fe7994fa21cb2ffd46272f3cb81e8223",
+    "game.js": "1460aa54081678ce5a91c0e2e8d7f5fae8ecf529a61988886636e9f512a70e0c",
+    "game.wasm": "50f91e53694a987730a55f1f0e129a9ed99a1013c514e3f78d4336a960939744",
+    "index.html": "7883a8682e9e14cf58025a8edf371f41af0810ab11abfb0ae4340aee6406ca2b",
+    "labelle-loader.js": "73cf9acce7041af5cd92d5deb75d9459cdc97fc910e184c51945ba5632242c61",
+    "labelle-logo.png": "fe592bfc85ff6a8cf67b2a4be0b7111912284483bcf396e621404ee1232333fe",
+    "manifest.json": "568d346c6202bf942c73cc5212736803d4bca6ac58a5282bbf06e94918aafa1d",
+    "assets/intro.mp4": "a81ca6ac238225a54336e311e14788577b96f77879b71ca74796cbd1957b458f",
+    "icons/icon-192.png": "002b97a329b2c27decc7b219a1fbd33504fb26909b7f4269a56ec8424d648f21",
+    "icons/icon-576.png": "a4eabff89a15aff765f803bf91f23f6543d8ed4f3dfdf251cada6867c41bf66b",
+    "icons/icon-preview-192.png": "d17e2a1d7059c72e865a5c0dabca00d180094bb6334853caeedb286d96c69ea2",
+    "icons/icon-preview-576.png": "1626539fcd4a681bbcad6c51bbeed687cecf9e7f895ec594e23ce203763321ee",
+    "threaded/game.js": "1460aa54081678ce5a91c0e2e8d7f5fae8ecf529a61988886636e9f512a70e0c",
+    "threaded/game.wasm": "50f91e53694a987730a55f1f0e129a9ed99a1013c514e3f78d4336a960939744",
+    "threaded/labelle-threads.json": "efa95056e157ce348211fdf41f8787e6b3d345af7c68937a4469faa09035e02f",
+    "assets/music/music_ingame_01.mp3": "095a5107325d597023a6a598bffaee4d8e6bcecd0aa667c0fa3ff395e7c5a26a",
+    "assets/music/music_ingame_02.mp3": "35f39ec301665ee4ab9768f1ad31c7cd86e6010e9819397036238ebee50362dc",
+    "assets/music/music_ingame_03.mp3": "7810d58bf37d37ebc508da421aa558f1c43e9fd68f3e8ed6f0b38de940ea45da"
+  },
+  "browser_version": "156.0.8078.4",
+  "graphics": {
+    "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)",
+    "astc": true
+  },
+  "threading": {
+    "isolated": true,
+    "sharedMemory": true,
+    "memoryBytes": 200474624,
+    "workers": 3,
+    "gameScript": "http://127.0.0.1:59256/threaded/game.js"
+  },
+  "game_started_seconds": 4.266000000061467,
+  "welcome_observed_after_game_seconds": 11.094000000040978,
+  "welcome_event": {
+    "seconds": 15.344000000040978,
+    "kind": "log",
+    "text": "[info] game speed 0x"
+  },
+  "errors": []
+}
