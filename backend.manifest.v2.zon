@@ -228,10 +228,14 @@
             // Empty per-platform list → inherits the base `gui_enabled` UNCHANGED
             // (merge contract), matching android + raylib-wasm.
             .dep_options = .{},
-            // The hook's wasm `post_wire` resolves emcc via
-            // `b.dependency("emsdk", .{})`; `.builtin` reuses the assembler's
-            // pinned emsdk section, and the backend build.zig.zon declares emsdk.
-            .root_build_deps = .{ .{ .name = "emsdk", .resolution = .builtin } },
+            // The hook's wasm `post_wire` falls back to the emsdk package via
+            // `b.lazyDependency("emsdk", .{})` only without a valid EMSDK;
+            // `.builtin` reuses the assembler's pinned emsdk section, and the
+            // backend build.zig.zon declares emsdk. `.lazy = true` asks the
+            // assembler to declare it lazy, so a build with a valid EMSDK never
+            // fetches it (assembler#823). Assemblers before #823 ignore the
+            // field and declare it eagerly, which the hook also handles.
+            .root_build_deps = .{ .{ .name = "emsdk", .resolution = .builtin, .lazy = true } },
             .package = .{ .web = .{ .shell = null } },
         },
         // No ios — bgfx ships no iOS template (mobile is Android-only).

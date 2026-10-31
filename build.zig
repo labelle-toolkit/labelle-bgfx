@@ -1467,10 +1467,12 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // stb C compile.
     //
     // Source (labelle-bgfx#159, see emsdk_source.zig):
-    //   * `EMSDK` set and valid (has `upstream/emscripten` + `.emscripten`, as
-    //     labelle-web 0.3's provider exports it): sysroot + emcc come from it,
-    //     and the `emsdk` package is never fetched or run. Before #159 the
+    //   * `EMSDK` set and valid (has `upstream/emscripten/emcc` + `.emscripten`,
+    //     as labelle-web 0.3's provider exports it): sysroot + emcc come from
+    //     it, and the `emsdk` package is never fetched or run. Before #159 the
     //     package was activated anyway, a second ~1.5 GB download per runner.
+    //     The sysroot is under `EM_CACHE` when that is set, and a cold one is
+    //     filled at configure time (`embuilder build sysroot`, assembler#823).
     //   * otherwise: the `emsdk` Zig package, activated on first use by
     //     `emSdkSetupStep` (`emsdk install/activate latest`), with every C/C++
     //     compile depending on it so the sysroot is populated first.
@@ -1503,8 +1505,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     };
     const source = emsdk_source.resolve(b.allocator, b.graph.environ_map.get("EMSDK"), .{
         .emcc_name = emcc_name,
-        // With `-Demsdk_sysroot` the default sysroot dir is not needed.
-        .need_sysroot = emsdk_sysroot_override == null,
+        .em_cache = b.graph.environ_map.get("EM_CACHE"),
     }, BuildFs{ .b = b });
     if (emsdk_source.mismatch(source, emsdk_expect)) |msg| std.debug.panic("emsdk: {s}", .{msg});
 
@@ -1520,10 +1521,13 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // The emsdk package, only when it is the source (never fetched otherwise).
     var package_emsdk: ?*std.Build.Dependency = null;
     switch (source) {
-        .external => |root| {
-            default_sysroot = .{ .cwd_relative = emsdk_source.sysrootInclude(b.allocator, root) catch @panic("OOM") };
-            emcc_exe = emsdk_source.toolPath(b.allocator, root, emcc_name) catch @panic("OOM");
-            em_config = b.pathJoin(&.{ root, ".emscripten" });
+        .external => |ext| {
+            // With `-Demsdk_sysroot` the default sysroot dir is not needed, so
+            // a cold one is left alone; otherwise fill it now (#823).
+            if (emsdk_sysroot_override == null) emsdk_source.ensureSysroot(b, ext);
+            default_sysroot = .{ .cwd_relative = ext.sysroot };
+            emcc_exe = emsdk_source.toolPath(b.allocator, ext.root, emcc_name) catch @panic("OOM");
+            em_config = b.pathJoin(&.{ ext.root, ".emscripten" });
         },
         .package => {
             // Lazy: only fetched when no valid EMSDK is set. On the first
@@ -1817,10 +1821,9 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .lib_backend = bgfx_artifact,
         // Null on the external path: the package is not fetched there.
         .emsdk = package_emsdk,
-        // The same EMSDK test emsdk_source.resolve applied above, so the hook
-        // never picks a different emsdk than the C compiles (and never falls
-        // back to a package that wasn't fetched).
-        .need_sysroot = emsdk_sysroot_override == null,
+        // The hook applies the same EMSDK test as emsdk_source.resolve above
+        // (emcc + .emscripten), so it never picks a different emsdk than the C
+        // compiles (and never falls back to a package that wasn't fetched).
     });
     const wasm_hook_step = b.step("wasm-example-hook", "Build the wasm example, linked by backend.hook.zig's emLinkStep (same code as a generated game)");
     wasm_hook_step.dependOn(&hook_install.step);

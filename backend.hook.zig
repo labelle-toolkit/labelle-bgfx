@@ -18,7 +18,8 @@
 //! "wasm32-emscripten" (resolved directly in the generated build.zig), so there
 //! is NO `resolve_target`. Its `post_wire` .wasm arm supplies the Emscripten
 //! `emcc` link step, reconstructed here from ONLY `std.Build` + the emsdk
-//! dependency (resolved via `b.dependency("emsdk", .{})`). bgfx creates its own
+//! dependency (`b.lazyDependency("emsdk", .{})`, only without a valid EMSDK —
+//! assembler#823). bgfx creates its own
 //! WebGL2 context on the emscripten canvas (the canvas selector is handed to bgfx
 //! via `PlatformData.nwh` in src/window.zig), so — unlike raylib — there is no
 //! GLFW emulation and no asyncify; the flag set is WebGL2 + the GL proc-address
@@ -408,11 +409,11 @@ pub const EmLinkOptions = struct {
     /// wasm32-emscripten by the apotema/zbgfx fork). Retained for callers/context;
     /// its subtree is already covered by walking `lib_main`'s graph.
     lib_backend: *std.Build.Step.Compile,
-    /// The emsdk dependency, resolved by the caller via `b.dependency("emsdk", .{})`
-    /// (`post_wire` always passes it). Null only when the caller already knows a
-    /// valid EMSDK is set (build.zig's `wasm-example-hook` on the external path,
-    /// which never fetches the package); falling back to the dependency without
-    /// one is a configure-time panic.
+    /// The emsdk dependency, resolved by the caller via
+    /// `b.lazyDependency("emsdk", .{})`. Null when the caller already knows a
+    /// valid EMSDK is set (`post_wire` and build.zig's `wasm-example-hook` on the
+    /// external path, which never fetch the package, assembler#823); falling
+    /// back to the dependency without one is a configure-time panic.
     emsdk: ?*std.Build.Dependency,
     /// Editor-preview build: add the `editor_*` export args (see
     /// `wasm_editor_exported_functions_arg`). Threaded from
@@ -421,10 +422,8 @@ pub const EmLinkOptions = struct {
     /// Threaded build: add `wasm_pthread_args`. Threaded from
     /// `HookContext.wasm_threads` by `post_wire`.
     wasm_threads: bool = false,
-    /// Whether an external EMSDK must also have the default sysroot include dir
-    /// to be used. False only when the caller's C compiles take the sysroot
-    /// from elsewhere (build.zig's `-Demsdk_sysroot`), so the link and
-    /// `emsdk_source.resolve` accept the same EMSDKs.
+    /// Unused since assembler#823 (kept so existing callers still compile): the
+    /// sysroot is no longer part of the EMSDK test, on either side.
     need_sysroot: bool = true,
 };
 
@@ -458,17 +457,19 @@ const EmToolResolution = union(enum) {
 /// Pure decision behind `emTool`: prefer an external `EMSDK` (the studio's
 /// managed emsdk, `~/.labelle/emsdk/<ver>/`, layout from cli#283) when it is set
 /// AND the tool actually exists at `<EMSDK>/upstream/emscripten/<tool>` on disk
-/// AND the emsdk is activated (`<EMSDK>/.emscripten` exists, #161)
-/// AND it has `upstream/emscripten/cache/sysroot/include` (#163) — the same
-/// test as build.zig's `emsdk_source.resolve` without `-Demsdk_sysroot`;
-/// otherwise fall back to the emsdk build dependency. EMSDK-unset (or an empty
-/// value, or a missing file) yields `.dep` — byte-identical to the pre-#535
-/// behavior for everyone who doesn't set EMSDK. `need_sysroot` is false only
-/// when the caller supplies the sysroot itself (build.zig's `-Demsdk_sysroot`),
-/// exactly as `emsdk_source.resolve`'s `Options.need_sysroot`. `fs` is any value
+/// AND the emsdk is activated (`<EMSDK>/.emscripten` exists, #161) — the same
+/// test as build.zig's `emsdk_source.resolve`; otherwise fall back to the emsdk
+/// build dependency. EMSDK-unset (or an empty value, or a missing file) yields
+/// `.dep` — byte-identical to the pre-#535 behavior for everyone who doesn't
+/// set EMSDK. The sysroot is not part of the test (assembler#823): it may live
+/// under `EM_CACHE` and be cold, and build.zig fills it at configure time
+/// (`emsdk_source.ensureSysroot`) for the same EMSDK, so the C compiles and
+/// this link always agree. Before #823 a missing
+/// `<EMSDK>/upstream/emscripten/cache/sysroot/include` sent both to the
+/// package, which then installed a second ~1.4 GB emsdk. `fs` is any value
 /// exposing `exists(path) bool`, so the branch is testable without a live
 /// `*std.Build`.
-fn emToolPath(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, tool: []const u8, need_sysroot: bool, fs: anytype) EmToolResolution {
+fn emToolPath(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, tool: []const u8, fs: anytype) EmToolResolution {
     const root = env_emsdk orelse return .dep;
     if (root.len == 0) return .dep;
     // The managed layout (cli#283) mirrors the zig-pkg dep EXACTLY — only the
@@ -486,16 +487,7 @@ fn emToolPath(gpa: std.mem.Allocator, env_emsdk: ?[]const u8, tool: []const u8, 
         gpa.free(abs);
         return .dep;
     };
-    // And the sysroot, like `emsdk_source.resolve`'s default (#163): build.zig
-    // compiles bgfx against the package emsdk when EMSDK lacks it, so the link
-    // must fall back too, or the compile and the link would use two SDKs.
-    const sysroot = std.fs.path.join(gpa, &.{ root, "upstream", "emscripten", "cache", "sysroot", "include" }) catch {
-        gpa.free(abs);
-        gpa.free(em_config);
-        return .dep;
-    };
-    defer gpa.free(sysroot);
-    if (!fs.exists(em_config) or (need_sysroot and !fs.exists(sysroot))) {
+    if (!fs.exists(em_config)) {
         gpa.free(abs);
         gpa.free(em_config);
         return .dep;
@@ -587,7 +579,7 @@ fn emccEnvironmentKey(key: []const u8) bool {
 /// override (no HookContext/EmLinkOptions ABI change — the dep is still passed in).
 /// Also returns the EM_CONFIG of whichever emsdk was chosen (#161), and on the
 /// dependency fallback the activate step the link must wait on, if any (#163).
-fn emTool(b: *std.Build, emsdk_opt: ?*std.Build.Dependency, tool: []const u8, need_sysroot: bool) EmTool {
+fn emTool(b: *std.Build, emsdk_opt: ?*std.Build.Dependency, tool: []const u8) EmTool {
     const BuildFs = struct {
         b: *std.Build,
         fn exists(self: @This(), path: []const u8) bool {
@@ -599,13 +591,13 @@ fn emTool(b: *std.Build, emsdk_opt: ?*std.Build.Dependency, tool: []const u8, ne
     // there. Match the `.bat` suffix build.zig already appends, and use the SAME
     // resolved name for BOTH the managed probe and the dep fallback so they agree.
     const actual_tool = if (builtin.os.tag == .windows) b.fmt("{s}.bat", .{tool}) else tool;
-    switch (emToolPath(b.allocator, b.graph.environ_map.get("EMSDK"), actual_tool, need_sysroot, fs)) {
+    switch (emToolPath(b.allocator, b.graph.environ_map.get("EMSDK"), actual_tool, fs)) {
         // `b.allocator` is the build arena, so the absolute slices outlive config.
         .managed => |m| return .{ .exe = .{ .cwd_relative = m.tool }, .em_config = m.em_config },
         .dep => {
             const emsdk = emsdk_opt orelse std.debug.panic(
-                "emsdk: no valid EMSDK (needs upstream/emscripten/{s}, .emscripten{s}) and no emsdk dependency was passed to emLinkStep",
-                .{ actual_tool, if (need_sysroot) " and upstream/emscripten/cache/sysroot/include" else "" },
+                "emsdk: no valid EMSDK (needs upstream/emscripten/{s} and .emscripten) and no emsdk dependency was passed to emLinkStep",
+                .{actual_tool},
             );
             // An env var needs a string now. A dependency's root is known at
             // configure time (it is fetched before build() runs), so this
@@ -620,6 +612,25 @@ fn emTool(b: *std.Build, emsdk_opt: ?*std.Build.Dependency, tool: []const u8, ne
                     null,
             };
         },
+    }
+}
+
+/// Whether `emTool` will take emcc from an external `EMSDK`, i.e. the emsdk
+/// dependency is not needed (assembler#823). Same decision, same probe.
+fn externalEmsdkValid(b: *std.Build) bool {
+    const Fs = struct {
+        b: *std.Build,
+        fn exists(self: @This(), path: []const u8) bool {
+            return if (std.Io.Dir.cwd().access(self.b.graph.io, path, .{})) |_| true else |_| false;
+        }
+    };
+    const tool = if (builtin.os.tag == .windows) "emcc.bat" else "emcc";
+    switch (emToolPath(b.allocator, b.graph.environ_map.get("EMSDK"), tool, Fs{ .b = b })) {
+        .managed => |m| {
+            m.deinit(b.allocator);
+            return true;
+        },
+        .dep => return false,
     }
 }
 
@@ -649,7 +660,7 @@ pub fn emLinkStep(b: *std.Build, options: EmLinkOptions) *std.Build.Step.Install
     // + `addFileArg` is the lazy-safe form; the step name "emcc" also hides the
     // resolved path in the log. Mirrors raylib's hook.
     const emcc = std.Build.Step.Run.create(b, "emcc");
-    const em = emTool(b, options.emsdk, "emcc", options.need_sysroot);
+    const em = emTool(b, options.emsdk, "emcc");
     emcc.addFileArg(em.exe);
     // Run under the SAME emsdk's `.emscripten` (#161): an inherited EM_CONFIG
     // naming another SDK would otherwise redirect this emcc's tools.
@@ -828,7 +839,15 @@ pub fn post_wire(b: *std.Build, ctx: HookContext) void {
             // backend dep. `emLinkStep` walks the GAME's transitive libs
             // (lib_main + bgfx+bx+bimg + any GUI bridge / plugin C archives) and
             // hands them all to emcc.
-            const emsdk = b.dependency("emsdk", .{});
+            // A valid EMSDK links with its own emcc, so the emsdk package is
+            // not even fetched (assembler#823): the root may declare it lazy.
+            // `lazyDependency` also works for an eager declaration (older
+            // assemblers). On the fallback its first configure returns null,
+            // and the build runner fetches the package and re-runs build().
+            const emsdk: ?*std.Build.Dependency = if (externalEmsdkValid(b))
+                null
+            else
+                b.lazyDependency("emsdk", .{}) orelse return;
             const bgfx_artifact = ctx.backend_dep.artifact("bgfx");
             const install = emLinkStep(b, .{
                 .optimize = ctx.optimize,
@@ -1051,7 +1070,7 @@ test "emToolPath: EMSDK unset → emsdk dependency (behavior byte-identical to p
             return true; // even if "everything exists", a null env must NOT go managed
         }
     };
-    switch (emToolPath(testing.allocator, null, "emcc", true, Fs{})) {
+    switch (emToolPath(testing.allocator, null, "emcc", Fs{})) {
         .dep => {}, // no allocation happens on this path — nothing to free
         .managed => |p| {
             p.deinit(testing.allocator);
@@ -1066,7 +1085,7 @@ test "emToolPath: empty EMSDK → emsdk dependency (treated as unset)" {
             return true;
         }
     };
-    switch (emToolPath(testing.allocator, "", "emcc", true, Fs{})) {
+    switch (emToolPath(testing.allocator, "", "emcc", Fs{})) {
         .dep => {},
         .managed => |p| {
             p.deinit(testing.allocator);
@@ -1087,7 +1106,7 @@ test "emToolPath: EMSDK set + tool present on disk → managed absolute path" {
         }
     };
     const root = "/home/u/.labelle/emsdk/4.0.0";
-    switch (emToolPath(testing.allocator, root, "emcc", true, Fs{})) {
+    switch (emToolPath(testing.allocator, root, "emcc", Fs{})) {
         .managed => |p| {
             defer p.deinit(testing.allocator);
             const expected = try std.fs.path.join(
@@ -1111,7 +1130,7 @@ test "emToolPath: Windows tool name (emcc.bat) flows through → managed abs pat
         }
     };
     const root = "C:/Users/u/.labelle/emsdk/4.0.0";
-    switch (emToolPath(testing.allocator, root, "emcc.bat", true, Fs{})) {
+    switch (emToolPath(testing.allocator, root, "emcc.bat", Fs{})) {
         .managed => |p| {
             defer p.deinit(testing.allocator);
             try testing.expect(std.mem.endsWith(u8, p.tool, "emcc.bat"));
@@ -1128,7 +1147,7 @@ test "emToolPath: EMSDK set but tool missing on disk → falls back to dep" {
             return false;
         }
     };
-    switch (emToolPath(testing.allocator, "/nonexistent/emsdk", "emcc", true, Fs{})) {
+    switch (emToolPath(testing.allocator, "/nonexistent/emsdk", "emcc", Fs{})) {
         .dep => {}, // helper frees the constructed path internally
         .managed => |p| {
             p.deinit(testing.allocator);
@@ -1147,7 +1166,7 @@ test "emToolPath: managed emcc runs under THAT emsdk's .emscripten (#161)" {
         }
     };
     const root = "/home/u/.cache/labelle-web/emsdk/v1/x86_64-linux/4.0.9-tag";
-    switch (emToolPath(testing.allocator, root, "emcc", true, Fs{})) {
+    switch (emToolPath(testing.allocator, root, "emcc", Fs{})) {
         .managed => |p| {
             defer p.deinit(testing.allocator);
             const expected = try std.fs.path.join(testing.allocator, &.{ root, ".emscripten" });
@@ -1169,7 +1188,7 @@ test "emToolPath: emcc present but EMSDK not activated (no .emscripten) → dep 
             return std.mem.endsWith(u8, path, "emcc");
         }
     };
-    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", true, Fs{})) {
+    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", Fs{})) {
         .dep => {}, // both constructed paths are freed internally
         .managed => |p| {
             p.deinit(testing.allocator);
@@ -1178,32 +1197,17 @@ test "emToolPath: emcc present but EMSDK not activated (no .emscripten) → dep 
     }
 }
 
-test "emToolPath: emcc + .emscripten but no sysroot → dep, like build.zig (#163)" {
-    // build.zig compiles bgfx against the package emsdk for this EMSDK, so the
-    // link must not pick the external emcc (two SDKs in one module).
+test "emToolPath: emcc + .emscripten without a sysroot under the emsdk is enough (assembler#823)" {
+    // The WASM builder image: /opt/emsdk has no upstream/emscripten/cache (its
+    // cache is EM_CACHE), and a cold cache has no sysroot yet. build.zig's
+    // emsdk_source.resolve takes this EMSDK and fills the sysroot, so the link
+    // must take it too. Before #823 both fell back to the package.
     const Fs = struct {
         fn exists(_: @This(), path: []const u8) bool {
             return std.mem.endsWith(u8, path, "emcc") or std.mem.endsWith(u8, path, ".emscripten");
         }
     };
-    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", true, Fs{})) {
-        .dep => {},
-        .managed => |p| {
-            p.deinit(testing.allocator);
-            return error.TestUnexpectedManaged;
-        },
-    }
-}
-
-test "emToolPath: with the sysroot supplied elsewhere, emcc + .emscripten is enough (#163)" {
-    // build.zig's `-Demsdk_sysroot` makes emsdk_source.resolve accept an EMSDK
-    // without the default sysroot; the link must accept the same EMSDK.
-    const Fs = struct {
-        fn exists(_: @This(), path: []const u8) bool {
-            return std.mem.endsWith(u8, path, "emcc") or std.mem.endsWith(u8, path, ".emscripten");
-        }
-    };
-    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", false, Fs{})) {
+    switch (emToolPath(testing.allocator, "/opt/emsdk", "emcc", Fs{})) {
         .managed => |p| p.deinit(testing.allocator),
         .dep => return error.TestExpectedManaged,
     }
