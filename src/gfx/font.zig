@@ -2,12 +2,16 @@
 ///
 ///   1. The **built-in** embedded 8x8 bitmap face (printable ASCII
 ///      32..126, one-row atlas) behind the contract's mandatory
-///      `drawText`. Unchanged, and still the fallback whenever no
-///      baked font is in play.
+///      `drawText`. Still the fallback whenever no baked font is in
+///      play; a codepoint past ASCII draws one `?` cell.
 ///   2. The **TTF/OTF** face (labelle-gfx#258, labelle-engine#448):
 ///      `decodeFont` bakes glyphs with stb_truetype on a worker
 ///      thread, `uploadFontAtlas` turns the bake into a bgfx texture
 ///      on the render thread, `unloadFontAtlas` releases it.
+///
+/// Text is UTF-8 in both faces: every draw and measure loop walks it
+/// with `nextCodepoint` (labelle-bgfx#214), so a face baked with a
+/// Latin-1 range draws "ñ" rather than the two bytes that encode it.
 ///
 /// The decode/upload split mirrors the image path (`texture.zig`):
 /// `decodeFont` is pure CPU and touches NO bgfx state — bgfx's API is
@@ -284,6 +288,49 @@ fn makeTexVertex(px: f32, py: f32, u: f32, v: f32, abgr: u32) PosTexColorVertex 
     };
 }
 
+/// Decode the UTF-8 codepoint that starts at `text[i.*]` and move `i`
+/// past it. Lenient, so a draw never fails on bad text: a truncated,
+/// overlong or otherwise invalid sequence yields U+FFFD and consumes
+/// exactly one byte, so the next byte starts a fresh decode. Both faces'
+/// draw and measure loops walk text with this (labelle-bgfx#214).
+/// `i.*` must be `< text.len`.
+pub fn nextCodepoint(text: []const u8, i: *usize) u21 {
+    const len = std.unicode.utf8ByteSequenceLength(text[i.*]) catch {
+        i.* += 1;
+        return std.unicode.replacement_character;
+    };
+    if (i.* + len > text.len) {
+        i.* += 1;
+        return std.unicode.replacement_character;
+    }
+    const cp = std.unicode.utf8Decode(text[i.* .. i.* + len]) catch {
+        i.* += 1;
+        return std.unicode.replacement_character;
+    };
+    i.* += len;
+    return cp;
+}
+
+/// What the built-in 8x8 face draws for `cp`: the index of its glyph in
+/// the atlas, or null for a blank cell. Every codepoint takes exactly one
+/// cell. Control characters stay blank, as they always were; anything
+/// past ASCII (which this face has no glyph for) draws `?`, so a missing
+/// letter is visible instead of silently gone (labelle-bgfx#214).
+pub fn builtinGlyphFor(cp: u21) ?usize {
+    if (cp >= FONT_FIRST_CHAR and cp <= FONT_LAST_CHAR) return cp - FONT_FIRST_CHAR;
+    if (cp < FONT_FIRST_CHAR or cp == 0x7F) return null;
+    return '?' - FONT_FIRST_CHAR;
+}
+
+/// Number of 8x8 cells `text` takes in the built-in face: one per
+/// codepoint, not per byte.
+pub fn builtinCellCount(text: []const u8) usize {
+    var i: usize = 0;
+    var cells: usize = 0;
+    while (i < text.len) : (cells += 1) _ = nextCodepoint(text, &i);
+    return cells;
+}
+
 pub fn drawText(text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void {
     ensureFontAtlas();
     if (font_texture.idx == std.math.maxInt(u16)) return;
@@ -299,13 +346,12 @@ pub fn drawText(text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void
     var cursor_x = state.transformX(x);
     const cursor_y = state.transformY(y);
 
-    for (text) |ch| {
-        if (ch < FONT_FIRST_CHAR or ch > FONT_LAST_CHAR) {
+    var i: usize = 0;
+    while (i < text.len) {
+        const glyph_idx = builtinGlyphFor(nextCodepoint(text, &i)) orelse {
             cursor_x += char_w;
             continue;
-        }
-
-        const glyph_idx: usize = ch - FONT_FIRST_CHAR;
+        };
         const uv0 = @as(f32, @floatFromInt(glyph_idx * FONT_CHAR_W)) / atlas_w_f;
         const uv1 = @as(f32, @floatFromInt((glyph_idx + 1) * FONT_CHAR_W)) / atlas_w_f;
         const tv0: f32 = 0.0;
@@ -328,11 +374,13 @@ pub fn drawText(text: [:0]const u8, x: f32, y: f32, size: f32, tint: Color) void
 // ── TTF/OTF font surface (labelle-gfx#258, labelle-engine#448) ─────────
 //
 // Everything below is the baked-font path. It sits alongside the
-// built-in 8x8 face above and never disturbs it: `drawText` keeps its
-// exact behaviour, and a caller with no baked font (or an invalid one)
-// still gets the embedded face, byte for byte.
+// built-in 8x8 face above and never disturbs it: a caller with no baked
+// font (or an invalid one) still gets the embedded face.
 
-/// Codepoint range to bake glyphs for, half-open `[first, last)`.
+/// Codepoint range to bake glyphs for, half-open `[first, last)`: the
+/// default `{ 0x20, 0x7F }` bakes printable ASCII 0x20..0x7E. That is
+/// also what labelle-core's and the assembler's defaults mean, so to
+/// bake all of Latin-1 declare `{ .first = 0x20, .last = 0x100 }`.
 pub const CodepointRange = extern struct {
     first: u32,
     last: u32,
@@ -1062,11 +1110,11 @@ pub fn layoutText(
     const baseline = y + face.atlas.ascent * scale;
     var prev: ?u32 = null;
 
-    for (text) |byte| {
-        // ASCII-only for now: the byte IS the codepoint. Full UTF-8
-        // decoding lands with the public draw decl, since that is what
-        // decides whether the backend or the engine owns the decode.
-        const cp: u32 = byte;
+    var i: usize = 0;
+    while (i < text.len) {
+        // Text is UTF-8 (labelle-bgfx#214): look glyphs up by codepoint,
+        // so a face baked with Latin-1 draws "ñ", not its two bytes.
+        const cp: u32 = nextCodepoint(text, &i);
 
         if (prev) |p| pen_x += kernAdvance(face.kerning, p, cp) * scale;
         prev = cp;
@@ -1105,8 +1153,9 @@ pub fn measureText(face: FontFace, text: []const u8, size: f32) f32 {
 
     var width: f32 = 0;
     var prev: ?u32 = null;
-    for (text) |byte| {
-        const cp: u32 = byte;
+    var i: usize = 0;
+    while (i < text.len) {
+        const cp: u32 = nextCodepoint(text, &i);
         if (prev) |p| width += kernAdvance(face.kerning, p, cp) * scale;
         prev = cp;
         const gi = glyphIndexFor(face.codepoint_index, cp) orelse continue;
