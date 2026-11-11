@@ -102,6 +102,12 @@ pub fn build(b: *std.Build) void {
     // mixer/decoder are pure Zig and compile for Android unchanged.
     const labelle_audio_dep = b.dependency("labelle_audio", .{ .target = target, .optimize = optimize });
     const labelle_audio_mod = labelle_audio_dep.module("labelle-audio");
+    // The opt-in decoder (MP3 via dr_mp3, OGG via stb_vorbis, WAV) + resampler
+    // from the SAME dependency instance, so its by-name `labelle-audio` import
+    // is the module above (one root per file). Wired onto the audio module on
+    // desktop only (#213): Android decodes with MediaCodec and wasm in the
+    // browser, so neither compiles the decoder's C.
+    const labelle_audio_decode_mod = labelle_audio_dep.module("labelle-audio-decode");
 
     // zglfw is desktop-only — it doesn't build for Android. Only fetch
     // the zglfw dependency (and its artifact) off the Android path so the
@@ -386,6 +392,9 @@ pub fn build(b: *std.Build) void {
     if (!is_android) {
         // ── miniaudio playback device (#297) — desktop only ─────────
         wireMiniaudio(b, audio_mod, target.result.os.tag);
+        // Desktop `loadMusicAsset` decodes MP3/OGG/WAV and resamples to the
+        // device rate in-process (#213).
+        audio_mod.addImport("labelle-audio-decode", labelle_audio_decode_mod);
     } else if (ndk != null) {
         // On Android the mixer is AAudio-backed via `labelle_android.aaudio`.
         // This module's own Zig source has no `@cInclude`, so the device-less
@@ -1426,11 +1435,17 @@ pub fn build(b: *std.Build) void {
     // host target so the run-test executes natively).
     const labelle_audio_host_dep = b.dependency("labelle_audio", .{ .target = host_target, .optimize = optimize });
     audio_test_mod.addImport("labelle-audio", labelle_audio_host_dep.module("labelle-audio"));
+    audio_test_mod.addImport("labelle-audio-decode", labelle_audio_host_dep.module("labelle-audio-decode"));
     // No `labelle_android` import here: `audio.zig` names it only inside its
     // dead `is_android` comptime branch, which Sema never reaches on the host.
     wireMiniaudio(b, audio_test_mod, host_target.result.os.tag);
     const audio_tests = b.addTest(.{ .root_module = audio_test_mod });
-    test_step.dependOn(&b.addRunArtifact(audio_tests).step);
+    const run_audio_tests = b.addRunArtifact(audio_tests);
+    // `loadMusicAsset` reads `assets/<name>` relative to the working
+    // directory, as a game does; run from the fixture root so the tests
+    // exercise that real path (test/audio_fixtures/assets/music/*).
+    run_audio_tests.setCwd(b.path("test/audio_fixtures"));
+    test_step.dependOn(&run_audio_tests.step);
 }
 
 /// WASM (Emscripten / WebGL2) build — SHIPPED + browser-verified (bgfx-wasm
