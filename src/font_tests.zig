@@ -197,6 +197,103 @@ test "layoutText emits nothing for a degenerate face" {
     try testing.expectEqual(@as(usize, 0), sink.count);
 }
 
+// ── UTF-8 (labelle-bgfx#214) ──────────────────────────────────────────
+
+test "nextCodepoint decodes UTF-8 one codepoint at a time" {
+    // "¡ñü" is three two-byte sequences; "€" three bytes; "😀" four.
+    const text = "a¡ñü€😀";
+    const want = [_]u21{ 'a', 0xA1, 0xF1, 0xFC, 0x20AC, 0x1F600 };
+    var i: usize = 0;
+    for (want) |cp| try testing.expectEqual(cp, font.nextCodepoint(text, &i));
+    try testing.expectEqual(text.len, i);
+}
+
+test "nextCodepoint maps invalid bytes to U+FFFD and resyncs on the next byte" {
+    // A lone continuation byte, a truncated two-byte lead at the end of
+    // the string, and a lead followed by ASCII instead of a continuation.
+    const cases = [_]struct { text: []const u8, want: []const u21 }{
+        .{ .text = "\x80A", .want = &.{ 0xFFFD, 'A' } },
+        .{ .text = "A\xC3", .want = &.{ 'A', 0xFFFD } },
+        .{ .text = "\xC3A", .want = &.{ 0xFFFD, 'A' } },
+        // Overlong encoding of '/'.
+        .{ .text = "\xC0\xAF", .want = &.{ 0xFFFD, 0xFFFD } },
+    };
+    for (cases) |c| {
+        var i: usize = 0;
+        for (c.want) |cp| try testing.expectEqual(cp, font.nextCodepoint(c.text, &i));
+        try testing.expectEqual(c.text.len, i);
+    }
+}
+
+test "the built-in face gives every codepoint one cell" {
+    // Before #214 "ñ" took two blank cells, one per byte.
+    try testing.expectEqual(@as(usize, 1), font.builtinCellCount("ñ"));
+    try testing.expectEqual(@as(usize, 13), font.builtinCellCount("¡Tengo sueño!"));
+    try testing.expectEqual(@as(usize, 13), font.builtinCellCount("Ich bin müde!"));
+    try testing.expectEqual(@as(usize, 5), font.builtinCellCount("hello"));
+}
+
+test "the built-in face draws ? past ASCII and keeps control characters blank" {
+    try testing.expectEqual(@as(?usize, 'A' - font.FONT_FIRST_CHAR), font.builtinGlyphFor('A'));
+    try testing.expectEqual(@as(?usize, '?' - font.FONT_FIRST_CHAR), font.builtinGlyphFor(0xF1));
+    try testing.expectEqual(@as(?usize, '?' - font.FONT_FIRST_CHAR), font.builtinGlyphFor(0xFFFD));
+    try testing.expectEqual(@as(?usize, null), font.builtinGlyphFor('\n'));
+    try testing.expectEqual(@as(?usize, null), font.builtinGlyphFor(0x7F));
+}
+
+/// `testFace` plus 'ñ' (U+00F1) as a third glyph, so the layout can be
+/// asserted against a face that has a non-ASCII codepoint baked.
+fn latinFace(kerning: []const font.KernPair) font.FontFace {
+    const S = struct {
+        const glyphs = [_]font.Glyph{
+            .{ .u0 = 0, .v0 = 0, .u1 = 0, .v1 = 0, .xoff = 0, .yoff = 0, .advance = 8 },
+            .{ .u0 = 0, .v0 = 0, .u1 = 10, .v1 = 10, .xoff = 1, .yoff = -10, .advance = 12 },
+            // 'ñ' — 10x12 at (10,0), advance 11.
+            .{ .u0 = 10, .v0 = 0, .u1 = 20, .v1 = 12, .xoff = 0, .yoff = -12, .advance = 11 },
+        };
+        const index = [_]font.CodepointEntry{
+            .{ .codepoint = ' ', .glyph_index = 0 },
+            .{ .codepoint = 'A', .glyph_index = 1 },
+            .{ .codepoint = 0xF1, .glyph_index = 2 },
+        };
+    };
+    var face = testFace(kerning);
+    face.glyphs = &S.glyphs;
+    face.codepoint_index = &S.index;
+    return face;
+}
+
+test "layoutText draws a baked non-ASCII codepoint as one glyph" {
+    var sink = QuadSink{};
+    font.layoutText(latinFace(&.{}), "AñA", 0, 0, 20, &QuadSink.emit, &sink);
+    // Three quads: before #214 the two bytes of 'ñ' (0xC3 0xB1) were
+    // looked up separately, found nothing, and drew nothing.
+    try testing.expectEqual(@as(usize, 3), sink.count);
+    // 'ñ' starts after advance('A') = 12, and is the 10..20 atlas rect.
+    try testing.expectApproxEqAbs(@as(f32, 12), sink.quads[1].x0, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.1), sink.quads[1].u0, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.2), sink.quads[1].u1, 0.001);
+    // The second 'A' starts after 12 + 11, plus its xoff of 1.
+    try testing.expectApproxEqAbs(@as(f32, 24), sink.quads[2].x0, 0.001);
+}
+
+test "kerning pairs on a non-ASCII codepoint apply" {
+    var sink = QuadSink{};
+    const pairs = [_]font.KernPair{.{ .first = 'A', .second = 0xF1, .advance = -2 }};
+    font.layoutText(latinFace(&pairs), "Añ", 0, 0, 20, &QuadSink.emit, &sink);
+    try testing.expectEqual(@as(usize, 2), sink.count);
+    try testing.expectApproxEqAbs(@as(f32, 10), sink.quads[1].x0, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 21), font.measureText(latinFace(&pairs), "Añ", 20), 0.001);
+}
+
+test "measureText counts a UTF-8 letter once" {
+    // 12 + 11 + 12: 'ñ' is one advance, not two failed lookups.
+    try testing.expectApproxEqAbs(@as(f32, 35), font.measureText(latinFace(&.{}), "AñA", 20), 0.001);
+    // A stray continuation byte maps to U+FFFD, which isn't baked: no
+    // advance, and the 'A' after it still measures.
+    try testing.expectApproxEqAbs(@as(f32, 12), font.measureText(latinFace(&.{}), "\x80A", 20), 0.001);
+}
+
 test "measureText sums advances and kerning" {
     try testing.expectApproxEqAbs(@as(f32, 32), font.measureText(testFace(&.{}), "A A", 20), 0.001);
     const pairs = [_]font.KernPair{.{ .first = 'A', .second = 'A', .advance = -3 }};
@@ -734,6 +831,41 @@ test "decodeFont honors multiple non-contiguous ranges" {
     // ':' sits between the two ranges and was never baked.
     try testing.expectEqual(@as(?u32, null), font.glyphIndexFor(d.codepoint_index, ':'));
     try testing.expectEqual(@as(?u32, null), font.glyphIndexFor(d.codepoint_index, 'a'));
+}
+
+test "a Latin-1 bake draws a localized line through the real layout" {
+    // The labelle-bgfx#214 end to end: bake Roboto with ASCII + Latin-1
+    // (half-open, so 0x100 includes 'ÿ'), then lay out a Spanish line.
+    // Every letter, '¡' and 'ñ' included, must come out as a glyph.
+    const params = font.FontBakeParams{
+        .pixel_height = 16,
+        .ranges = &.{.{ .first = 0x20, .last = 0x100 }},
+        .atlas_width = 512,
+        .atlas_height = 512,
+    };
+    const d = try font.decodeFont("ttf", roboto_ttf, &params, testing.allocator);
+    defer freeDecodedFont(testing.allocator, d);
+    try testing.expect(font.glyphIndexFor(d.codepoint_index, 0xF1) != null); // ñ
+    try testing.expect(font.glyphIndexFor(d.codepoint_index, 0xFF) != null); // ÿ
+
+    const face = font.FontFace{
+        .atlas = .{
+            .texture = .{ .idx = 1 },
+            .width = d.width,
+            .height = d.height,
+            .ascent = d.ascent,
+            .descent = d.descent,
+            .line_gap = d.line_gap,
+            .line_height = d.line_height,
+        },
+        .glyphs = d.glyphs,
+        .codepoint_index = d.codepoint_index,
+        .kerning = d.kerning,
+    };
+    var sink = QuadSink{};
+    // 13 codepoints, one of them a space: 12 visible glyphs.
+    font.layoutText(face, "¡Tengo sueño!", 0, 0, 16, &QuadSink.emit, &sink);
+    try testing.expectEqual(@as(usize, 12), sink.count);
 }
 
 test "decodeFont reports FontAtlasTooSmall when the glyphs do not fit" {
