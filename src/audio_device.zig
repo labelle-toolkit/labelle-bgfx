@@ -33,7 +33,10 @@ const ma = @cImport({
 /// enforce the signature at the `Mixer(...)` instantiation site.
 pub const MixFn = @import("labelle-audio").MixCallback;
 
-const DEVICE_SAMPLE_RATE: u32 = 48000;
+/// The rate the device opens at. The mixer does not resample, so every PCM
+/// buffer handed to it must already be at this rate (`audio.zig` resamples
+/// decoded music assets to it).
+pub const DEVICE_SAMPLE_RATE: u32 = 48000;
 const DEVICE_CHANNELS: u32 = 2;
 
 var device: ma.ma_device = undefined;

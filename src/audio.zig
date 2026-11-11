@@ -16,6 +16,9 @@
 ///     behind the path-based `loadSound`/`loadMusic`: the shared mixer is
 ///     byte-buffer based (`loadSoundFromMemory`), so we read path→bytes via
 ///     libc here and hand the bytes to the mixer.
+///   * `loadMusicAsset` decodes per platform: MediaCodec on Android, the
+///     browser on wasm, and on desktop `labelle-audio-decode` (MP3 via dr_mp3,
+///     OGG via stb_vorbis, WAV) resampled to the device's 48 kHz (#213).
 ///
 /// Thread-safety, the #298 unload/mix UAF fix, the spinlock, mono→stereo
 /// duplication, and the device-less Android behaviour are all provided by the
@@ -217,15 +220,65 @@ pub fn loadMusic(path: [:0]const u8) u32 {
 /// device (a 2-minute MP3 is ~7 s on the MT6750 P42), long enough for an
 /// Android "not responding" dialog. Games should use `loadMusicAssetAsync`.
 ///
-/// On desktop it loads `assets/<name>` with `loadMusic`, so only a WAV at the
-/// device rate works there until desktop decodes compressed audio. The browser
-/// can't fetch synchronously, so on wasm this returns 0: use
+/// On desktop it reads `assets/<name>` (relative to the working directory),
+/// picks the decoder from the extension (`.mp3`, `.ogg` or `.wav`, any case),
+/// decodes in-process with `labelle-audio-decode` and resamples to the
+/// device's 48 kHz (linear interpolation; the mixer itself does not resample,
+/// so a 44.1 kHz track would otherwise play ~9% fast). Mono stays mono; the
+/// mixer plays it on both channels. No external tool is involved (#213). A
+/// long MP3 takes a noticeable moment to decode, so games should still use
+/// `loadMusicAssetAsync`.
+///
+/// The browser can't fetch synchronously, so on wasm this returns 0: use
 /// `loadMusicAssetAsync`, which fetches and decodes in the browser.
 pub fn loadMusicAsset(name: []const u8) u32 {
     if (comptime is_android) return loadMusicAssetAndroid(name);
     var buf: [512]u8 = undefined;
     const path = std.fmt.bufPrintZ(&buf, "assets/{s}", .{name}) catch return 0;
-    return loadMusic(path);
+    // wasm keeps its old behaviour (no synchronous fetch; returns 0) and
+    // doesn't link the decoder.
+    // `else` so the desktop decoder is never analyzed on wasm.
+    if (comptime is_wasm) return loadMusic(path) else return loadMusicFileDesktop(path);
+}
+
+/// The decoder `labelle-audio-decode` should use for `path`, from its
+/// extension (case-insensitive), or null if it isn't one we decode.
+fn musicFileType(path: []const u8) ?[:0]const u8 {
+    const ext = std.fs.path.extension(path);
+    if (std.ascii.eqlIgnoreCase(ext, ".mp3")) return "mp3";
+    if (std.ascii.eqlIgnoreCase(ext, ".ogg")) return "ogg";
+    if (std.ascii.eqlIgnoreCase(ext, ".wav")) return "wav";
+    return null;
+}
+
+/// Desktop music asset load: read, decode by extension, resample to the
+/// device rate, register. Runs on the caller's thread (a worker thread under
+/// `loadMusicAssetAsync`): it touches only the file, `heap.allocator` and the
+/// mixer's locked registration.
+fn loadMusicFileDesktop(path: [:0]const u8) u32 {
+    useHeap();
+    const file_type = musicFileType(path) orelse {
+        std.log.warn("[audio] music asset {s}: unsupported extension (want .mp3, .ogg or .wav)", .{path});
+        return 0;
+    };
+    const bytes = readFileBytes(path) orelse return 0;
+    defer heap.allocator.free(bytes);
+    return loadMusicEncoded(path, file_type, bytes);
+}
+
+/// Decode `bytes` as `file_type` at the device rate and register it as music.
+/// The mixer copies the samples, so the decoded buffer is freed here.
+fn loadMusicEncoded(label: []const u8, file_type: [:0]const u8, bytes: []const u8) u32 {
+    const decode = @import("labelle-audio-decode");
+    const rate = @import("audio_device.zig").DEVICE_SAMPLE_RATE;
+    const dec = decode.decodeAudioAt(file_type, bytes, heap.allocator, rate) catch |err| {
+        std.log.warn("[audio] music asset {s}: decode failed: {s}", .{ label, @errorName(err) });
+        return 0;
+    };
+    defer heap.allocator.free(dec.samples);
+    const frames = dec.samples.len / dec.channels;
+    std.log.info("[audio] music asset {s}: {d} frames ({d:.2} s at {d} Hz)", .{ label, frames, @as(f64, @floatFromInt(frames)) / @as(f64, @floatFromInt(rate)), rate });
+    return loadMusicFromPcm(dec.samples, dec.channels, rate);
 }
 
 /// A music asset being decoded off the calling thread by
@@ -517,6 +570,90 @@ test "MusicAssetLoad.wait joins the worker and returns its result" {
 test "MusicAssetLoad.wait on a load that never started returns 0" {
     var load: MusicAssetLoad = .{};
     try testing.expectEqual(@as(u32, 0), load.wait());
+}
+
+// -- Desktop compressed music (#213) ---------------------------------
+//
+// The run step's cwd is `test/audio_fixtures` (build.zig), so
+// `loadMusicAsset("music/…")` reads the real `assets/music/…` file, the same
+// path a game takes. The fixtures are 0.25 s sines (LAME 3.100 MP3s, the
+// labelle-audio OGG) plus a 20 ms 48 kHz WAV.
+
+/// Play `id` non-looping and count the frames the mixer produces before it
+/// reports EOF — the length the mixer actually has for the track.
+fn playedFrames(id: u32) !usize {
+    setMusicLooping(id, false);
+    playMusic(id);
+    var out: [2 * 256]i16 = undefined;
+    var total: usize = 0;
+    while (isMusicPlaying(id)) : (total += 1) {
+        mixAudio(out[0..2], 1);
+        if (total > 48000 * 5) return error.NeverEnded;
+    }
+    return total;
+}
+
+test "desktop loadMusicAsset decodes a 44.1 kHz MP3 to 0.25 s at 48 kHz" {
+    if (comptime is_android or is_wasm) return error.SkipZigTest;
+    Audio.resetForTest();
+    const id = loadMusicAsset("music/tone_stereo_44k.mp3");
+    try testing.expect(id != 0);
+    defer unloadMusic(id);
+    // 11025 source frames at 44.1 kHz → 12000 at 48 kHz: the right pitch and
+    // length, not the ~9% fast a straight 44.1 kHz register would give.
+    try testing.expectEqual(@as(usize, 12000), try playedFrames(id));
+}
+
+test "desktop loadMusicAsset decodes a mono 22.05 kHz MP3, case-insensitive extension" {
+    if (comptime is_android or is_wasm) return error.SkipZigTest;
+    try testing.expectEqualStrings("mp3", musicFileType("assets/x/TRACK.Mp3").?);
+    Audio.resetForTest();
+    const id = loadMusicAsset("music/tone_mono_22k.mp3");
+    try testing.expect(id != 0);
+    defer unloadMusic(id);
+    // round(5512 * 48000 / 22050)
+    try testing.expectEqual(@as(usize, 11999), try playedFrames(id));
+}
+
+test "desktop loadMusicAsset decodes an OGG and resamples it to 48 kHz" {
+    if (comptime is_android or is_wasm) return error.SkipZigTest;
+    Audio.resetForTest();
+    const id = loadMusicAsset("music/tone_mono_8k.ogg");
+    try testing.expect(id != 0);
+    defer unloadMusic(id);
+    const frames = try playedFrames(id);
+    // 8 kHz → 48 kHz is exactly 6x; the fixture is ~0.05 s.
+    try testing.expectEqual(@as(usize, 0), frames % 6);
+    try testing.expect(frames > 2000 and frames < 3000);
+}
+
+test "desktop loadMusicAsset keeps a 48 kHz WAV as-is" {
+    if (comptime is_android or is_wasm) return error.SkipZigTest;
+    Audio.resetForTest();
+    const id = loadMusicAsset("music/tone_stereo_48k.wav");
+    try testing.expect(id != 0);
+    defer unloadMusic(id);
+    try testing.expectEqual(@as(usize, 960), try playedFrames(id));
+}
+
+test "desktop loadMusicAssetAsync loads an MP3 on the worker" {
+    if (comptime is_android or is_wasm) return error.SkipZigTest;
+    Audio.resetForTest();
+    var load: MusicAssetLoad = .{};
+    try testing.expect(loadMusicAssetAsync(&load, "music/tone_stereo_44k.mp3"));
+    const id = load.wait();
+    try testing.expect(id != 0);
+    defer unloadMusic(id);
+    try testing.expectEqual(@as(usize, 12000), try playedFrames(id));
+}
+
+test "desktop music rejects unknown extensions and corrupt data" {
+    if (comptime is_android or is_wasm) return error.SkipZigTest;
+    Audio.resetForTest();
+    try testing.expect(musicFileType("music/track.flac") == null);
+    try testing.expect(musicFileType("music/track") == null);
+    try testing.expectEqual(@as(u32, 0), loadMusicAsset("music/track.flac"));
+    try testing.expectEqual(@as(u32, 0), loadMusicEncoded("junk.mp3", "mp3", "this is not an mpeg audio stream at all, sorry"));
 }
 
 test "Android asset music loader is type checked" {
