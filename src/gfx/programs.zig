@@ -1397,18 +1397,20 @@ pub fn submitShaderMaterialTriangles(vertices: []const PosTexColorVertex, textur
     // `LABELLE_BGFX_MATERIAL_SKIP` / `_STATS` (labelle-bgfx#217).
     const label = instance.program.labelSlice();
     if (diagnostics.skipped(label)) return true;
+    ensureLayouts();
+    const num: u32 = @intCast(vertices.len);
+    if (!transient_budget.fits(num, bgfx.getAvailTransientVertexBuffer(num, &vertex_layout))) {
+        noteTransientDrop("shader material quad", "vertex", num);
+        return true;
+    }
+    // Counted only once it is really submitted: a quad dropped above never
+    // reaches the GPU (Codex on #220).
     if (diagnostics.enabled()) {
         var ndc: [6][2]f32 = undefined;
         const n = @min(vertices.len, ndc.len);
         for (vertices[0..n], 0..) |v, i| ndc[i] = .{ v.x, v.y };
         const size = gfx_state.physicalSize();
         diagnostics.record(instance.program.handle, label, diagnostics.pixelArea(ndc[0..n], @floatFromInt(size[0]), @floatFromInt(size[1])));
-    }
-    ensureLayouts();
-    const num: u32 = @intCast(vertices.len);
-    if (!transient_budget.fits(num, bgfx.getAvailTransientVertexBuffer(num, &vertex_layout))) {
-        noteTransientDrop("shader material quad", "vertex", num);
-        return true;
     }
     var tvb: bgfx.TransientVertexBuffer = undefined;
     bgfx.allocTransientVertexBuffer(&tvb, num, &vertex_layout);

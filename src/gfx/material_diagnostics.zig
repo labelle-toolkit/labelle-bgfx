@@ -88,22 +88,70 @@ pub fn listed(list: []const u8, label: []const u8) bool {
 }
 
 /// Screen-space pixels covered by `ndc` triangles (x, y pairs, three per
-/// triangle), each vertex clamped to the screen, on a `w` x `h` backbuffer.
+/// triangle) on a `w` x `h` backbuffer. Each triangle is clipped to the
+/// screen's [-1, 1] square first (Sutherland-Hodgman), so a rotated quad
+/// hanging off the edges counts what is on screen: clamping its corners
+/// instead under-counted it (Codex on #220).
 pub fn pixelArea(ndc: []const [2]f32, w: f32, h: f32) f64 {
     var area: f64 = 0;
     var i: usize = 0;
     while (i + 2 < ndc.len) : (i += 3) {
-        const a = clamp(ndc[i]);
-        const b = clamp(ndc[i + 1]);
-        const c = clamp(ndc[i + 2]);
-        area += @abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) / 2.0;
+        var poly: [9][2]f64 = undefined;
+        poly[0] = widen(ndc[i]);
+        poly[1] = widen(ndc[i + 1]);
+        poly[2] = widen(ndc[i + 2]);
+        var n: usize = 3;
+        inline for (.{ .{ 0, -1.0 }, .{ 0, 1.0 }, .{ 1, -1.0 }, .{ 1, 1.0 } }) |edge| {
+            n = clipEdge(&poly, n, edge[0], edge[1]);
+        }
+        area += polygonArea(poly[0..n]);
     }
     // NDC spans 2 units on each axis.
     return area * (w / 2.0) * (h / 2.0);
 }
 
-fn clamp(p: [2]f32) [2]f64 {
-    return .{ std.math.clamp(p[0], -1, 1), std.math.clamp(p[1], -1, 1) };
+fn widen(p: [2]f32) [2]f64 {
+    return .{ p[0], p[1] };
+}
+
+/// Keep the part of `poly[0..n]` on the inside of `axis = bound` (inside is
+/// towards 0), in place. A triangle clipped by four edges has at most 7
+/// corners; the buffer holds 9.
+fn clipEdge(poly: *[9][2]f64, n: usize, comptime axis: usize, comptime bound: f64) usize {
+    if (n == 0) return 0;
+    var out: [9][2]f64 = undefined;
+    var m: usize = 0;
+    const inside = struct {
+        fn f(p: [2]f64) bool {
+            return if (bound < 0) p[axis] >= bound else p[axis] <= bound;
+        }
+    }.f;
+    var prev = poly[n - 1];
+    for (poly[0..n]) |cur| {
+        const cur_in = inside(cur);
+        if (cur_in != inside(prev)) {
+            const t = (bound - prev[axis]) / (cur[axis] - prev[axis]);
+            out[m] = .{ prev[0] + t * (cur[0] - prev[0]), prev[1] + t * (cur[1] - prev[1]) };
+            m += 1;
+        }
+        if (cur_in) {
+            out[m] = cur;
+            m += 1;
+        }
+        prev = cur;
+    }
+    @memcpy(poly[0..m], out[0..m]);
+    return m;
+}
+
+fn polygonArea(poly: []const [2]f64) f64 {
+    if (poly.len < 3) return 0;
+    var twice: f64 = 0;
+    for (poly, 0..) |a, k| {
+        const b = poly[(k + 1) % poly.len];
+        twice += a[0] * b[1] - b[0] * a[1];
+    }
+    return @abs(twice) / 2.0;
 }
 
 /// Count one draw of `program` (`label`) covering `pixels`.
@@ -165,6 +213,16 @@ test "pixel area of a full-screen quad is the backbuffer, clipped beyond it" {
     try testing.expectApproxEqAbs(@as(f64, 2000 * 1200), pixelArea(&big, 2000, 1200), 0.5);
     const quarter = [_][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 0 }, .{ 1, 1 }, .{ 0, 1 } };
     try testing.expectApproxEqAbs(@as(f64, 1000 * 600), pixelArea(&quarter, 2000, 1200), 0.5);
+}
+
+test "a rotated quad hanging off every edge counts the whole screen it covers" {
+    // A diamond with corners at (0,-2), (2,0), (0,2), (-2,0) covers all of
+    // [-1,1]^2: clamping corners counted half (Codex on #220).
+    const diamond = [_][2]f32{ .{ 0, -2 }, .{ 2, 0 }, .{ 0, 2 }, .{ 0, -2 }, .{ 0, 2 }, .{ -2, 0 } };
+    try testing.expectApproxEqAbs(@as(f64, 2000 * 1200), pixelArea(&diamond, 2000, 1200), 1.0);
+    // Entirely off screen: nothing.
+    const off = [_][2]f32{ .{ 2, 2 }, .{ 3, 2 }, .{ 3, 3 } };
+    try testing.expectEqual(@as(f64, 0), pixelArea(&off, 2000, 1200));
 }
 
 test "the skip list matches whole labels, comma or space separated" {
