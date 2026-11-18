@@ -41,11 +41,22 @@
 //! `LABELLE_BGFX_SHADER_CACHE=<dir>` turns it on anywhere; `=off` turns the
 //! Android default off.
 //!
-//! All I/O is plain libc (`fopen`/`fread`/`fwrite`/`rename`), as in the
-//! screenshot writer: the callbacks run on bgfx's render thread with no
-//! allocator in hand, so nothing here allocates.
+//! All I/O is plain libc, as in the screenshot writer: the callbacks run on
+//! bgfx's render thread with no allocator in hand, so nothing here
+//! allocates. A write goes to a temp file unique to that write (pid and a
+//! counter), created exclusively without following links, then renamed into
+//! place, so two processes sharing a directory can't write through one temp
+//! file and a planted link can't be truncated.
+//!
+//! POSIX only (Android, Linux, macOS): Windows' CRT `rename` refuses to
+//! replace an existing file, so a rejected entry could never be healed. On
+//! Windows the cache stays off; it was opt-in there anyway.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// Whether this platform can host the cache (see the header).
+pub const supported = builtin.os.tag != .windows;
 
 const log = std.log.scoped(.bgfx_shader_cache);
 
@@ -76,6 +87,10 @@ pub fn enabled() bool {
 pub fn configure(dir: ?[]const u8) void {
     dir_len = 0;
     const d = dir orelse return;
+    if (comptime !supported) {
+        log.warn("shader cache: not supported on this platform; off", .{});
+        return;
+    }
     const trimmed = std.mem.trimEnd(u8, d, "/");
     if (trimmed.len == 0 or trimmed.len > max_dir) {
         log.warn("shader cache disabled: directory path is empty or longer than {d} bytes", .{max_dir});
@@ -97,7 +112,8 @@ pub fn directory() ?[]const u8 {
     return if (dir_len == 0) null else dir_buf[0..dir_len];
 }
 
-/// `mkdir -p`. True when the directory exists afterwards.
+/// `mkdir -p`. True when `path` is a directory afterwards: an existing
+/// regular file of that name (`EEXIST` from `mkdir`) is not.
 fn makePath(path: [:0]u8) bool {
     var i: usize = 1;
     while (i <= path.len) : (i += 1) {
@@ -107,12 +123,28 @@ fn makePath(path: [:0]u8) bool {
         defer path[i] = saved;
         if (std.c.mkdir(path[0..i :0].ptr, 0o700) != 0 and std.c._errno().* != @intFromEnum(std.c.E.EXIST)) return false;
     }
+    const dir = std.c.opendir(path.ptr) orelse return false;
+    _ = std.c.closedir(dir);
     return true;
 }
 
-/// `<dir>/<id>.bin`, or `<dir>/<id>.tmp` for a write in progress.
-fn entryPath(buf: *[max_dir + 32:0]u8, id: u64, suffix: []const u8) [:0]const u8 {
+/// `<dir>/<id>.bin`.
+fn entryPath(buf: *[max_dir + 64:0]u8, id: u64, suffix: []const u8) [:0]const u8 {
     return std.fmt.bufPrintZ(buf, "{s}/{x:0>16}{s}", .{ dir_buf[0..dir_len], id, suffix }) catch unreachable;
+}
+
+/// Temp names are unique per write: this process's id and a counter.
+var tmp_counter: u32 = 0;
+
+fn processId() u64 {
+    if (comptime !supported) return 0;
+    return @intCast(std.c.getpid());
+}
+
+/// `<dir>/<id>.<pid>.<n>.tmp`, for one write in progress.
+fn tempPath(buf: *[max_dir + 64:0]u8, id: u64) [:0]const u8 {
+    tmp_counter +%= 1;
+    return std.fmt.bufPrintZ(buf, "{s}/{x:0>16}.{d}.{d}.tmp", .{ dir_buf[0..dir_len], id, processId(), tmp_counter }) catch unreachable;
 }
 
 /// The header bgfx's payload of `size` bytes and checksum `crc` is stored under.
@@ -137,7 +169,7 @@ pub fn parseHeader(h: *const [header_len]u8) ?struct { size: u32, crc: u32 } {
 /// Checks an entry end to end (magic, version, length, checksum) and
 /// returns its payload size, or null for a missing or bad entry.
 fn validSize(id: u64) ?u32 {
-    var path_buf: [max_dir + 32:0]u8 = undefined;
+    var path_buf: [max_dir + 64:0]u8 = undefined;
     const file = std.c.fopen(entryPath(&path_buf, id, ".bin").ptr, "rb") orelse return null;
     defer _ = std.c.fclose(file);
     var h: [header_len]u8 = undefined;
@@ -171,27 +203,29 @@ pub fn readSize(id: u64) u32 {
 }
 
 fn exists(id: u64) bool {
-    var path_buf: [max_dir + 32:0]u8 = undefined;
+    var path_buf: [max_dir + 64:0]u8 = undefined;
     const file = std.c.fopen(entryPath(&path_buf, id, ".bin").ptr, "rb") orelse return false;
     _ = std.c.fclose(file);
     return true;
 }
 
 /// bgfx `cacheRead`: fill `out` with the entry's payload. bgfx calls it with
-/// the size `readSize` just reported; a mismatch reads as a failure.
+/// the size `readSize` just reported. Checked again on the one stream it is
+/// read from (header, size, checksum, nothing after), not trusted from
+/// `readSize`: the file could have been replaced in between.
 pub fn read(id: u64, out: []u8) bool {
     if (!enabled()) return false;
-    // Checked again, not trusted from `readSize`: the file could have been
-    // replaced in between.
-    const size = validSize(id) orelse return false;
-    if (size != out.len) return false;
-    var path_buf: [max_dir + 32:0]u8 = undefined;
+    var path_buf: [max_dir + 64:0]u8 = undefined;
     const file = std.c.fopen(entryPath(&path_buf, id, ".bin").ptr, "rb") orelse return false;
     defer _ = std.c.fclose(file);
     var h: [header_len]u8 = undefined;
     if (std.c.fread(&h, 1, h.len, file) != h.len) return false;
+    const meta = parseHeader(&h) orelse return false;
+    if (meta.size != out.len) return false;
     if (std.c.fread(out.ptr, 1, out.len, file) != out.len) return false;
-    if (std.hash.Crc32.hash(out) != parseHeader(&h).?.crc) return false;
+    var extra: [1]u8 = undefined;
+    if (std.c.fread(&extra, 1, 1, file) != 0) return false;
+    if (std.hash.Crc32.hash(out) != meta.crc) return false;
     stats.hits += 1;
     return true;
 }
@@ -203,12 +237,14 @@ pub fn write(id: u64, data: []const u8) void {
         log.warn("shader cache: entry {x:0>16} ({d} bytes) is too large to store", .{ id, data.len });
         return;
     }
-    var tmp_buf: [max_dir + 32:0]u8 = undefined;
-    var bin_buf: [max_dir + 32:0]u8 = undefined;
-    const tmp = entryPath(&tmp_buf, id, ".tmp");
+    var tmp_buf: [max_dir + 64:0]u8 = undefined;
+    var bin_buf: [max_dir + 64:0]u8 = undefined;
+    const tmp = tempPath(&tmp_buf, id);
     const bin = entryPath(&bin_buf, id, ".bin");
-    if (!writeFile(tmp, data)) {
-        _ = std.c.unlink(tmp.ptr);
+    const written = writeFile(tmp, data);
+    if (written != .ok) {
+        // Only a temp this write created is ours to remove.
+        if (written == .failed) _ = std.c.unlink(tmp.ptr);
         stats.write_failures += 1;
         log.warn("shader cache: could not write {s}", .{tmp});
         return;
@@ -223,14 +259,29 @@ pub fn write(id: u64, data: []const u8) void {
     log.debug("shader cache: stored {x:0>16} ({d} bytes)", .{ id, data.len });
 }
 
-fn writeFile(path: [:0]const u8, data: []const u8) bool {
-    const file = std.c.fopen(path.ptr, "wb") orelse return false;
+const Written = enum { ok, failed, not_created };
+
+/// Writes header and payload to a NEW file at `path`: created exclusively,
+/// without following a link, readable by this user only.
+fn writeFile(path: [:0]const u8, data: []const u8) Written {
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return .not_created;
     var ok = true;
     const h = header(@intCast(data.len), std.hash.Crc32.hash(data));
-    if (std.c.fwrite(&h, 1, h.len, file) != h.len) ok = false;
-    if (ok and std.c.fwrite(data.ptr, 1, data.len, file) != data.len) ok = false;
-    if (std.c.fclose(file) != 0) ok = false;
-    return ok;
+    if (!writeAll(fd, &h)) ok = false;
+    if (ok and !writeAll(fd, data)) ok = false;
+    if (std.c.close(fd) != 0) ok = false;
+    return if (ok) .ok else .failed;
+}
+
+fn writeAll(fd: std.c.fd_t, bytes: []const u8) bool {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = std.c.write(fd, bytes[off..].ptr, bytes.len - off);
+        if (n <= 0) return false;
+        off += @intCast(n);
+    }
+    return true;
 }
 
 /// The Android cache directory under the app's private files dir, keyed by
@@ -243,15 +294,31 @@ pub fn androidDir(buf: []u8, files_dir: []const u8, fingerprint: []const u8) []c
 
 // ── Platform default ───────────────────────────────────────────────────
 
-const builtin = @import("builtin");
 const is_android = builtin.target.os.tag == .linux and
     (builtin.target.abi == .android or builtin.target.abi == .androideabi);
 
 /// The activity's files dir, exported by `android_app.zig` (a C symbol, so
 /// this module doesn't import the shell). Only referenced on Android.
 extern fn labelle_bgfx_internal_data_path() ?[*:0]const u8;
-/// bionic's system property reader; values are at most 92 bytes.
-extern "c" fn __system_property_get(name: [*:0]const u8, value: [*]u8) c_int;
+/// bionic's property API. Not `__system_property_get`: for a read-only
+/// property longer than 91 bytes it returns a fixed diagnostic string, so two
+/// builds with long fingerprints would hash alike (CodeRabbit on #219).
+const PropInfo = opaque {};
+extern "c" fn __system_property_find(name: [*:0]const u8) ?*const PropInfo;
+extern "c" fn __system_property_read_callback(
+    pi: *const PropInfo,
+    callback: *const fn (cookie: ?*anyopaque, name: [*:0]const u8, value: [*:0]const u8, serial: u32) callconv(.c) void,
+    cookie: ?*anyopaque,
+) void;
+
+const Fingerprint = struct { buf: [512]u8 = undefined, len: usize = 0 };
+
+fn onProperty(cookie: ?*anyopaque, _: [*:0]const u8, value: [*:0]const u8, _: u32) callconv(.c) void {
+    const out: *Fingerprint = @ptrCast(@alignCast(cookie.?));
+    const v = std.mem.span(value);
+    out.len = @min(v.len, out.buf.len);
+    @memcpy(out.buf[0..out.len], v[0..out.len]);
+}
 
 pub const env_name = "LABELLE_BGFX_SHADER_CACHE";
 
@@ -278,10 +345,12 @@ pub fn configureForPlatform() void {
     }
     if (comptime !is_android) return configure(null);
     const files = labelle_bgfx_internal_data_path() orelse return configure(null);
-    var fp: [128]u8 = @splat(0);
-    const n = __system_property_get("ro.build.fingerprint", &fp);
+    // No fingerprint, no default cache (a stale driver binary is the risk).
+    const info = __system_property_find("ro.build.fingerprint") orelse return configure(null);
+    var fp: Fingerprint = .{};
+    __system_property_read_callback(info, &onProperty, &fp);
     var buf: [max_dir]u8 = undefined;
-    const dir = androidDir(&buf, std.mem.span(files), fp[0..@intCast(@max(n, 0))]);
+    const dir = androidDir(&buf, std.mem.span(files), fp.buf[0..fp.len]);
     configure(if (dir.len == 0) null else dir);
 }
 
@@ -290,13 +359,12 @@ const testing = std.testing;
 
 fn testDir(buf: []u8, name: []const u8) []const u8 {
     const base = std.mem.span(std.c.getenv("TMPDIR") orelse "/tmp");
-    return std.fmt.bufPrint(buf, "{s}/labelle_bgfx_shader_cache_test_{s}_{d}", .{ std.mem.trimEnd(u8, base, "/"), name, std.c.getpid() }) catch unreachable;
+    return std.fmt.bufPrint(buf, "{s}/labelle_bgfx_shader_cache_test_{s}_{d}", .{ std.mem.trimEnd(u8, base, "/"), name, processId() }) catch unreachable;
 }
 
 fn removeEntry(id: u64) void {
-    var b: [max_dir + 32:0]u8 = undefined;
+    var b: [max_dir + 64:0]u8 = undefined;
     _ = std.c.unlink(entryPath(&b, id, ".bin").ptr);
-    _ = std.c.unlink(entryPath(&b, id, ".tmp").ptr);
 }
 
 test "off by default: every read misses and writes are dropped" {
@@ -309,6 +377,7 @@ test "off by default: every read misses and writes are dropped" {
 }
 
 test "a stored entry reads back whole; a missing one misses" {
+    if (comptime !supported) return error.SkipZigTest;
     var dbuf: [256]u8 = undefined;
     configure(testDir(&dbuf, "roundtrip"));
     defer configure(null);
@@ -329,6 +398,7 @@ test "a stored entry reads back whole; a missing one misses" {
 }
 
 test "a truncated, corrupted or foreign entry reads as a miss, never as a size (bgfx trusts the size)" {
+    if (comptime !supported) return error.SkipZigTest;
     // Its "damaged or stale" warnings are expected here.
     const level = testing.log_level;
     testing.log_level = .err;
@@ -338,7 +408,7 @@ test "a truncated, corrupted or foreign entry reads as a miss, never as a size (
     defer configure(null);
     const id: u64 = 42;
     defer removeEntry(id);
-    var pbuf: [max_dir + 32:0]u8 = undefined;
+    var pbuf: [max_dir + 64:0]u8 = undefined;
     const path = entryPath(&pbuf, id, ".bin");
 
     // Truncated: header promises more than the file holds.
@@ -374,6 +444,7 @@ test "a truncated, corrupted or foreign entry reads as a miss, never as a size (
 }
 
 test "configure creates missing parents" {
+    if (comptime !supported) return error.SkipZigTest;
     var dbuf: [256]u8 = undefined;
     const base = testDir(&dbuf, "nested");
     var nbuf: [300]u8 = undefined;
@@ -382,6 +453,49 @@ test "configure creates missing parents" {
     defer configure(null);
     try testing.expect(enabled());
     try testing.expect(std.mem.endsWith(u8, directory().?, "/a/b"));
+}
+
+test "a path that is a regular file leaves the cache off" {
+    if (comptime !supported) return error.SkipZigTest;
+    var dbuf: [256]u8 = undefined;
+    const dir = testDir(&dbuf, "notadir");
+    var zbuf: [300]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&zbuf, "{s}", .{dir});
+    const f = std.c.fopen(path.ptr, "wb").?;
+    _ = std.c.fclose(f);
+    defer _ = std.c.unlink(path.ptr);
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    configure(dir);
+    try testing.expect(!enabled());
+}
+
+test "a rewrite replaces the published entry and leaves no temp file behind" {
+    if (comptime !supported) return error.SkipZigTest;
+    var dbuf: [256]u8 = undefined;
+    configure(testDir(&dbuf, "rewrite"));
+    defer configure(null);
+    const id: u64 = 7;
+    defer removeEntry(id);
+    write(id, "first");
+    write(id, "second!");
+    try testing.expectEqual(@as(u32, 7), readSize(id));
+    var out: [7]u8 = undefined;
+    try testing.expect(read(id, &out));
+    try testing.expectEqualStrings("second!", &out);
+    // Only the published entry is left in the directory.
+    var zbuf: [300]u8 = undefined;
+    const d = std.c.opendir((try std.fmt.bufPrintZ(&zbuf, "{s}", .{directory().?})).ptr).?;
+    defer _ = std.c.closedir(d);
+    var names: usize = 0;
+    while (std.c.readdir(d)) |ent| {
+        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.name)), 0);
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        try testing.expect(std.mem.endsWith(u8, name, ".bin"));
+        names += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), names);
 }
 
 test "header round-trips and rejects other versions, empty and oversized payloads" {
