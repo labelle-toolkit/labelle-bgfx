@@ -1023,6 +1023,20 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(screenshot_path_tests).step);
 
+    // Persistent shader cache behind bgfx's cache callbacks (labelle-bgfx#217).
+    // Plain libc file I/O, no bgfx: it EXECUTES on the host against a temp dir.
+    const shader_cache_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shader_cache.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const shader_cache_run = b.addRunArtifact(shader_cache_tests);
+    test_step.dependOn(&shader_cache_run.step);
+    b.step("test-shader-cache", "Run the persistent shader cache tests").dependOn(&shader_cache_run.step);
+
     // Android activity-instance bgfx ownership (labelle-bgfx#143). Pure
     // bookkeeping the NativeActivity shell drives, so it EXECUTES on the host;
     // the shell itself only gets the Android compile-check below.
