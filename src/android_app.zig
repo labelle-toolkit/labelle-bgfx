@@ -478,6 +478,13 @@ export fn labelle_bgfx_display_scale() callconv(.c) f32 {
     return @as(f32, @floatFromInt(density)) / 160.0;
 }
 
+/// The activity's private files dir, for `shader_cache.zig`'s default
+/// directory (labelle-bgfx#217); null before the activity starts. Exported as
+/// a C symbol, the same bridge as `labelle_bgfx_display_scale`.
+export fn labelle_bgfx_internal_data_path() callconv(.c) ?[*:0]const u8 {
+    return internalDataPath();
+}
+
 /// The device locale on Android as `ll` or `ll-CC` (e.g. `pt-BR`), written
 /// into `buf`; returns the length, 0 before `run` has stashed the app or when
 /// the configuration carries no language. Exported as a C symbol for

@@ -26,9 +26,9 @@
 //! async `bgfx::requestScreenShot`. So `screenShot` below is a faithful
 //! reimplementation of `bimg::imageWriteTga` (same 18-byte header, same
 //! descriptor byte 32, same pitch/y-flip handling); dropping it would silently
-//! break the WINDOWED `--screenshot` path, which no probe covers. The
-//! remaining members (profiler, shader cache, video capture) are no-ops in the
-//! stub too, so they are no-ops here.
+//! break the WINDOWED `--screenshot` path, which no probe covers. The shader
+//! cache members are backed by `shader_cache.zig` (labelle-bgfx#217); the
+//! profiler and video capture members are no-ops, as in the stub.
 //!
 //! Knobs (all default to today's behaviour):
 //!   * `LABELLE_BGFX_ASSERT=continue` — log a failed bgfx debug assert and keep
@@ -49,6 +49,7 @@ const zbgfx = @import("zbgfx");
 const bgfx = zbgfx.bgfx;
 
 const log = std.log.scoped(.bgfx);
+const shader_cache = @import("shader_cache.zig");
 
 // ── C ABI: bgfx_callback_interface_t / bgfx_callback_vtbl_t ────────────
 //
@@ -240,20 +241,25 @@ fn profilerEnd(_this: *CallbackInterface) callconv(.c) void {
     _ = _this;
 }
 
-// Shader cache: bgfx's stub declines to cache (read size 0 / read false / write
-// no-op) and so do we. A persistent cache is a separate, opt-in feature.
+// Shader cache (labelle-bgfx#217): linked GL/GLES program binaries and the
+// Vulkan pipeline cache, kept on disk by `shader_cache.zig` so a program
+// compiles on its first ever use only. Off (every call a miss, as bgfx's stub)
+// until `window.zig` gives it a directory: the Android files dir by default.
 fn cacheReadSize(_this: *CallbackInterface, id: u64) callconv(.c) u32 {
-    _ = .{ _this, id };
-    return 0;
+    _ = _this;
+    return shader_cache.readSize(id);
 }
 
 fn cacheRead(_this: *CallbackInterface, id: u64, data: [*c]u8, size: u32) callconv(.c) bool {
-    _ = .{ _this, id, data, size };
-    return false;
+    _ = _this;
+    const out: [*]u8 = @ptrCast(data orelse return false);
+    return shader_cache.read(id, out[0..size]);
 }
 
 fn cacheWrite(_this: *CallbackInterface, id: u64, data: [*c]u8, size: u32) callconv(.c) void {
-    _ = .{ _this, id, data, size };
+    _ = _this;
+    const bytes: [*]const u8 = @ptrCast(data orelse return);
+    shader_cache.write(id, bytes[0..size]);
 }
 
 /// Does a bgfx capture of `format` need R and B swapped to become TGA's native
@@ -474,6 +480,9 @@ pub fn install(init: *bgfx.Init) void {
     // is a read of an already-populated optional.
     _ = assertBreaks();
     _ = traceEnabled();
+    // Same reasoning: the cache directory is set here, before bgfx's threads
+    // exist, and only read by the callbacks after.
+    shader_cache.configureForPlatform();
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
