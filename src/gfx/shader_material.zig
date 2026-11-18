@@ -14,6 +14,12 @@ var context_active = false;
 
 pub fn contextStarted() void {
     context_active = true;
+    // Diagnostics knobs, read once per context (labelle-bgfx#217).
+    @import("material_diagnostics.zig").configure();
+}
+/// End of a presented frame, for the material diagnostics (#217).
+pub fn frameEnd() void {
+    @import("material_diagnostics.zig").frameEnd();
 }
 pub fn shutdown() void {
     registry.shutdown();

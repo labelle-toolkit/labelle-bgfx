@@ -668,6 +668,7 @@ pub const setShaderTexture = shader_materials.setTexture;
 pub const destroyShaderMaterial = shader_materials.destroy;
 pub const shaderMaterialSupported = shader_materials.supported;
 pub const shaderMaterialContextStarted = shader_materials.contextStarted;
+pub const shaderMaterialFrameEnd = shader_materials.frameEnd;
 
 test "compile probe: generic shader material GPU paths" {
     var never = false;

@@ -485,6 +485,12 @@ export fn labelle_bgfx_internal_data_path() callconv(.c) ?[*:0]const u8 {
     return internalDataPath();
 }
 
+/// `isDebuggable` for the gfx module's device knobs (`device_knobs.zig`,
+/// labelle-bgfx#217), the same C-symbol bridge.
+export fn labelle_bgfx_is_debuggable() callconv(.c) bool {
+    return isDebuggable();
+}
+
 /// The device locale on Android as `ll` or `ll-CC` (e.g. `pt-BR`), written
 /// into `buf`; returns the length, 0 before `run` has stashed the app or when
 /// the configuration carries no language. Exported as a C symbol for

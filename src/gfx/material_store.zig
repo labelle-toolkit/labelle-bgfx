@@ -32,7 +32,15 @@ pub fn Store(comptime Driver: type) type {
                 return t.name[0..t.len :0];
             }
         };
-        const Program = struct { bytes: []u8, schema: [2048]u8, handle: u16, refs: usize };
+        pub const Program = struct {
+            bytes: []u8,
+            schema: [2048]u8,
+            handle: u16,
+            refs: usize,
+            /// Never reused, unlike `handle` (bgfx recycles those once a
+            /// program is destroyed): what diagnostics key on (#217).
+            serial: u32 = 0,
+        };
         pub const Instance = struct {
             program: *Program,
             parameters: [sm.MAX_PARAMETERS]Parameter = undefined,
@@ -43,12 +51,20 @@ pub fn Store(comptime Driver: type) type {
             blend: sm.Blend,
             rect: u16,
             sprite: u16,
+            /// This material's own descriptor label, for diagnostics
+            /// (labelle-bgfx#217): materials sharing a program keep theirs.
+            label: [32]u8 = @splat(0),
+            label_len: usize = 0,
+            pub fn labelSlice(i: *const Instance) []const u8 {
+                return i.label[0..i.label_len];
+            }
         };
         const Slot = struct { generation: u32 = 0, instance: ?*Instance = null };
         allocator: std.mem.Allocator,
         driver: Driver,
         slots: [capacity]Slot = @splat(.{}),
         programs: [capacity]?*Program = @splat(null),
+        next_serial: u32 = 0,
 
         pub fn get(self: *Self, id: sm.Id) sm.Error!*Instance {
             const bits = @intFromEnum(id);
@@ -90,6 +106,8 @@ pub fn Store(comptime Driver: type) type {
             const program = try self.acquire(bytes, desc);
             errdefer self.release(program);
             instance.* = .{ .program = program, .blend = desc.blend, .rect = 0xffff, .sprite = 0xffff };
+            instance.label_len = @min(desc.label.len, instance.label.len);
+            @memcpy(instance.label[0..instance.label_len], desc.label[0..instance.label_len]);
             errdefer self.releaseUniforms(instance);
             instance.rect = try self.driver.uniform("u_material_rect", .vec4, 1);
             instance.sprite = try self.driver.uniform("s_tex", null, 1);
@@ -187,6 +205,8 @@ pub fn Store(comptime Driver: type) type {
                 errdefer self.allocator.free(owned);
                 fragment_owned = false;
                 p.* = .{ .bytes = owned, .schema = schema, .handle = try self.driver.program(fragment), .refs = 1 };
+                self.next_serial +%= 1;
+                p.serial = self.next_serial;
                 entry.* = p;
                 return p;
             };

@@ -88,6 +88,28 @@ test "a material's fragment shader compiles once and is released, linked or not 
     try std.testing.expectEqual(@as(usize, 2), gpu.compiled);
     try std.testing.expectEqual(@as(usize, 0), gpu.shaders);
 }
+test "each material keeps its own label, and programs get serials that are never reused (#217)" {
+    var gpu = Fake{};
+    var store = Store(*Fake){ .allocator = std.testing.allocator, .driver = &gpu };
+    defer store.shutdown();
+    var bytes = [_]u8{ 1, 2, 3 };
+    var a_desc = desc;
+    a_desc.label = "smoke";
+    var b_desc = desc;
+    b_desc.label = "smoke_copy";
+    const a = try store.create(a_desc, &bytes);
+    const b = try store.create(b_desc, &bytes);
+    // One shared program, two labels.
+    try std.testing.expectEqual((try store.get(a)).program, (try store.get(b)).program);
+    try std.testing.expectEqualStrings("smoke", (try store.get(a)).labelSlice());
+    try std.testing.expectEqualStrings("smoke_copy", (try store.get(b)).labelSlice());
+    const first = (try store.get(a)).program.serial;
+    store.destroy(a);
+    store.destroy(b);
+    var other = [_]u8{ 9, 9, 9 };
+    const c = try store.create(desc, &other);
+    try std.testing.expect((try store.get(c)).program.serial != first);
+}
 test "stale handles never alias after destroy, shutdown or generation exhaustion" {
     var gpu = Fake{};
     var store = Store(*Fake){ .allocator = std.testing.allocator, .driver = &gpu };
