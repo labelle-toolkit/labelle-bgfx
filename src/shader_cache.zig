@@ -192,6 +192,9 @@ fn validSize(id: u64) ?u32 {
 /// bgfx `cacheReadSize`: the payload size of a VALID entry, else 0 (a miss,
 /// which makes bgfx compile and then `write`).
 pub fn readSize(id: u64) u32 {
+    // Compile-time too: the POSIX calls below aren't analyzed on Windows,
+    // where `install` still wires these callbacks (CodeRabbit on #219).
+    if (comptime !supported) return 0;
     if (!enabled()) return 0;
     return validSize(id) orelse {
         if (exists(id)) {
@@ -214,6 +217,7 @@ fn exists(id: u64) bool {
 /// read from (header, size, checksum, nothing after), not trusted from
 /// `readSize`: the file could have been replaced in between.
 pub fn read(id: u64, out: []u8) bool {
+    if (comptime !supported) return false;
     if (!enabled()) return false;
     var path_buf: [max_dir + 64:0]u8 = undefined;
     const file = std.c.fopen(entryPath(&path_buf, id, ".bin").ptr, "rb") orelse return false;
@@ -232,6 +236,7 @@ pub fn read(id: u64, out: []u8) bool {
 
 /// bgfx `cacheWrite`: store `data` under `id`, atomically.
 pub fn write(id: u64, data: []const u8) void {
+    if (comptime !supported) return;
     if (!enabled() or data.len == 0) return;
     if (data.len > max_payload) {
         log.warn("shader cache: entry {x:0>16} ({d} bytes) is too large to store", .{ id, data.len });
