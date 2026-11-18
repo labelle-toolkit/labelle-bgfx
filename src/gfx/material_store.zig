@@ -174,9 +174,10 @@ pub fn Store(comptime Driver: type) type {
                 }
             };
             for (&self.programs) |*entry| if (entry.* == null) {
-                // The validated shader is the one `program` links, so each
-                // fragment shader compiles once (labelle-bgfx#217). Until
-                // `program` takes it, it is ours to release on failure.
+                // The validated shader is the one `program` links, so a new
+                // program makes one fragment creation request, not two
+                // (labelle-bgfx#217). Until `program` takes it, it is ours to
+                // release on failure.
                 const fragment = try self.driver.validateShader(bytes, desc);
                 var fragment_owned = true;
                 errdefer if (fragment_owned) self.driver.destroyShader(fragment);

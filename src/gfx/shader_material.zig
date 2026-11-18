@@ -90,11 +90,13 @@ const Driver = struct {
         return id != .none and texture.handleForId(id).idx != 0xffff;
     }
     /// Validates the fragment shader against `desc` and returns it, still
-    /// alive, for `program`. Creating a bgfx shader is what compiles it (GL
-    /// and GLES compile at `createShader`), so the shader reflected here is
-    /// the one the program links: destroying it and creating it again in
-    /// `program` compiled every material's fragment shader twice
-    /// (labelle-bgfx#217).
+    /// alive, for `program`, which links that same handle. Destroying it
+    /// here and creating it again in `program` issued a second creation
+    /// request for the same bytes, which bgfx's shader de-duplication can't
+    /// merge once the first handle is gone, so the backend built (on GL,
+    /// compiled) the fragment shader twice (labelle-bgfx#217). This does not
+    /// wait for the compile: bgfx runs it when it processes the request on
+    /// the render thread.
     pub fn validateShader(_: Driver, bytes: []const u8, desc: sm.Descriptor) sm.Error!u16 {
         const reflection = try binary.read(bytes);
         try binary.validate(reflection, desc);
