@@ -1037,6 +1037,22 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&shader_cache_run.step);
     b.step("test-shader-cache", "Run the persistent shader cache tests").dependOn(&shader_cache_run.step);
 
+    // Per-material draw/pixel diagnostics and their device knobs (#217).
+    const material_diag_step = b.step("test-material-diagnostics", "Run the material diagnostics tests");
+    inline for (.{ "src/gfx/material_diagnostics.zig", "src/gfx/device_knobs.zig" }) |path| {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(path),
+                .target = b.graph.host,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        const run = b.addRunArtifact(t);
+        test_step.dependOn(&run.step);
+        material_diag_step.dependOn(&run.step);
+    }
+
     // Android activity-instance bgfx ownership (labelle-bgfx#143). Pure
     // bookkeeping the NativeActivity shell drives, so it EXECUTES on the host;
     // the shell itself only gets the Android compile-check below.

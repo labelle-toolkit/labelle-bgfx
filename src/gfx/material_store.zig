@@ -32,7 +32,18 @@ pub fn Store(comptime Driver: type) type {
                 return t.name[0..t.len :0];
             }
         };
-        const Program = struct { bytes: []u8, schema: [2048]u8, handle: u16, refs: usize };
+        pub const Program = struct {
+            bytes: []u8,
+            schema: [2048]u8,
+            handle: u16,
+            refs: usize,
+            /// The first descriptor's label, for diagnostics (labelle-bgfx#217).
+            label: [32]u8 = @splat(0),
+            label_len: usize = 0,
+            pub fn labelSlice(p: *const Program) []const u8 {
+                return p.label[0..p.label_len];
+            }
+        };
         pub const Instance = struct {
             program: *Program,
             parameters: [sm.MAX_PARAMETERS]Parameter = undefined,
@@ -187,6 +198,8 @@ pub fn Store(comptime Driver: type) type {
                 errdefer self.allocator.free(owned);
                 fragment_owned = false;
                 p.* = .{ .bytes = owned, .schema = schema, .handle = try self.driver.program(fragment), .refs = 1 };
+                p.label_len = @min(desc.label.len, p.label.len);
+                @memcpy(p.label[0..p.label_len], desc.label[0..p.label_len]);
                 entry.* = p;
                 return p;
             };

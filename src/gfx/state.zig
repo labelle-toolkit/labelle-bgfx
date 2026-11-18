@@ -306,6 +306,12 @@ pub fn endMode2D() void {
 // Backend contract: return the DESIGN canvas so engine/camera math stays
 // resolution-independent (matches the sokol backend). Physical size lives
 // in screen_w/h and is used only for the fit scale.
+/// The physical backbuffer size in pixels (`setScreenSize`), for
+/// `material_diagnostics`' pixel counts.
+pub fn physicalSize() [2]i32 {
+    return .{ screen_w, screen_h };
+}
+
 pub fn getScreenWidth() i32 {
     return design_w;
 }

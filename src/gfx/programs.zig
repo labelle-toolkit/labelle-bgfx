@@ -3,6 +3,7 @@
 /// "engine warmup" state lives here so the draw / texture / font
 /// modules don't each carry their own shader-init flags.
 const std = @import("std");
+const gfx_state = @import("state.zig");
 const bgfx = @import("zbgfx").bgfx;
 const core = @import("labelle-core");
 const shaders_data = @import("../shaders.zig");
@@ -1391,7 +1392,18 @@ pub fn submitYuvTriangles(
 /// Transient exhaustion drops the whole quad without leaving uniform state.
 pub fn submitShaderMaterialTriangles(vertices: []const PosTexColorVertex, texture_handle: bgfx.TextureHandle, id: core.shader_material.Id, rect: [4]f32) bool {
     const materials = @import("shader_material.zig");
+    const diagnostics = @import("material_diagnostics.zig");
     const instance = materials.resolve(id) orelse return false;
+    // `LABELLE_BGFX_MATERIAL_SKIP` / `_STATS` (labelle-bgfx#217).
+    const label = instance.program.labelSlice();
+    if (diagnostics.skipped(label)) return true;
+    if (diagnostics.enabled()) {
+        var ndc: [6][2]f32 = undefined;
+        const n = @min(vertices.len, ndc.len);
+        for (vertices[0..n], 0..) |v, i| ndc[i] = .{ v.x, v.y };
+        const size = gfx_state.physicalSize();
+        diagnostics.record(instance.program.handle, label, diagnostics.pixelArea(ndc[0..n], @floatFromInt(size[0]), @floatFromInt(size[1])));
+    }
     ensureLayouts();
     const num: u32 = @intCast(vertices.len);
     if (!transient_budget.fits(num, bgfx.getAvailTransientVertexBuffer(num, &vertex_layout))) {

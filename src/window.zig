@@ -1872,6 +1872,7 @@ pub fn endFrame() void {
         has_pending_screenshot = false;
     }
     _ = bgfx.frame(0);
+    gfx.shaderMaterialFrameEnd();
     // The real per-frame submit (every platform's game loop ends here). The
     // extra `bgfx.frame` pumps in `captureHeadless` are readback waits, not
     // presented frames, so they are deliberately not counted (#182).
