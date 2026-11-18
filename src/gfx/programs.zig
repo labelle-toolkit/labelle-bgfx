@@ -1395,7 +1395,7 @@ pub fn submitShaderMaterialTriangles(vertices: []const PosTexColorVertex, textur
     const diagnostics = @import("material_diagnostics.zig");
     const instance = materials.resolve(id) orelse return false;
     // `LABELLE_BGFX_MATERIAL_SKIP` / `_STATS` (labelle-bgfx#217).
-    const label = instance.program.labelSlice();
+    const label = instance.labelSlice();
     if (diagnostics.skipped(label)) return true;
     ensureLayouts();
     const num: u32 = @intCast(vertices.len);
@@ -1410,7 +1410,7 @@ pub fn submitShaderMaterialTriangles(vertices: []const PosTexColorVertex, textur
         const n = @min(vertices.len, ndc.len);
         for (vertices[0..n], 0..) |v, i| ndc[i] = .{ v.x, v.y };
         const size = gfx_state.physicalSize();
-        diagnostics.record(instance.program.handle, label, diagnostics.pixelArea(ndc[0..n], @floatFromInt(size[0]), @floatFromInt(size[1])));
+        diagnostics.record(instance.program.serial, label, diagnostics.pixelArea(ndc[0..n], @floatFromInt(size[0]), @floatFromInt(size[1])));
     }
     var tvb: bgfx.TransientVertexBuffer = undefined;
     bgfx.allocTransientVertexBuffer(&tvb, num, &vertex_layout);

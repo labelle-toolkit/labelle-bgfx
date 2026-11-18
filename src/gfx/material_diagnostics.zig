@@ -18,9 +18,19 @@
 //!     them, with no game change.
 //!
 //! Pixels are each draw's screen-space area (its normalized-device quad,
-//! clipped to the screen, times the physical backbuffer size). A draw into a
-//! smaller render target is counted at backbuffer scale: a cost estimate,
-//! not a measurement.
+//! clipped to the screen, times the physical backbuffer size): a cost
+//! estimate, not a measurement. Two cases it overstates, not handled yet:
+//! a draw into a smaller render target, and a draw through a split-screen or
+//! picture-in-picture camera, whose NDC is relative to its own viewport, so
+//! a quad filling a quarter-screen camera counts as the whole screen (Codex
+//! on #220). With one full-screen camera, the usual case, it is exact up to
+//! the screen edge.
+//!
+//! Entries are keyed by the program's never-reused serial, not its bgfx
+//! handle (recycled once a program is destroyed), and labelled by the
+//! material's own descriptor label: two materials that share a program are
+//! counted together under the first label seen. Skipping matches each
+//! material's own label.
 
 const std = @import("std");
 const knobs = @import("device_knobs.zig");
@@ -35,7 +45,7 @@ const max_tracked = 64;
 const max_label = 32;
 
 const Entry = struct {
-    program: u16,
+    program: u32,
     label: [max_label]u8 = undefined,
     label_len: usize = 0,
     draws: u64 = 0,
@@ -49,7 +59,7 @@ var skip_buf: [256]u8 = undefined;
 var skip_list: []const u8 = &.{};
 var entries: [max_tracked]Entry = undefined;
 var entry_count: usize = 0;
-var other: Entry = .{ .program = 0xffff };
+var other: Entry = .{ .program = 0 };
 var frames: u32 = 0;
 
 /// Read both knobs. Called when a bgfx context starts.
@@ -67,7 +77,7 @@ pub fn configure() void {
 
 fn reset() void {
     entry_count = 0;
-    other = .{ .program = 0xffff };
+    other = .{ .program = 0 };
     frames = 0;
 }
 
@@ -154,8 +164,9 @@ fn polygonArea(poly: []const [2]f64) f64 {
     return @abs(twice) / 2.0;
 }
 
-/// Count one draw of `program` (`label`) covering `pixels`.
-pub fn record(program: u16, label: []const u8, pixels: f64) void {
+/// Count one draw of `program` (the store's never-reused program serial)
+/// under `label` (its material's own) covering `pixels`.
+pub fn record(program: u32, label: []const u8, pixels: f64) void {
     if (period == 0) return;
     const e = find(program, label);
     e.draws += 1;
@@ -163,7 +174,7 @@ pub fn record(program: u16, label: []const u8, pixels: f64) void {
     e.frame_pixels += pixels;
 }
 
-fn find(program: u16, label: []const u8) *Entry {
+fn find(program: u32, label: []const u8) *Entry {
     for (entries[0..entry_count]) |*e| if (e.program == program) return e;
     if (entry_count == max_tracked) return &other;
     const e = &entries[entry_count];
