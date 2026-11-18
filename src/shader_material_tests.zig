@@ -10,11 +10,24 @@ const Fake = struct {
     calls: usize = 0,
     fail_at: usize = std.math.maxInt(usize),
     reject_program: bool = false,
+    /// Shaders compiled (`validateShader`), and those still alive.
+    compiled: usize = 0,
+    shaders: usize = 0,
     pub fn validTexture(_: *Fake, id: core.BackendTextureId) bool {
         return id.toInt() == 1 or id.toInt() == 2;
     }
-    pub fn validateShader(_: *Fake, _: []const u8, _: sm.Descriptor) sm.Error!void {}
-    pub fn program(f: *Fake, _: []const u8) sm.Error!u16 {
+    pub fn validateShader(f: *Fake, _: []const u8, _: sm.Descriptor) sm.Error!u16 {
+        f.compiled += 1;
+        f.shaders += 1;
+        return 7;
+    }
+    pub fn destroyShader(f: *Fake, _: u16) void {
+        f.shaders -= 1;
+    }
+    pub fn program(f: *Fake, fragment: u16) sm.Error!u16 {
+        // Takes the validated shader, linked or not.
+        std.debug.assert(fragment == 7);
+        f.shaders -= 1;
         if (f.reject_program) return error.ShaderLinkFailed;
         f.programs += 1;
         f.created += 1;
@@ -56,6 +69,24 @@ test "independent instances own defaults and borrowed bytes; refcounted cache" {
     store.destroy(b);
     try std.testing.expectEqual(@as(usize, 0), gpu.programs);
     try std.testing.expectEqual(@as(usize, 0), gpu.uniforms);
+}
+test "a material's fragment shader compiles once and is released, linked or not (#217)" {
+    var gpu = Fake{};
+    var store = Store(*Fake){ .allocator = std.testing.allocator, .driver = &gpu };
+    defer store.shutdown();
+    var bytes = [_]u8{ 1, 2, 3 };
+    const a = try store.create(desc, &bytes);
+    _ = try store.create(desc, &bytes);
+    // Validation's shader is the one linked: one compile for two
+    // instances of the program, and none left over.
+    try std.testing.expectEqual(@as(usize, 1), gpu.compiled);
+    try std.testing.expectEqual(@as(usize, 0), gpu.shaders);
+    store.destroy(a);
+    gpu.reject_program = true;
+    var other = [_]u8{ 4, 5, 6 };
+    try std.testing.expectError(error.ShaderLinkFailed, store.create(desc, &other));
+    try std.testing.expectEqual(@as(usize, 2), gpu.compiled);
+    try std.testing.expectEqual(@as(usize, 0), gpu.shaders);
 }
 test "stale handles never alias after destroy, shutdown or generation exhaustion" {
     var gpu = Fake{};
@@ -123,6 +154,8 @@ test "every uniform creation failure unwinds program and prior uniforms" {
 }
 fn allocationFailure(allocator: std.mem.Allocator) !void {
     var gpu = Fake{};
+    // No GPU shader leaks either, on every failure path (#217).
+    defer std.debug.assert(gpu.shaders == 0);
     var store = Store(*Fake){ .allocator = allocator, .driver = &gpu };
     defer store.shutdown();
     _ = try store.create(desc, "a");

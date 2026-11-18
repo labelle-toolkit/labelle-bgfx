@@ -89,7 +89,13 @@ const Driver = struct {
     pub fn validTexture(_: Driver, id: core.BackendTextureId) bool {
         return id != .none and texture.handleForId(id).idx != 0xffff;
     }
-    pub fn validateShader(_: Driver, bytes: []const u8, desc: sm.Descriptor) sm.Error!void {
+    /// Validates the fragment shader against `desc` and returns it, still
+    /// alive, for `program`. Creating a bgfx shader is what compiles it (GL
+    /// and GLES compile at `createShader`), so the shader reflected here is
+    /// the one the program links: destroying it and creating it again in
+    /// `program` compiled every material's fragment shader twice
+    /// (labelle-bgfx#217).
+    pub fn validateShader(_: Driver, bytes: []const u8, desc: sm.Descriptor) sm.Error!u16 {
         const reflection = try binary.read(bytes);
         try binary.validate(reflection, desc);
         try binary.validateSlots(reflection, desc, switch (bgfx.getRendererType()) {
@@ -108,7 +114,7 @@ const Driver = struct {
             }
         }
         const shader = try makeShader(bytes);
-        defer bgfx.destroyShader(shader);
+        errdefer bgfx.destroyShader(shader);
         var handles: [128]bgfx.UniformHandle = undefined;
         const count = bgfx.getShaderUniforms(shader, &handles, handles.len);
         if (count > handles.len) return error.InvalidShader;
@@ -122,6 +128,7 @@ const Driver = struct {
             actual.len += 1;
         }
         try binary.validate(actual, desc);
+        return shader.idx;
     }
     fn makeShader(bytes: []const u8) sm.Error!bgfx.ShaderHandle {
         const mem = bgfx.copy(bytes.ptr, @intCast(bytes.len));
@@ -130,16 +137,23 @@ const Driver = struct {
         if (handle.idx == 0xffff) return error.InvalidShader;
         return handle;
     }
-    pub fn program(_: Driver, bytes: []const u8) sm.Error!u16 {
+    /// Links `fragment` (from `validateShader`) with the sprite vertex
+    /// stage. Takes ownership of `fragment`: it is released whether or not
+    /// the link succeeds.
+    pub fn program(_: Driver, fragment: u16) sm.Error!u16 {
+        const fs: bgfx.ShaderHandle = .{ .idx = fragment };
+        defer bgfx.destroyShader(fs);
         const vs = try makeShader(vertexBytes());
         defer bgfx.destroyShader(vs);
-        const fs = try makeShader(bytes);
-        defer bgfx.destroyShader(fs);
         // Explicit shader release on both success/failure; program retains its
         // own refs when destroyShaders=false.
         const handle = bgfx.createProgram(vs, fs, false);
         if (handle.idx == 0xffff) return error.ShaderLinkFailed;
         return handle.idx;
+    }
+    /// Releases a shader from `validateShader` that never reached `program`.
+    pub fn destroyShader(_: Driver, shader: u16) void {
+        bgfx.destroyShader(.{ .idx = shader });
     }
     pub fn uniform(_: Driver, name: [:0]const u8, kind: ?sm.Kind, count: u16) sm.Error!u16 {
         const handle = bgfx.createUniform(name.ptr, @enumFromInt(binary.kindOf(kind)), count);
