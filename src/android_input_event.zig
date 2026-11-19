@@ -76,10 +76,12 @@ extern fn AMotionEvent_getPointerId(event: *AInputEvent, pointer_index: usize) i
 extern fn AMotionEvent_getAxisValue(event: *AInputEvent, axis: i32, pointer_index: usize) f32;
 extern fn AKeyEvent_getAction(event: *AInputEvent) i32;
 extern fn AKeyEvent_getKeyCode(event: *AInputEvent) i32;
+extern fn AKeyEvent_getMetaState(event: *AInputEvent) i32;
 
-// ── Input: AInputEvent handler (touch + gamepad) ────────────────────
+// ── Input: AInputEvent handler (touch + gamepad + text) ─────────────
 // Returns 1 ("handled") for events we consume, 0 otherwise so the glue lets
-// the system process them. Two paths:
+// the system process them. Keyboard KEY events go to a focused imgui text
+// field first (`input.applyAndroidTextKey`); otherwise two paths:
 //
 //   * Touch (motion events from a touchscreen / mouse-like source) is mapped
 //     to the backend's pointer model: pointer 0's (x, y) becomes the mouse
@@ -91,6 +93,16 @@ extern fn AKeyEvent_getKeyCode(event: *AInputEvent) i32;
 //     route into the shared `android_gamepad` state (via `input.zig`), keyed
 //     by `AInputEvent_getDeviceId` (the same id the JNI detection registry
 //     emits as its hotplug slot), so the engine's gamepad queries resolve.
+/// A finger went down since the shell last looked (`takeTap`). The shell
+/// re-shows the on-screen keyboard on a tap while a text field still has
+/// focus, after the player hid it with BACK or the keyboard's own button.
+var tapped: bool = false;
+
+pub fn takeTap() bool {
+    defer tapped = false;
+    return tapped;
+}
+
 pub fn onInputEvent(app: *android_app, event: *AInputEvent) callconv(.c) c_int {
     _ = app;
     const etype = AInputEvent_getType(event);
@@ -98,12 +110,19 @@ pub fn onInputEvent(app: *android_app, event: *AInputEvent) callconv(.c) c_int {
     const device_id = AInputEvent_getDeviceId(event);
 
     if (etype == AINPUT_EVENT_TYPE_KEY) {
+        const keycode = AKeyEvent_getKeyCode(event);
+        const action = AKeyEvent_getAction(event);
+        const from_pad = (source & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD or
+            (source & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK;
+        // The on-screen keyboard (or a hardware one) typing into a focused
+        // imgui text field. A controller's DPAD/buttons never type.
+        if (!from_pad and (action == AKEY_EVENT_ACTION_DOWN or action == AKEY_EVENT_ACTION_UP)) {
+            if (input.applyAndroidTextKey(keycode, AKeyEvent_getMetaState(event), action == AKEY_EVENT_ACTION_DOWN)) return 1;
+        }
         // Controller buttons (BUTTON_A/B/X/Y, L1/R1/L2/R2, thumbs, start/
         // select/mode) and DPAD_* arrive as key events. Forward the raw
         // keycode; the shared state module maps it to a canonical button
         // (and ignores non-gamepad keys).
-        const keycode = AKeyEvent_getKeyCode(event);
-        const action = AKeyEvent_getAction(event);
         if (action == AKEY_EVENT_ACTION_DOWN) {
             input.applyGamepadKey(device_id, keycode, true);
         } else if (action == AKEY_EVENT_ACTION_UP) {
@@ -115,8 +134,6 @@ pub fn onInputEvent(app: *android_app, event: *AInputEvent) callconv(.c) c_int {
         // still navigates. Other gamepad keys stay unconsumed (return 0) —
         // the system does nothing useful with BUTTON_*/DPAD_*, and consuming
         // them all would swallow HOME/volume on odd devices.
-        const from_pad = (source & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD or
-            (source & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK;
         if (keycode == AKEYCODE_BACK and from_pad) return 1;
         return 0;
     }
@@ -189,6 +206,7 @@ pub fn onInputEvent(app: *android_app, event: *AInputEvent) callconv(.c) c_int {
     switch (action) {
         AMOTION_EVENT_ACTION_DOWN => {
             input.setPointerDown(true);
+            tapped = true;
         },
         AMOTION_EVENT_ACTION_UP, AMOTION_EVENT_ACTION_CANCEL => {
             input.setPointerDown(false);
