@@ -11,6 +11,7 @@ const std = @import("std");
 const core = @import("labelle-core");
 const gui_pointer = @import("gui_pointer.zig");
 const web_touch = @import("web_touch.zig");
+const android_text_keys = @import("android_text_keys.zig");
 
 // Prove this module satisfies labelle-core's input contract — formerly only a
 // duck-typed claim in the doc comment above. The required core is small
@@ -254,6 +255,9 @@ const imgui = if (gui_enabled) struct {
     // char + key callbacks (event-driven, not polled in `forwardGuiInput`).
     extern fn imgui_bridge_char(codepoint: u32) void;
     extern fn imgui_bridge_key(key: i32, down: bool) void;
+    // True while a text field has focus: the Android shell shows the
+    // on-screen keyboard then (`wantsTextInput`).
+    extern fn imgui_bridge_wants_text_input() bool;
 } else struct {};
 // Opt-in for HIDAPI raw-HID decode in the shared SDL gamepad source; OFF by
 // default (HIDAPI's per-connect init stalls the render thread for seconds on
@@ -1049,6 +1053,42 @@ pub const GAMEPAD_AXIS_COUNT = agp.FORWARDED_AXIS_COUNT;
 /// is the raw `AKEYCODE_*` from `AKeyEvent_getKeyCode`.
 pub fn applyGamepadKey(device_id: i32, keycode: i32, down: bool) void {
     agp.applyKey(device_id, keycode, down);
+}
+
+/// True while an imgui text field has focus, so the Android shell shows the
+/// on-screen keyboard. Always false without the imgui bridge.
+pub fn wantsTextInput() bool {
+    if (comptime !gui_enabled) return false;
+    return imgui.imgui_bridge_wants_text_input();
+}
+
+/// Feed a (non-gamepad) Android KEY event to the focused imgui text field:
+/// the key for Backspace/Enter/arrows, and on a press the character it
+/// types (`android_text_keys`, `meta` is `AKeyEvent_getMetaState`). True
+/// when the event was the text field's; false while no field has focus or
+/// for a key a text field doesn't use, so it keeps its usual path.
+pub fn applyAndroidTextKey(keycode: i32, meta: i32, down: bool) bool {
+    if (comptime !gui_enabled) return false;
+    if (!imgui.imgui_bridge_wants_text_input()) return false;
+    const mapped = android_text_keys.map(keycode, meta) orelse return false;
+    imgui.imgui_bridge_key(mapped.key, down);
+    if (down and mapped.char != 0) imgui.imgui_bridge_char(mapped.char);
+    return true;
+}
+
+/// What the Android on-screen keyboard typed (`labelle_android.text_input
+/// .poll`): each code point to imgui's text input, and each `backspace`
+/// entry (any negative one) as a Backspace press and release.
+pub fn applyAndroidTypedText(entries: []const i32) void {
+    if (comptime !gui_enabled) return;
+    for (entries) |entry| {
+        if (entry < 0) {
+            imgui.imgui_bridge_key(android_text_keys.GLFW_BACKSPACE, true);
+            imgui.imgui_bridge_key(android_text_keys.GLFW_BACKSPACE, false);
+        } else if (entry > 0 and entry <= 0x10FFFF) {
+            imgui.imgui_bridge_char(@intCast(entry));
+        }
+    }
 }
 
 /// Feed a gamepad MOTION (analog axis snapshot) keyed by Android device id.

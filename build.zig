@@ -900,6 +900,12 @@ pub fn build(b: *std.Build) void {
     const web_command_keys_run = b.addRunArtifact(web_command_keys);
     test_step.dependOn(&web_command_keys_run.step);
     b.step("test-web-command-keys", "Test browser save/load shortcut routing").dependOn(&web_command_keys_run.step);
+    const android_text_keys = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/android_text_keys.zig"),
+        .target = host_target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(android_text_keys).step);
 
     const shader_material_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/shader_material_tests.zig"),
