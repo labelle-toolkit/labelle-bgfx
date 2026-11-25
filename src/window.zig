@@ -99,6 +99,7 @@ pub const ConfigFlags = struct {
 };
 
 var glfw_window: if (no_glfw) ?*anyopaque else ?*glfw.Window = null;
+var native_cursor: if (no_glfw) ?*anyopaque else ?*glfw.Cursor = null;
 var target_fps_val: i32 = 60;
 var screen_w: i32 = 800;
 var screen_h: i32 = 600;
@@ -1141,6 +1142,7 @@ pub fn teardownSurface() void {
 }
 
 pub fn closeWindow() void {
+    clearCursorImage();
     _ = setCursorVisible(true);
     // Release the sprite program (+ its shaders), the s_tex sampler
     // uniform, the 1x1 white texture, the font atlas, and any uploaded
@@ -1538,14 +1540,42 @@ extern "c" fn labelle_web_cursor_over() c_int;
 /// lock or warp the pointer, so input coordinates and click targeting stay
 /// unchanged. Call on the window thread, after init. Restore before removing
 /// the game's overlay; closeWindow also restores the browser's prior style.
-/// Native custom image cursors are deliberately not part of this API: draw
-/// artwork in a screen-space overlay with its hotspot at the mouse position.
 pub fn setCursorVisible(visible: bool) bool {
     if (is_android) return false;
     if (is_wasm) return labelle_web_cursor_visible(@intFromBool(visible)) != 0;
     const win = glfw_window orelse return false;
     win.setInputMode(.cursor, if (visible) .normal else .hidden) catch return false;
     return true;
+}
+
+/// Install a desktop cursor from tightly packed RGBA8 pixels, with a
+/// top-left origin and a hotspot inside the image. GLFW copies the pixels.
+/// Call on the window thread. A failed replacement leaves the old cursor
+/// in place. Returns false when the surface has no native cursor.
+pub fn setCursorImage(image_width: i32, image_height: i32, rgba: []const u8, hotspot_x: i32, hotspot_y: i32) bool {
+    if (no_glfw) return false;
+    const win = glfw_window orelse return false;
+    if (image_width <= 0 or image_height <= 0 or hotspot_x < 0 or hotspot_y < 0 or
+        hotspot_x >= image_width or hotspot_y >= image_height) return false;
+    // zglfw calculates the same byte count using signed 32-bit arithmetic.
+    const stride = std.math.mul(i32, image_width, 4) catch return false;
+    const size = std.math.mul(i32, stride, image_height) catch return false;
+    if (rgba.len != @as(usize, @intCast(size))) return false;
+
+    const cursor = glfw.Cursor.create(image_width, image_height, rgba, hotspot_x, hotspot_y) catch return false;
+    win.setCursor(cursor);
+    if (native_cursor) |old| old.destroy();
+    native_cursor = cursor;
+    return true;
+}
+
+/// Restore the system's default cursor and release the installed image.
+pub fn clearCursorImage() void {
+    if (no_glfw) return;
+    const cursor = native_cursor orelse return;
+    if (glfw_window) |win| win.setCursor(null);
+    cursor.destroy();
+    native_cursor = null;
 }
 
 /// Whether a custom pointer should be drawn: the pointer is over the focused
@@ -2336,5 +2366,15 @@ test "desktop cursor visibility changes GLFW mode without locking the pointer" {
     try std.testing.expect(setCursorVisible(false));
     try std.testing.expect(setCursorVisible(true));
     try std.testing.expectEqual(glfw.Cursor.Mode.normal, try win.getInputMode(.cursor));
+    defer clearCursorImage();
+    try std.testing.expect(setCursorImage(2, 2, &([_]u8{255} ** 16), 0, 0));
+    const first = native_cursor.?;
+    try std.testing.expect(!setCursorImage(2, 2, &.{255}, 0, 0));
+    try std.testing.expect(!setCursorImage(2, 2, &([_]u8{255} ** 16), 2, 0));
+    try std.testing.expectEqual(first, native_cursor.?);
+    try std.testing.expect(setCursorImage(1, 1, &.{ 0, 0, 0, 255 }, 0, 0));
+    clearCursorImage();
+    try std.testing.expect(native_cursor == null);
+    clearCursorImage();
     try std.testing.expect(!isCursorOverWindow()); // hidden test window
 }
