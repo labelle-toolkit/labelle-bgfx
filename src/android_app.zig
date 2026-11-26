@@ -31,7 +31,8 @@ const input = @import("input");
 // `android:debuggable` query and the #127 window relayout. Named module.
 const labelle_android = @import("labelle_android");
 // The `AInputEvent` handler (touch + gamepad) lives in its own file.
-const onInputEvent = @import("android_input_event.zig").onInputEvent;
+const android_input_event = @import("android_input_event.zig");
+const onInputEvent = android_input_event.onInputEvent;
 // `root` is the compilation's root module — the generated game's
 // `main.zig` when this backend is consumed by an assembled project. We
 // read an optional `labelle_provides_android_main` declaration from it so
@@ -278,7 +279,49 @@ const Shell = struct {
     waiting_logged: bool = false,
     /// Blocked until woken by `wakeParkedLocked` rather than polling.
     parked: bool = false,
+    /// The on-screen keyboard was last asked to show (`syncSoftKeyboard`).
+    keyboard_shown: bool = false,
 };
+
+// `<android/native_activity.h>`: ask the framework to show / hide the IME
+// for this activity. Both post to the UI thread themselves, so the app
+// thread calls them directly. The fallback for an APK without
+// labelle-android's `LabelleActivity`: Android 14+ ignores them, since a
+// NativeActivity's content view is not a text editor. SHOW_FORCED: an
+// implicit (flag 0) request is commonly ignored for it. A forced show is
+// only undone by hide flag 0.
+extern fn ANativeActivity_showSoftInput(activity: *ANativeActivity, flags: u32) void;
+extern fn ANativeActivity_hideSoftInput(activity: *ANativeActivity, flags: u32) void;
+const ANATIVEACTIVITY_SHOW_SOFT_INPUT_FORCED: u32 = 0x0002;
+
+/// labelle-android's on-screen keyboard (`text_input`, its `LabelleActivity`),
+/// when the package version has it.
+const has_text_input = @hasDecl(labelle_android, "text_input");
+
+/// Show the on-screen keyboard while an imgui text field has focus, and
+/// hide it once it hasn't (Enter, a tap elsewhere, the window closing).
+/// Otherwise only on a tap, so the player can dismiss it with BACK while
+/// the field keeps focus and bring it back by tapping the field again.
+/// Then hand imgui what the keyboard typed since the last frame.
+fn syncSoftKeyboard(app: *android_app, shell: *Shell) void {
+    if (comptime has_text_input) {
+        var typed: [64]i32 = undefined;
+        input.applyAndroidTypedText(labelle_android.text_input.poll(&typed));
+    }
+    const want = input.wantsTextInput();
+    const tapped = android_input_event.takeTap();
+    if (want == shell.keyboard_shown and !(want and tapped)) return;
+    const activity = app.activity orelse return;
+    const via_activity = if (comptime has_text_input) labelle_android.text_input.setVisible(@ptrCast(activity), want) else false;
+    if (!via_activity) {
+        if (want) {
+            ANativeActivity_showSoftInput(activity, ANATIVEACTIVITY_SHOW_SOFT_INPUT_FORCED);
+        } else {
+            ANativeActivity_hideSoftInput(activity, 0);
+        }
+    }
+    shell.keyboard_shown = want;
+}
 
 fn shellOf(app: *android_app) *Shell {
     return @ptrCast(@alignCast(app.userData.?));
@@ -889,6 +932,7 @@ pub fn run(app: *android_app) void {
         // the activity is in the foreground.
         if (shell.bgfx_ready and shell.is_resumed) {
             if (tick_fn) |cb| cb();
+            syncSoftKeyboard(app, &shell);
             // The game quit (`game.quit()` → the generated `gameFrame` →
             // `window.requestQuit()`, the same seam desktop closes its GLFW
             // window through). This loop only ends when the activity is
