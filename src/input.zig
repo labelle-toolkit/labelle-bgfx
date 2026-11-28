@@ -255,6 +255,12 @@ const imgui = if (gui_enabled) struct {
     // char + key callbacks (event-driven, not polled in `forwardGuiInput`).
     extern fn imgui_bridge_char(codepoint: u32) void;
     extern fn imgui_bridge_key(key: i32, down: bool) void;
+    // The modifier flags a key event carried (GLFW's `mods` bits), sent
+    // just before the key: imgui then has Shift / Ctrl / Alt / Super even
+    // when no modifier key event said so (held before the window had focus,
+    // or a chord from an automation tool, which is the plain key with the
+    // modifier only in its flags).
+    extern fn imgui_bridge_mods(mods: i32) void;
     // True while a text field has focus: the Android shell shows the
     // on-screen keyboard then (`wantsTextInput`).
     extern fn imgui_bridge_wants_text_input() bool;
@@ -686,7 +692,7 @@ fn scrollCallback(_: *glfw.Window, _: f64, yoffset: f64) callconv(.c) void {
 /// the engine's `KeyboardKey` values (the same convention `isKeyDown` relies
 /// on via `@enumFromInt`), so indexing the arrays by the GLFW code is
 /// correct. `GLFW_KEY_UNKNOWN` (-1) and any code past the table are ignored.
-fn keyCallback(_: *glfw.Window, key: glfw.Key, _: c_int, action: glfw.Action, _: glfw.Mods) callconv(.c) void {
+fn keyCallback(_: *glfw.Window, key: glfw.Key, _: c_int, action: glfw.Action, mods: glfw.Mods) callconv(.c) void {
     const code: c_int = @intFromEnum(key);
     // Forward to imgui so text fields see Backspace/Enter/Delete/arrows and
     // the Ctrl/Shift/Super modifiers. The bridge maps GLFW→ImGuiKey. Repeat
@@ -694,6 +700,9 @@ fn keyCallback(_: *glfw.Window, key: glfw.Key, _: c_int, action: glfw.Action, _:
     // a held Backspace keeps deleting. (No-op / comptime-eliminated unless the
     // imgui bridge is linked.)
     if (comptime gui_enabled) {
+        // The event's own modifier flags first, so the key is handled with
+        // the modifiers it was made with (`imgui_bridge_mods`).
+        imgui.imgui_bridge_mods(@as(c_int, @bitCast(mods)));
         switch (action) {
             .press => imgui.imgui_bridge_key(code, true),
             .release => imgui.imgui_bridge_key(code, false),
