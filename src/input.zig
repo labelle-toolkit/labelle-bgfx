@@ -10,6 +10,7 @@ const std = @import("std");
 /// labelle-core, for the comptime input-contract conformance gate below.
 const core = @import("labelle-core");
 const gui_pointer = @import("gui_pointer.zig");
+const desktop_pointer = @import("desktop_pointer.zig");
 const web_touch = @import("web_touch.zig");
 const android_text_keys = @import("android_text_keys.zig");
 
@@ -304,6 +305,14 @@ var mouse_x: f32 = 0;
 var mouse_y: f32 = 0;
 var mouse_wheel: f32 = 0;
 
+// ── Desktop (GLFW) pointer and button events (labelle-engine#938) ────
+// Fed by `cursorPosCallback` / `mouseButtonCallback` during `pollEvents`, and
+// settled once a frame in `newFrame`: input sent to the window by a tool
+// carries its own position and can press and release between two frames,
+// neither of which polling sees (`desktop_pointer.zig`).
+var desktop_pos: desktop_pointer.Pointer = .{};
+var desktop_buttons: desktop_pointer.Buttons(MAX_MOUSE_BUTTONS) = .{};
+
 // ── Android touch state ─────────────────────────────────────────────
 // On Android there is no GLFW mouse — touch is the pointer. The
 // NativeActivity glue (src/android_app.zig) feeds these from
@@ -354,6 +363,12 @@ pub fn setWindow(win: if (no_glfw) *anyopaque else *glfw.Window) void {
         // nothing on bgfx — only live-poll `isKeyDown` worked. Mirrors
         // `scrollCallback`.
         _ = win.setKeyCallback(keyCallback);
+        // The pointer's position and button events, as sent: polling alone
+        // reads the OS pointer and the button's level, so a click a tool
+        // sends to the window landed under the person's own pointer, or was
+        // missed (labelle-engine#938).
+        _ = win.setCursorPosCallback(cursorPosCallback);
+        _ = win.setMouseButtonCallback(mouseButtonCallback);
         // Char callback drives imgui text input (typed characters). Only
         // wired when the imgui bridge is linked — `charCallback` references
         // the (then-defined) `imgui_bridge_char` export.
@@ -680,6 +695,24 @@ fn scrollCallback(_: *glfw.Window, _: f64, yoffset: f64) callconv(.c) void {
     mouse_wheel = @floatCast(yoffset);
 }
 
+/// A cursor event's own position, in the window's logical coordinates.
+/// `newFrame` decides whether it or the OS pointer is in effect.
+fn cursorPosCallback(_: *glfw.Window, x: f64, y: f64) callconv(.c) void {
+    desktop_pos.moved(x, y);
+}
+
+/// A button event. GLFW's button numbers are the engine's (0 left, 1 right,
+/// 2 middle), as `isMouseButtonDown` relies on.
+fn mouseButtonCallback(_: *glfw.Window, button: glfw.MouseButton, action: glfw.Action, _: glfw.Mods) callconv(.c) void {
+    const b: c_int = @intFromEnum(button);
+    if (b < 0) return;
+    switch (action) {
+        .press => desktop_buttons.record(@intCast(b), true),
+        .release => desktop_buttons.record(@intCast(b), false),
+        .repeat => {},
+    }
+}
+
 /// GLFW fires this during `glfw.pollEvents()` (called in `newFrame`, AFTER
 /// the per-frame edge arrays are cleared), so a key pressed since last frame
 /// shows up in `keys_pressed` for exactly this frame. GLFW key codes equal
@@ -803,25 +836,32 @@ pub fn newFrame() void {
         // `setScreenSize`, which now receives framebuffer pixels). Scale the
         // cursor to framebuffer pixels using the window's own
         // framebuffer/logical ratio so HiDPI hit-testing lands correctly.
-        const pos = win.getCursorPos();
+        //
+        // The polled position is the OS pointer. It is in effect whenever it
+        // moves over the window; a position that came as an event while it
+        // did not (input a tool sent to the window) is taken as sent
+        // (`desktop_pointer.Pointer`, labelle-engine#938).
+        const polled = win.getCursorPos();
         const fb = win.getFramebufferSize();
         const ws = win.getSize();
+        const pos = desktop_pos.settle(.{ .x = polled[0], .y = polled[1] }, @floatFromInt(ws[0]), @floatFromInt(ws[1]));
         const sx: f64 = if (ws[0] > 0) @as(f64, @floatFromInt(fb[0])) / @as(f64, @floatFromInt(ws[0])) else 1.0;
         const sy: f64 = if (ws[1] > 0) @as(f64, @floatFromInt(fb[1])) / @as(f64, @floatFromInt(ws[1])) else 1.0;
-        mouse_x = @floatCast(pos[0] * sx);
-        mouse_y = @floatCast(pos[1] * sy);
+        mouse_x = @floatCast(pos.x * sx);
+        mouse_y = @floatCast(pos.y * sy);
 
-        // Derive this-frame mouse button press/release EDGES. GLFW gives only
-        // live down-state, so (mirroring the keyboard `keys_pressed`/`released`
-        // and the Android pointer path) compare each button's live state
-        // against `mouse_down[]` — the persisted previous-frame state — to set
-        // the one-frame `mouse_pressed`/`mouse_released` arrays the engine's
-        // `isMouseButtonPressed`/`Released` read. Without this they were always
-        // false on desktop; only live-poll `isMouseButtonDown` worked.
+        // Derive this-frame mouse button press/release EDGES for the engine's
+        // `isMouseButtonPressed`/`Released`: the events `mouseButtonCallback`
+        // saw since the last frame, or a change of the live down-state against
+        // `mouse_down[]` (the previous frame's). The events catch a press and
+        // release that both arrived between two frames, which the level alone
+        // misses (as on wasm); the level catches a change that came with no
+        // event.
         for (0..MAX_MOUSE_BUTTONS) |b| {
             const cur = win.getMouseButton(@enumFromInt(b)) == .press;
-            if (cur and !mouse_down[b]) mouse_pressed[b] = true;
-            if (!cur and mouse_down[b]) mouse_released[b] = true;
+            const e = desktop_pointer.edges(desktop_buttons.pressed[b], desktop_buttons.released[b], cur, mouse_down[b]);
+            if (e.pressed) mouse_pressed[b] = true;
+            if (e.released) mouse_released[b] = true;
             mouse_down[b] = cur;
         }
     }
@@ -840,9 +880,11 @@ pub fn newFrame() void {
     }
 
     // Forward the GLFW mouse (cursor pos already in framebuffer pixels above,
-    // buttons read live, wheel accumulated by the scroll callback) to Dear
-    // ImGui. No-op (comptime-eliminated) unless the imgui bridge is linked.
+    // this frame's button events then the live level, wheel accumulated by the
+    // scroll callback) to Dear ImGui. No-op (comptime-eliminated) unless the
+    // imgui bridge is linked.
     forwardGuiInput(mouse_x, mouse_y);
+    desktop_buttons.clear();
 }
 
 // ── GUI (Dear ImGui) input forwarding ──────────────────────────────────
@@ -855,8 +897,9 @@ pub fn newFrame() void {
 // Called from `newFrame` AFTER `mouse_x`/`mouse_y` and the gamepad snapshot
 // are settled, on BOTH paths:
 //   - Desktop (GLFW): cursor pos is already scaled to framebuffer pixels;
-//     button down-state is read live via `glfw.getMouseButton`; the wheel is
-//     the `scrollCallback`-accumulated delta for this frame.
+//     the frame's button events are replayed in order, then the down-state
+//     is read live via `glfw.getMouseButton`; the wheel is the
+//     `scrollCallback`-accumulated delta for this frame.
 //   - Android (NDK): the touch pointer is mirrored onto `mouse_x`/`mouse_y` +
 //     `mouse_down[0]`; there is no wheel.
 //
@@ -889,6 +932,15 @@ fn forwardGuiInput(x: f32, y: f32) void {
     if (comptime !gui_enabled) return;
 
     imgui.imgui_bridge_mouse_pos(x, y);
+
+    // Desktop: first this frame's button events in the order they came, so a
+    // press and release between two frames reach imgui as a click (it plays
+    // queued events over the next frames). Then the live level below, which
+    // imgui drops when it repeats the last event, and which still brings a
+    // change that came with no event. Empty on Android and wasm.
+    for (desktop_buttons.ordered()) |e| {
+        if (e.button < GUI_FORWARDED_BUTTONS) imgui.imgui_bridge_mouse_button(@intCast(e.button), e.down);
+    }
 
     var b: u32 = 0;
     while (b < GUI_FORWARDED_BUTTONS) : (b += 1) {

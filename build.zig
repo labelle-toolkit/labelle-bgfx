@@ -993,6 +993,19 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(gui_pointer_tests).step);
 
+    // ── Unit tests for the desktop pointer and button events (labelle-engine#938) ──
+    // `src/desktop_pointer.zig` is pure Zig: which position is in effect (the
+    // OS pointer, or one sent to the window as an event) and a frame's button
+    // edges. input.zig's GLFW path needs a window, so test it as its own root.
+    const desktop_pointer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/desktop_pointer.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(desktop_pointer_tests).step);
+
     // ── Unit tests for the browser touch callbacks (#202) ──
     // `src/web_touch.zig` is the touch state machine input.zig's wasm-only
     // callbacks hand each event to, with ImGui passed in, so the callbacks'
